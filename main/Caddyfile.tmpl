@@ -1,0 +1,162 @@
+# Шаблон Caddyfile. Плейсхолдеры @@...@@ подставляет entrypoint.sh.
+{
+	admin off
+@@GLOBAL_TLS@@
+	skip_install_trust
+	default_sni @@MAIN_ADVERTISE_IP@@
+	auto_https disable_redirects
+	# TRUSTED_PROXIES (фронт-прокси, например nginx на tsga): servers { trusted_proxies static ... }, пусто без них
+@@TRUSTED_PROXIES@@
+}
+
+https://@@PUBLIC_HOSTNAME@@, https://@@MAIN_ADVERTISE_IP@@ {
+@@SITE_TLS@@
+
+	# Сайт только по HTTPS; страницы портала нельзя встроить во фрейм на чужом сайте. defer: значения окончательные,
+	# даже если ответ портала или LiteLLM несёт свои.
+	header {
+		defer
+		Strict-Transport-Security "max-age=31536000"
+		X-Frame-Options DENY
+		X-Content-Type-Options nosniff
+		Referrer-Policy same-origin
+	}
+
+	# Потоки /v1/* (SSE) идут без буферизации (flush_interval -1). Таймаутов, которые оборвали бы долгую
+	# генерацию или ожидание в очереди, у Caddy по умолчанию нет: у транспорта http нет response_header_timeout,
+	# read_timeout и write_timeout, у сервера нет write и read_body; idle ждёт следующего запроса на
+	# keep-alive соединении, а write_idle (если есть в версии) ограничивает одну зависшую запись, но не паузы
+	# между событиями потока. Keep-alive с клиентами по умолчанию.
+	# Тело запроса ограничено до чтения: портал и LiteLLM читают его целиком до проверки сессии или ключа, а память
+	# у Postgres, LiteLLM и k3s общая. /v1/* до 32 МБ (длинный контекст, картинки в base64), портал до 1 МБ.
+	# Перезапуск LiteLLM: соединение пробуется заново до 15 с, затем 503 с Retry-After (handle_errors ниже). Повторить
+	# можно только запрос, тело которого Caddy держит в памяти: request_buffers 256KB покрывает чат-запросы до ~60 тыс.
+	# токенов, запрос с телом больше получает 503 сразу после первой неудачной попытки.
+	# Простаивающее соединение с LiteLLM и порталом (uvicorn закрывает его через 5 с) Caddy держит не дольше 4 с:
+	# иначе под нагрузкой POST уходит в соединение, которое uvicorn уже закрыл, и клиент получает 502.
+	handle /v1/* {
+		request_body {
+			max_size 32MB
+		}
+		reverse_proxy 127.0.0.1:4000 {
+			flush_interval -1
+			lb_try_duration 15s
+			request_buffers 256KB
+			transport http {
+				keepalive 4s
+			}
+		}
+	}
+
+	handle /ca.crt {
+@@CA_HANDLER@@
+	}
+
+	# Части загрузки своих моделей («Мои модели», портал принимает до UPLOAD_CHUNK_MIB, не больше 64 МиБ): до 80 МБ на
+	# запрос, тело идёт в портал потоком (без request_buffers), портал пишет его на диск по мере получения.
+	handle /api/admin/local-models/uploads/* {
+		request_body {
+			max_size 80MB
+		}
+		reverse_proxy 127.0.0.1:8000 {
+			flush_interval -1
+			transport http {
+				keepalive 4s
+			}
+		}
+	}
+
+	# Зеркало Hugging Face для нод (под hf-mirror, main/hf_mirror.py): префикс /hf снимается. Без лимита тела и без
+	# буферизации: ответы — файлы моделей в десятки гигабайт с Range и докачкой. Ключ (HF_MIRROR_TOKEN) проверяет зеркало.
+	handle_path /hf/* {
+		reverse_proxy 127.0.0.1:@@HF_MIRROR_PORT@@ {
+			flush_interval -1
+			transport http {
+				keepalive 4s
+			}
+		}
+	}
+
+	# Чат Playground: картинки и текстовые файлы в сообщении (base64 в JSON), портал принимает до 20 МБ (MAX_BODY_BYTES
+	# в playground.py), здесь 24 МБ с запасом на служебные поля. Остальной портал остаётся на 1 МБ.
+	handle /api/playground/chat {
+		request_body {
+			max_size 24MB
+		}
+		reverse_proxy 127.0.0.1:8000 {
+			flush_interval -1
+			lb_try_duration 15s
+			request_buffers 64KB
+			transport http {
+				keepalive 4s
+			}
+		}
+	}
+
+	# Реестр образов для класса (CNCF registry в k3s главного, main/manifests/common-50-registry.yaml.tmpl): ноды и ПК
+	# класса берут образы ноды с главного по https://<главный>/v2/..., не с ghcr.io. Тот же сайт и тот же сертификат, что у
+	# портала: нового порта открывать не нужно, а CA главного ноды уже получают (/ca.crt). Только чтение (GET, HEAD) и только
+	# из подсетей REGISTRY_ALLOW_FROM (по умолчанию частные сети); запись разрешена лишь самому главному: install-main.sh
+	# кладёт образы прямо на 127.0.0.1:<порт>, мимо Caddy. Без лимита тела и без буферизации: слои до нескольких ГБ.
+	handle /v2/* {
+		@registry_denied not client_ip @@REGISTRY_ALLOW_FROM@@
+		respond @registry_denied `{"errors":[{"code":"DENIED","message":"Реестр образов доступен только из сети класса"}]}` 403
+		@registry_write not method GET HEAD
+		respond @registry_write `{"errors":[{"code":"DENIED","message":"Реестр образов открыт только для чтения"}]}` 405
+		reverse_proxy 127.0.0.1:@@REGISTRY_PORT@@ {
+			flush_interval -1
+			transport http {
+				keepalive 4s
+			}
+		}
+	}
+
+	handle {
+		request_body {
+			max_size 1MB
+		}
+		reverse_proxy 127.0.0.1:8000 {
+			flush_interval -1
+			lb_try_duration 15s
+			request_buffers 64KB
+			transport http {
+				keepalive 4s
+			}
+		}
+	}
+
+	# Ошибки самого Caddy (сервис за ним не отвечает, тело больше лимита): JSON по-русски вместо пустого ответа.
+	# /v1/* в формате ошибок OpenAI, портал в формате FastAPI ({"detail": ...}).
+	handle_errors 502 503 504 {
+		header Retry-After 15
+		header Content-Type "application/json; charset=utf-8"
+		@v1 path /v1/*
+		respond @v1 `{"error":{"message":"Шлюз моделей временно недоступен, повторите запрос через 15 секунд","type":"service_unavailable","code":"service_unavailable"}}` 503
+		@hf path /hf/*
+		respond @hf `{"error":"Зеркало Hugging Face временно недоступно, повторите запрос через 15 секунд"}` 503
+		@registry path /v2/*
+		respond @registry `{"errors":[{"code":"UNAVAILABLE","message":"Реестр образов временно недоступен, повторите запрос через 15 секунд"}]}` 503
+		respond `{"detail":"Портал временно недоступен, повторите запрос через 15 секунд"}` 503
+	}
+	handle_errors 413 {
+		header Content-Type "application/json; charset=utf-8"
+		@v1 path /v1/*
+		respond @v1 `{"error":{"message":"Запрос больше 32 МБ","type":"invalid_request_error","code":"request_too_large"}}` 413
+		@upload path /api/admin/local-models/uploads/*
+		respond @upload `{"detail":"Часть файла больше 80 МБ"}` 413
+		@playground path /api/playground/chat
+		respond @playground `{"detail":"Запрос больше 24 МБ: уберите часть изображений или файлов"}` 413
+		respond `{"detail":"Запрос больше 1 МБ"}` 413
+	}
+}
+
+# Порт 80: корневой сертификат для установки в браузеры, остальное на https.
+http:// {
+	handle /ca.crt {
+@@CA_HANDLER@@
+	}
+
+	handle {
+		redir https://{host}{uri} permanent
+	}
+}

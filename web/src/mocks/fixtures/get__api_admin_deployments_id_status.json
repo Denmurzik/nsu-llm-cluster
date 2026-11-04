@@ -1,0 +1,74 @@
+{
+  "spec_hash": "3f9a1c07be52",
+  "nodes": [
+    {
+      "name": "aud-101-pc01",
+      "source": "k8s",
+      "pods": [
+        {
+          "name": "llm-gemma-4-e4b-cpu-x7k2p",
+          "role": "inference",
+          "phase": "Running",
+          "ready": true,
+          "restarts": 0,
+          "message": "",
+          "last_log": null,
+          "progress": {
+            "stage": "ready",
+            "percent": null,
+            "done_bytes": null,
+            "total_bytes": null
+          }
+        }
+      ],
+      "applied": true
+    },
+    {
+      "name": "aud-101-pc02",
+      "source": "k8s",
+      "pods": [
+        {
+          "name": "llm-gemma-4-e4b-cpu-m4d9q",
+          "role": "inference",
+          "phase": "Running",
+          "ready": false,
+          "restarts": 2,
+          "message": "Загрузка модели",
+          "last_log": "llama_model_load: loading tensors 212/340",
+          "progress": {
+            "stage": "downloading",
+            "percent": 42.5,
+            "done_bytes": 2147483648,
+            "total_bytes": 5046586573
+          }
+        }
+      ],
+      "applied": false
+    },
+    {
+      "name": "aud-204-gpu01",
+      "source": "k8s",
+      "pods": [
+        {
+          "name": "llm-gemma-4-e4b-gpu-b2w8n",
+          "role": "inference",
+          "phase": "Running",
+          "ready": true,
+          "restarts": 0,
+          "message": "",
+          "last_log": null,
+          "progress": {
+            "stage": "ready",
+            "percent": null,
+            "done_bytes": null,
+            "total_bytes": null
+          }
+        }
+      ],
+      "applied": true
+    }
+  ],
+  "groups": [],
+  "placement_problems": [],
+  "ready_backends": 2
+}

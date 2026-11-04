@@ -1,0 +1,69 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: llm
+  labels:
+    app.kubernetes.io/part-of: nsu-llm
+---
+# Основа: deployments/static/nvidia-device-plugin.yml релиза v0.19.3 плюс runtimeClassName
+# и nodeSelector (на CPU-узле без GPU под ушёл бы в CrashLoop).
+# nvcr.io из РФ отвечает 403: плагин v0.19.3 собран из исходников в GPU-образ ноды (node/Dockerfile, стадия
+# device-plugin), а этот образ уже лежит в каталоге образов k3s каждой GPU-ноды (run-node: airgap/node.tar), поэтому
+# под не скачивает ничего (imagePullPolicy Never). DEVICE_PLUGIN_IMAGE в .env главного: официальный образ из
+# зеркала реестра, тогда IfNotPresent. Переменные NVIDIA_* такие же, как в официальном образе.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: nvidia-device-plugin-daemonset
+  namespace: kube-system
+  labels:
+    app.kubernetes.io/part-of: nsu-llm
+spec:
+  selector:
+    matchLabels:
+      name: nvidia-device-plugin-ds
+  updateStrategy:
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        name: nvidia-device-plugin-ds
+        app.kubernetes.io/part-of: nsu-llm
+    spec:
+      runtimeClassName: nvidia
+      nodeSelector:
+        llm.nsu/accel: nvidia
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+        - key: llm.nsu/class   # ПК класса (k3s agent --node-taint)
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      priorityClassName: system-node-critical
+      containers:
+        - name: nvidia-device-plugin-ctr
+          image: "$DEVICE_PLUGIN_IMAGE"
+          imagePullPolicy: $DEVICE_PLUGIN_PULL_POLICY
+          command: ["nvidia-device-plugin"]
+          env:
+            - name: FAIL_ON_INIT_ERROR
+              value: "false"
+            - name: NVIDIA_DISABLE_REQUIRE
+              value: "true"
+            - name: NVIDIA_VISIBLE_DEVICES
+              value: all
+            - name: NVIDIA_DRIVER_CAPABILITIES
+              value: compute,utility
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: device-plugin
+              mountPath: /var/lib/kubelet/device-plugins
+      volumes:
+        - name: device-plugin
+          hostPath:
+            path: /var/lib/kubelet/device-plugins

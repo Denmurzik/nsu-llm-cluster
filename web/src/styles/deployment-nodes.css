@@ -1,0 +1,69 @@
+/* ---------- deployments: the nodes of a row ---------- */
+
+/* the nodes are a line under the row, not a ninth column (it does not fit the page next to the other eight); the line
+   is one row of tags with or without the groups read, so nothing under it moves when they arrive */
+table.data tr.dep-row td {
+  padding-bottom: var(--s1);
+}
+table.data tr.dep-nodes-row td {
+  height: auto;
+  padding-top: 0;
+  padding-bottom: var(--s3);
+  border-top: 0;
+}
+/* the two lines of a deployment light up together */
+table.data tr.dep-row:hover,
+table.data tr.dep-row:hover + tr.dep-nodes-row,
+table.data tr.dep-row:has(+ tr.dep-nodes-row:hover) {
+  background: var(--hover);
+}
+
+.dep-nodes {
+  min-height: 20px;
+}
+.dep-node-list {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--s1) var(--s3);
+}
+.dep-node-group {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--s1);
+}
+.dep-node-plus {
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 16px;
+  color: var(--text-3);
+}
+.tag.dep-node-tag {
+  gap: var(--s2);
+}
+.tag.dep-node-more {
+  color: var(--text-3);
+}
+.dep-node-count {
+  display: none;
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 16px;
+  color: var(--text-2);
+  white-space: nowrap;
+}
+
+@media (max-width: 560px) {
+  /* the count stays at the left edge of the screen while the table scrolls sideways */
+  .dep-nodes {
+    position: sticky;
+    left: var(--s4);
+    width: max-content;
+  }
+  .dep-node-list {
+    display: none;
+  }
+  .dep-node-count {
+    display: inline;
+  }
+}

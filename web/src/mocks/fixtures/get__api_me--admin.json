@@ -1,0 +1,8 @@
+{
+  "id": "0b8d2f64-93a7-4c1e-8f21-6d5e7a9c4b02",
+  "email": "d.muruev@g.nsu.ru",
+  "username": "d.muruev",
+  "full_name": "Денис Муруев",
+  "role": "admin",
+  "csrf_token": "csrf-test-token-admin"
+}

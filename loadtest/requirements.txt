@@ -1,0 +1,7 @@
+httpx[http2]
+anyio
+# only for fake_backends.py (the fake OpenAI backend is pure Starlette) and the offline tests
+starlette
+uvicorn
+pytest
+respx

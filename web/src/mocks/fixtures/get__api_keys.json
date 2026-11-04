@@ -1,0 +1,20 @@
+[
+  {
+    "id": "3f6a9c1e-5b0d-4c7a-9e2f-8d1b7a4c6e12",
+    "alias": "курсовая",
+    "masked": "sk-…q7Zd",
+    "created_at": "2026-10-28T09:14:03Z",
+    "expires_at": "2027-01-26T09:14:03Z",
+    "tokens_30d": 184320,
+    "requests_30d": 412
+  },
+  {
+    "id": "b2d4e8a0-71c3-4f95-a6d8-0c9e3f5b1a09",
+    "alias": "лабораторная-3",
+    "masked": "sk-…a4F9",
+    "created_at": "2026-10-02T16:40:51Z",
+    "expires_at": null,
+    "tokens_30d": 53870,
+    "requests_30d": 96
+  }
+]

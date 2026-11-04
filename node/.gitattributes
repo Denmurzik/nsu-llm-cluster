@@ -1,0 +1,5 @@
+# scripts run inside Linux containers: never let a Windows checkout turn them into CRLF
+*.sh text eol=lf
+*.py text eol=lf
+Dockerfile text eol=lf
+rootfs/** text eol=lf

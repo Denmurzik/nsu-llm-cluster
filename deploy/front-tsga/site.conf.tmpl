@@ -1,0 +1,66 @@
+# nsu-llm-front: managed by switch-front.sh (NSU LLM Cluster, deploy/front-tsga). Откат: sudo ./switch-front.sh --rollback
+# Домен @@HOSTNAME@@ целиком проксируется на главный сервер https://@@MAIN@@ (docs/deploy-class.md,
+# «Домен double.fresh.nsuts.ru через сервер tsga»). Значения в двойных @ подставляет switch-front.sh.
+server {
+    listen 80;
+    server_name @@HOSTNAME@@;
+
+    location /.well-known/acme-challenge/ {
+        root /var/www/html;
+    }
+
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+
+server {
+    listen 443 ssl http2;
+    server_name @@HOSTNAME@@;
+
+    # сертификат tsga для пользователей: пути взяты из прежнего файла сайта
+    ssl_certificate @@SSL_CERTIFICATE@@;
+    ssl_certificate_key @@SSL_CERTIFICATE_KEY@@;
+
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers HIGH:!aNULL:!MD5;
+    ssl_prefer_server_ciphers on;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 1d;
+    ssl_session_tickets off;
+
+    # Лимиты тела задаёт Caddy главного (портал 1 МБ, /v1 32 МБ, части загрузки своих моделей 80 МБ).
+    client_max_body_size 0;
+
+    location / {
+        proxy_pass https://@@MAIN@@;
+
+        # TLS до главного: имя сайта в SNI и проверка сертификата главного по его корневому CA (/ca.crt главного).
+        # Цепочка внутреннего CA Caddy: сертификат сайта, промежуточный, корневой.
+        proxy_ssl_server_name on;
+        proxy_ssl_name @@HOSTNAME@@;
+        proxy_ssl_verify on;
+        proxy_ssl_verify_depth 2;
+        proxy_ssl_trusted_certificate @@CA@@;
+        proxy_ssl_protocols TLSv1.2 TLSv1.3;
+
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        # tsga первый прокси на пути клиента: адрес клиента записывается, а не дописывается к присланному им заголовку
+        # (главный доверяет X-Forwarded-For от tsga, TRUSTED_PROXIES)
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header X-Forwarded-Proto https;
+
+        # Потоки SSE (/v1/*, stream: true) и загрузка файлов моделей идут без буферизации в обе стороны; gzip из
+        # conf.d/gzip.conf тоже копил бы ответ.
+        proxy_buffering off;
+        proxy_request_buffering off;
+        gzip off;
+
+        # долгая генерация и ожидание в очереди главного
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+    }
+}

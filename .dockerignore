@@ -1,0 +1,13 @@
+ref/
+**/.env
+**/*.env
+**/.env.*
+!**/*.env.example
+.git
+.superpowers
+.claude
+**/node_modules
+**/.venv
+**/__pycache__
+web/dist
+docs

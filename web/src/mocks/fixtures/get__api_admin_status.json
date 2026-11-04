@@ -1,0 +1,84 @@
+{
+  "at": "2026-11-03T12:00:00+00:00",
+  "k8s_available": true,
+  "nodes": [
+    {
+      "name": "llm-main",
+      "source": "k8s",
+      "accel": "cpu",
+      "ready": true,
+      "is_main": true,
+      "vram_mib": null,
+      "mem_mib": 1048576,
+      "deployment": null,
+      "backends": 0,
+      "heartbeat_age_s": 3,
+      "maintenance": false,
+      "wakeable": false,
+      "wake": null
+    },
+    {
+      "name": "aud-204-gpu01",
+      "source": "k8s",
+      "accel": "nvidia",
+      "ready": true,
+      "is_main": false,
+      "vram_mib": 12288,
+      "mem_mib": 32768,
+      "deployment": "gemma-4-e4b",
+      "backends": 1,
+      "heartbeat_age_s": 9,
+      "maintenance": false,
+      "wakeable": true,
+      "wake": null
+    },
+    {
+      "name": "aud-101-pc02",
+      "source": "k8s",
+      "accel": "cpu",
+      "ready": true,
+      "is_main": false,
+      "vram_mib": null,
+      "mem_mib": 8192,
+      "deployment": null,
+      "backends": 0,
+      "heartbeat_age_s": 4,
+      "maintenance": true,
+      "wakeable": false,
+      "wake": null
+    },
+    {
+      "name": "win-laptop-07",
+      "source": "standalone",
+      "accel": "cpu",
+      "ready": false,
+      "is_main": false,
+      "vram_mib": null,
+      "mem_mib": 16384,
+      "deployment": null,
+      "backends": 0,
+      "heartbeat_age_s": 1260,
+      "maintenance": false,
+      "wakeable": true,
+      "wake": { "tries": 2, "max_tries": 6, "since": "2026-11-03T11:58:00+00:00" }
+    }
+  ],
+  "deployments": [
+    { "name": "gemma-4-e4b", "mode": "replicas", "enabled": true, "status": "ready", "ready_backends": 2, "assigned_nodes": 2 },
+    { "name": "qwen3-30b-a3b", "mode": "split", "enabled": true, "status": "starting", "ready_backends": 0, "assigned_nodes": 3 },
+    { "name": "llama-3-8b", "mode": "replicas", "enabled": false, "status": "off", "ready_backends": null, "assigned_nodes": 0 }
+  ],
+  "gateway": {
+    "available": true,
+    "last_5m": { "rate_limited": 12, "server_errors": 0 },
+    "last_1h": { "rate_limited": 340, "server_errors": 3 }
+  },
+  "main": { "gpu": "NVIDIA GeForce RTX 4090, 24564 MiB" },
+  "backups": {
+    "available": true,
+    "count": 14,
+    "last_at": "2026-11-03T03:17:00+00:00",
+    "last_age_s": 31320,
+    "last_size_bytes": 52428800
+  }
+}

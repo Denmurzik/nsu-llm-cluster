@@ -1,0 +1,15 @@
+{
+  "days": 7,
+  "prompt_tokens": 128450,
+  "completion_tokens": 96210,
+  "requests": 318,
+  "by_day": [
+    { "day": "2026-10-27", "tokens": 18420, "requests": 41 },
+    { "day": "2026-10-28", "tokens": 42710, "requests": 88 },
+    { "day": "2026-10-29", "tokens": 31960, "requests": 63 },
+    { "day": "2026-10-30", "tokens": 12080, "requests": 27 },
+    { "day": "2026-10-31", "tokens": 5340, "requests": 12 },
+    { "day": "2026-11-01", "tokens": 38900, "requests": 52 },
+    { "day": "2026-11-02", "tokens": 75250, "requests": 35 }
+  ]
+}

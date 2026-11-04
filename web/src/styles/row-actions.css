@@ -1,0 +1,60 @@
+/* ---------- table rows: the «⋯» menu of a deployment ---------- */
+
+/* «Проверить» and the «⋯» button; the menu itself is a layer over the page, so the row never changes height */
+.row-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--s1);
+}
+.btn.icon-only {
+  width: 32px;
+  padding: 0;
+  flex: none;
+}
+.btn.icon-only[aria-expanded="true"] {
+  background: var(--hover);
+  color: var(--text);
+}
+table.data th.actions {
+  text-align: right;
+}
+
+.row-menu {
+  position: fixed;
+  z-index: 40;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: var(--s1);
+  background: var(--card);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-ctl);
+  box-shadow: var(--shadow-float);
+  max-width: calc(100vw - 16px);
+}
+.row-menu-item {
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+  height: 32px;
+  padding: 0 var(--s2);
+  border: 0;
+  border-radius: var(--r-key);
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: background-color var(--t-fast) var(--ease);
+}
+.row-menu-item:hover,
+.row-menu-item:focus-visible {
+  background: var(--hover);
+}
+.row-menu-item.danger {
+  color: var(--bad);
+}
+.row-menu-item.danger svg.ic {
+  color: inherit;
+}

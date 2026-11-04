@@ -1,0 +1,7 @@
+{
+  "models": [
+    { "name": "gemma-4-e4b", "status": "ready", "ready_backends": 3 },
+    { "name": "qwen3-30b-a3b", "status": "starting", "ready_backends": 0 },
+    { "name": "llama-3-1-8b", "status": "down", "ready_backends": 0 }
+  ]
+}

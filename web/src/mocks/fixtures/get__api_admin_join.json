@@ -1,0 +1,7 @@
+{
+  "agent_token": "K10f3a9c7d2b84e61a05c9d7e3b2f18a64c5d0e9b7a31f26c8d4e5b0a97c1f3e2d8::node:9c2d47e1b8a05f36",
+  "main_host": "192.168.3.21",
+  "linux": "sudo ./run-node.sh --main 192.168.3.21 --token K10f3a9c7d2b84e61a05c9d7e3b2f18a64c5d0e9b7a31f26c8d4e5b0a97c1f3e2d8::node:9c2d47e1b8a05f36",
+  "linux_standalone": "sudo ./run-node.sh --main 192.168.3.21 --token K10f3a9c7d2b84e61a05c9d7e3b2f18a64c5d0e9b7a31f26c8d4e5b0a97c1f3e2d8::node:9c2d47e1b8a05f36 --mode standalone",
+  "windows": ".\\run-node.ps1 -Main 192.168.3.21 -Token K10f3a9c7d2b84e61a05c9d7e3b2f18a64c5d0e9b7a31f26c8d4e5b0a97c1f3e2d8::node:9c2d47e1b8a05f36"
+}

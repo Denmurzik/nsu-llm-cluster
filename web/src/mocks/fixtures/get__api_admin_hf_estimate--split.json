@@ -1,0 +1,64 @@
+{
+  "meta": {
+    "weights_bytes": 5046586573,
+    "arch": "gemma4",
+    "n_layers": 42,
+    "n_heads": 8,
+    "n_kv_heads": 2,
+    "head_dim": 256,
+    "max_ctx": 131072
+  },
+  "estimate": {
+    "weights_bytes": 5046586573,
+    "kv_bytes": 1409286144,
+    "total_bytes": 6455872717,
+    "per_node_bytes": 6992743629
+  },
+  "nodes": [
+    {
+      "name": "aud-101-pc01",
+      "capacity_bytes": 12670153523,
+      "fits": true
+    },
+    {
+      "name": "aud-101-pc02",
+      "capacity_bytes": 5368709120,
+      "fits": false
+    },
+    {
+      "name": "aud-204-gpu01",
+      "capacity_bytes": 11596411699,
+      "fits": true
+    }
+  ],
+  "recommended_group_size": 1,
+  "ctx_ok": true,
+  "placement": {
+    "fits": true,
+    "tensor_split": [20, 9, 24, 0],
+    "ram_bytes": 2411724800,
+    "speed_warning": true,
+    "nodes": [
+      {
+        "name": "aud-204-gpu01",
+        "leader": true,
+        "vram_bytes": 10737418240,
+        "vram_budget_bytes": 11274289152,
+        "gpu_layers": 20,
+        "ram_bytes": 2411724800,
+        "ram_budget_bytes": 19166291558,
+        "cpu_layers": 9
+      },
+      {
+        "name": "aud-204-gpu02",
+        "leader": false,
+        "vram_bytes": 11005853696,
+        "vram_budget_bytes": 11274289152,
+        "gpu_layers": 24,
+        "ram_bytes": 0,
+        "ram_budget_bytes": 0,
+        "cpu_layers": 0
+      }
+    ]
+  }
+}

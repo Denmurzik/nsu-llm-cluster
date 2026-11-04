@@ -1,0 +1,13 @@
+# Scripts, templates and configs run inside Linux containers: LF on every checkout, also with core.autocrlf=true
+# on Windows (a CRLF entrypoint.sh fails with `bash\r` and the container restarts forever).
+* text=auto eol=lf
+
+# binary files are never converted
+*.png binary
+*.jpg binary
+*.webp binary
+*.ico binary
+*.gguf binary
+*.tar binary
+*.zst binary
+*.gz binary

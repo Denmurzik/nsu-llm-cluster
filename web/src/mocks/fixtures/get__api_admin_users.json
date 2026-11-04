@@ -1,0 +1,32 @@
+[
+  {
+    "id": "0b8d2f64-93a7-4c1e-8f21-6d5e7a9c4b02",
+    "email": "d.muruev@g.nsu.ru",
+    "full_name": "Денис Муруев",
+    "role": "admin",
+    "created_at": "2026-10-20T08:00:00Z",
+    "last_login_at": "2026-11-02T09:58:41Z",
+    "keys": 2,
+    "tokens_30d": 12840
+  },
+  {
+    "id": "7c1f6a3e-5b0d-4a52-9d44-0e2b8c1f3a10",
+    "email": "a.petrova@g.nsu.ru",
+    "full_name": "Анна Петрова",
+    "role": "user",
+    "created_at": "2026-10-28T09:10:11Z",
+    "last_login_at": "2026-11-02T10:02:19Z",
+    "keys": 2,
+    "tokens_30d": 238190
+  },
+  {
+    "id": "e41a9b07-2c6d-4f83-b1a5-93d0c7f8e612",
+    "email": "i.sidorov@g.nsu.ru",
+    "full_name": "Игорь Сидоров",
+    "role": "user",
+    "created_at": "2026-10-30T14:22:05Z",
+    "last_login_at": null,
+    "keys": 0,
+    "tokens_30d": null
+  }
+]

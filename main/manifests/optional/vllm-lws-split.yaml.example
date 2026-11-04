@@ -1,0 +1,104 @@
+# НЕ ПРОВЕРЕНО. Пример разбиения одной модели между двумя GPU-узлами через vLLM и
+# LeaderWorkerSet (pipeline parallel). Не рендерится и не применяется автоматически.
+# Требования: CRD LeaderWorkerSet (leaderworkerset.x-k8s.io/v1) установлен отдельно,
+# два узла с llm.nsu/accel=nvidia, узлы видят друг друга по сети.
+# Основа: kubernetes-sigs/lws docs/examples/leaderworkerset/basic/vllm.yaml (без Ray);
+# источник и оценки: docs/research/inference.md §3.1. Для 1GbE разумен только PP, не TP.
+apiVersion: leaderworkerset.x-k8s.io/v1
+kind: LeaderWorkerSet
+metadata:
+  name: vllm-split
+  namespace: llm
+  labels:
+    app.kubernetes.io/part-of: nsu-llm
+spec:
+  replicas: 1
+  leaderWorkerTemplate:
+    size: 2
+    restartPolicy: RecreateGroupOnPodRestart
+    leaderTemplate:
+      metadata:
+        labels:
+          role: leader
+          app.kubernetes.io/part-of: nsu-llm
+      spec:
+        runtimeClassName: nvidia
+        nodeSelector:
+          llm.nsu/accel: nvidia
+        containers:
+          - name: vllm-leader
+            image: vllm/vllm-openai:v0.32.0
+            command: ["/bin/sh", "-c"]
+            args:
+              - >-
+                vllm serve google/gemma-4-12B-it-qat-w4a16-ct
+                --port 8080
+                --tensor-parallel-size 1
+                --pipeline-parallel-size 2
+                --nnodes $(LWS_GROUP_SIZE)
+                --node-rank $(LWS_WORKER_INDEX)
+                --master-addr $(LWS_LEADER_ADDRESS)
+            resources:
+              limits:
+                nvidia.com/gpu: "1"
+            ports:
+              - containerPort: 8080
+            readinessProbe:
+              tcpSocket:
+                port: 8080
+              initialDelaySeconds: 15
+              periodSeconds: 10
+            volumeMounts:
+              - name: dshm
+                mountPath: /dev/shm
+        volumes:
+          - name: dshm
+            emptyDir:
+              medium: Memory
+              sizeLimit: 15Gi
+    workerTemplate:
+      spec:
+        runtimeClassName: nvidia
+        nodeSelector:
+          llm.nsu/accel: nvidia
+        containers:
+          - name: vllm-worker
+            image: vllm/vllm-openai:v0.32.0
+            command: ["/bin/sh", "-c"]
+            args:
+              - >-
+                vllm serve google/gemma-4-12B-it-qat-w4a16-ct
+                --tensor-parallel-size 1
+                --pipeline-parallel-size 2
+                --nnodes $(LWS_GROUP_SIZE)
+                --node-rank $(LWS_WORKER_INDEX)
+                --master-addr $(LWS_LEADER_ADDRESS)
+                --headless
+            resources:
+              limits:
+                nvidia.com/gpu: "1"
+            volumeMounts:
+              - name: dshm
+                mountPath: /dev/shm
+        volumes:
+          - name: dshm
+            emptyDir:
+              medium: Memory
+              sizeLimit: 15Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-split-leader
+  namespace: llm
+  labels:
+    app.kubernetes.io/part-of: nsu-llm
+spec:
+  type: ClusterIP
+  selector:
+    leaderworkerset.sigs.k8s.io/name: vllm-split
+    role: leader
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080

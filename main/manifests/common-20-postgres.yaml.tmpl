@@ -1,0 +1,173 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: llm
+  labels:
+    app.kubernetes.io/part-of: nsu-llm
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-init
+  namespace: llm
+  labels:
+    app.kubernetes.io/part-of: nsu-llm
+data:
+  10-roles.sh: |
+    #!/bin/sh
+    # Выполняется образом postgres один раз, при инициализации пустого каталога данных.
+    # Пароли берутся из окружения контейнера (secret llm-secrets) и передаются в psql
+    # переменными, а не подставляются в текст SQL.
+    set -e
+    psql -v ON_ERROR_STOP=1 --username "$$POSTGRES_USER" --dbname postgres \
+      -v litellm_pw="$$LITELLM_DB_PASSWORD" -v portal_pw="$$PORTAL_DB_PASSWORD" <<'SQL'
+    CREATE ROLE litellm LOGIN PASSWORD :'litellm_pw';
+    CREATE DATABASE litellm OWNER litellm;
+    CREATE ROLE portal LOGIN PASSWORD :'portal_pw';
+    CREATE DATABASE portal OWNER portal;
+    SQL
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: llm
+  labels:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/part-of: nsu-llm
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: postgres
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: postgres
+        app.kubernetes.io/part-of: nsu-llm
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      nodeSelector:
+        kubernetes.io/hostname: llm-main
+      containers:
+        - name: postgres
+          image: postgres:17-alpine
+          # max_connections: LiteLLM (воркеры x database_connection_pool_limit) + портал, см. render_manifests.py
+          args: ["-c", "listen_addresses=127.0.0.1", "-c", "max_connections=$POSTGRES_MAX_CONNECTIONS"]
+          env:
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef: {name: llm-secrets, key: POSTGRES_PASSWORD}
+            - name: LITELLM_DB_PASSWORD
+              valueFrom:
+                secretKeyRef: {name: llm-secrets, key: LITELLM_DB_PASSWORD}
+            - name: PORTAL_DB_PASSWORD
+              valueFrom:
+                secretKeyRef: {name: llm-secrets, key: PORTAL_DB_PASSWORD}
+          ports:
+            - name: postgres
+              containerPort: 5432
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-h", "127.0.0.1", "-U", "postgres"]
+            periodSeconds: 5
+            failureThreshold: 12
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+            - name: init
+              mountPath: /docker-entrypoint-initdb.d
+              readOnly: true
+      volumes:
+        - name: init
+          configMap:
+            name: postgres-init
+            defaultMode: 0555
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          app.kubernetes.io/part-of: nsu-llm
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: local-path
+        resources:
+          requests:
+            storage: 5Gi
+---
+# Ежедневная копия баз portal и litellm (pg_dump -Fc) в /var/lib/llm/backups (том llm-main-data): хранится
+# $BACKUP_KEEP последних наборов. Восстановление: main/backup/pg-restore.sh, см. README.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-backup
+  namespace: llm
+  labels:
+    app.kubernetes.io/part-of: nsu-llm
+data:
+  pg-backup.sh: |
+$BACKUP_SH
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: postgres-backup
+  namespace: llm
+  labels:
+    app.kubernetes.io/name: postgres-backup
+    app.kubernetes.io/part-of: nsu-llm
+spec:
+  # UTC: контроллер работает в контейнере без часового пояса (21:17 UTC это 04:17 в Новосибирске)
+  schedule: "$BACKUP_SCHEDULE"
+  concurrencyPolicy: Forbid
+  # k3s был выключен в назначенную минуту: копия всё равно делается, если он поднялся в течение двух часов
+  startingDeadlineSeconds: 7200
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      activeDeadlineSeconds: 3600
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: postgres-backup
+            app.kubernetes.io/part-of: nsu-llm
+        spec:
+          restartPolicy: Never
+          hostNetwork: true
+          dnsPolicy: ClusterFirstWithHostNet
+          nodeSelector:
+            kubernetes.io/hostname: llm-main
+          containers:
+            - name: backup
+              # тот же образ, что у сервера: pg_dump другой старшей версии не снимает копию с этого сервера
+              image: postgres:17-alpine
+              command: ["sh", "/scripts/pg-backup.sh"]
+              env:
+                - {name: PGHOST, value: "127.0.0.1"}
+                - {name: PGUSER, value: postgres}
+                - name: PGPASSWORD
+                  valueFrom:
+                    secretKeyRef: {name: llm-secrets, key: POSTGRES_PASSWORD}
+                - {name: BACKUP_DIR, value: /backups}
+                - {name: BACKUP_KEEP, value: "$BACKUP_KEEP"}
+              volumeMounts:
+                - name: scripts
+                  mountPath: /scripts
+                  readOnly: true
+                - name: backups
+                  mountPath: /backups
+          volumes:
+            - name: scripts
+              configMap:
+                name: postgres-backup
+            # каталог главного контейнера: файлы лежат в томе llm-main-data и переживают пересоздание контейнера
+            - name: backups
+              hostPath:
+                path: /var/lib/llm/backups
+                type: DirectoryOrCreate

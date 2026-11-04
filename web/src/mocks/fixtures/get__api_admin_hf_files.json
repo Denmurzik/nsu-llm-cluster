@@ -1,0 +1,6 @@
+[
+  { "file": "gemma-4-E4B-it-Q8_0.gguf", "size_bytes": 8190735360, "quant": "Q8_0", "shards": [] },
+  { "file": "gemma-4-E4B-it-Q4_K_M.gguf", "size_bytes": 5046586573, "quant": "Q4_K_M", "shards": [] },
+  { "file": "UD-Q4_K_XL/gemma-4-E4B-it-UD-Q4_K_XL.gguf", "size_bytes": 5368709120, "quant": "UD-Q4_K_XL", "shards": [] },
+  { "file": "gemma-4-E4B-it-IQ4_XS.gguf", "size_bytes": 4513071104, "quant": "IQ4_XS", "shards": [] }
+]

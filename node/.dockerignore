@@ -1,0 +1,5 @@
+tests/
+README.md
+run-node.sh
+run-node.ps1
+.dockerignore

@@ -1,0 +1,38 @@
+[
+  {
+    "name": "gemma-4-e4b",
+    "engine": "llamacpp",
+    "mode": "replicas",
+    "group_size": 2,
+    "ctx_per_request": 8192,
+    "parallel": 2,
+    "ready_backends": 3,
+    "status": "ready",
+    "experimental": false,
+    "vision": false
+  },
+  {
+    "name": "qwen3-30b-a3b",
+    "engine": "llamacpp",
+    "mode": "split",
+    "group_size": 2,
+    "ctx_per_request": 16384,
+    "parallel": 1,
+    "ready_backends": 0,
+    "status": "starting",
+    "experimental": false,
+    "vision": false
+  },
+  {
+    "name": "llama-3-1-8b",
+    "engine": "vllm",
+    "mode": "replicas",
+    "group_size": 2,
+    "ctx_per_request": 4096,
+    "parallel": 4,
+    "ready_backends": 0,
+    "status": "down",
+    "experimental": false,
+    "vision": false
+  }
+]

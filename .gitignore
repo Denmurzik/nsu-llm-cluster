@@ -1,0 +1,19 @@
+# secrets & local reference material (contains prod NSU ID credentials)
+ref/
+.env
+*.env
+!*.env.example
+# local tooling
+.superpowers/
+node_modules/
+__pycache__/
+*.pyc
+.venv/
+dist/
+build/
+*.log
+# mass deployment: inventory, shared answers (DPAPI token) and per-host logs
+class-nodes.csv
+class-answers.json
+class-deploy-logs/
+.claude/skills/

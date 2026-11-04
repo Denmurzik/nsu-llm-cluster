@@ -1,0 +1,4 @@
+{
+  "name": "llm-gemma-4-e4b-cpu-m4d9q",
+  "lines": "llama_model_loader: loaded meta data with 38 key-value pairs\nllama_model_load: loading tensors 212/340\nllama_model_load: loading tensors 340/340\nsrv  log_server_r: request: GET /health 127.0.0.1 200"
+}

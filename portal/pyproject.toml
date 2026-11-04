@@ -1,0 +1,44 @@
+[project]
+name = "nsu-llm-portal"
+version = "0.1.0"
+description = "NSU LLM Cluster portal"
+requires-python = ">=3.12"
+dependencies = [
+  "fastapi",
+  "uvicorn[standard]",
+  "pydantic-settings",
+  "sqlalchemy[asyncio]>=2",
+  "asyncpg",
+  "alembic",
+  "authlib",
+  "httpx",
+  "joserfc",
+  "kubernetes_asyncio",
+  "redis",
+  "starlette",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest",
+  "pytest-asyncio",
+  "asgi-lifespan",
+  "respx",
+  "testcontainers[postgres]",
+  "cryptography",
+  "fakeredis[lua]",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"
+testpaths = ["tests"]
+markers = ["docker: test needs Docker (testcontainers)"]

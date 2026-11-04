@@ -1,0 +1,98 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: llm
+  labels:
+    app.kubernetes.io/part-of: nsu-llm
+---
+# Кэширующее зеркало Hugging Face (main/hf_mirror.py): ноды качают модель через https://<PUBLIC_HOSTNAME>/hf/, зеркало
+# скачивает каждый файл из интернета один раз. Файлы лежат в /var/lib/llm-hf главного контейнера (том llm-main-hf),
+# туда же администратор кладёт модели руками, если у главного нет интернета (docs/hf-mirror.md).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hf-mirror
+  namespace: llm
+  labels:
+    app.kubernetes.io/part-of: nsu-llm
+data:
+  hf_mirror.py: |
+$HF_MIRROR_PY
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hf-mirror
+  namespace: llm
+  labels:
+    app.kubernetes.io/name: hf-mirror
+    app.kubernetes.io/part-of: nsu-llm
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: hf-mirror
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: hf-mirror
+        app.kubernetes.io/part-of: nsu-llm
+      annotations:
+        llm.nsu/config-hash: "$CONFIG_HASH"
+        # HF_TOKEN читается при старте контейнера: новый токен меняет шаблон, и под перезапускается
+        llm.nsu/hf-token: "$HF_TOKEN_FINGERPRINT"
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      nodeSelector:
+        kubernetes.io/hostname: llm-main
+      containers:
+        # python3 образа LiteLLM: образ уже есть на главном (и в офлайн-наборе run-main --airgap), скрипт без зависимостей
+        - name: hf-mirror
+          image: ghcr.io/berriai/litellm:v1.106.6
+          command: ["python3", "/opt/hf-mirror/hf_mirror.py"]
+          securityContext:
+            runAsUser: 0
+          env:
+            - {name: HF_MIRROR_DIR, value: /data}
+            - {name: HF_MIRROR_HOST, value: 127.0.0.1}
+            - {name: HF_MIRROR_PORT, value: "$HF_MIRROR_PORT"}
+            - {name: HF_MIRROR_MAX_GIB, value: "$HF_MIRROR_MAX_GIB"}
+            - {name: HF_MIRROR_UPSTREAM, value: "$HF_MIRROR_UPSTREAM"}
+            - {name: HF_MIRROR_PREFIX, value: /hf}
+            - {name: PYTHONUNBUFFERED, value: "1"}
+            # токен Hugging Face остаётся на главном: ноды получают только HF_MIRROR_TOKEN
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef: {name: llm-secrets, key: HF_TOKEN, optional: true}
+            - name: HF_MIRROR_TOKEN
+              valueFrom:
+                secretKeyRef: {name: llm-secrets, key: HF_MIRROR_TOKEN}
+$HF_MIRROR_PROXY_ENV
+          ports:
+            - name: http
+              containerPort: $HF_MIRROR_PORT
+          readinessProbe:
+            httpGet: {host: 127.0.0.1, port: $HF_MIRROR_PORT, path: /_mirror/health}
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: {host: 127.0.0.1, port: $HF_MIRROR_PORT, path: /_mirror/health}
+            periodSeconds: 20
+            timeoutSeconds: 10
+            failureThreshold: 6
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: code
+              mountPath: /opt/hf-mirror
+              readOnly: true
+      volumes:
+        - name: data
+          hostPath:
+            path: /var/lib/llm-hf
+            type: DirectoryOrCreate
+        - name: code
+          configMap:
+            name: hf-mirror
