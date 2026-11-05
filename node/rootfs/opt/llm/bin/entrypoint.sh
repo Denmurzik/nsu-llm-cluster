@@ -62,10 +62,14 @@ case "$MODE" in
       cp "$k3s_data/node-password" "$node_etc/password"
       chmod 600 "$k3s_data/node-password" "$node_etc/password"
     )
-    # Wake-on-LAN: the NIC run-node passed (WOL_MAC, WOL_IP, WOL_PREFIX) is reported to the portal in the background
-    # until the portal takes it; the token reaches the registrar through its environment, never argv.
-    if [ -n "${WOL_MAC:-}" ]; then
-      CLUSTER_TOKEN="$K3S_TOKEN" registrar.sh --wake-report &
+    # What the portal learns from this container in the background, until it takes it: the image it runs (version, revision, digest;
+    # «Версии» of the admin pages and the update from the panel) and the NIC run-node passed (WOL_MAC, WOL_IP, WOL_PREFIX) for
+    # Wake-on-LAN. The token reaches the registrar through its environment, never argv.
+    CLUSTER_TOKEN="$K3S_TOKEN" registrar.sh --report &
+    # The size of the models volume goes to the portal every few minutes (the «Ноды» page, the cleanup of task 2-26);
+    # MODELS_REPORT_S=0 switches it off.
+    if [ "${MODELS_REPORT_S:-300}" != 0 ]; then
+      CLUSTER_TOKEN="$K3S_TOKEN" registrar.sh --models-report &
     fi
     # Pod images come from the registry of main first (https://$MAIN_HOST/v2/, read-only, the campus LAN) and only then from
     # the internet: k3s appends the original registry to the endpoint list of a mirror. Pods ask for the bare name
@@ -96,6 +100,11 @@ configs:
       $reg_tls
 REGISTRIES
     fi
+    # monitoring: the load of the node (GPU, VRAM, RAM, CPU, model disk, llama/rpc up) goes to the portal every 20 s;
+    # NODE_METRICS=0 switches it off. The token reaches the collector through its environment, never argv.
+    if [ "${NODE_METRICS:-1}" != 0 ]; then
+      CLUSTER_TOKEN="$K3S_TOKEN" node-metrics.sh &
+    fi
     # k3s must stay PID 1: it evacuates the root cgroup (cgroup v2) only as PID 1.
     exec k3s "${args[@]}"
     ;;
@@ -103,6 +112,9 @@ REGISTRIES
     : "${MAIN_URL:?MAIN_URL or MAIN_HOST is required in standalone mode}"
     : "${CLUSTER_TOKEN:?CLUSTER_TOKEN is required}"
     : "${NODE_IP:?NODE_IP is required in standalone mode}"
+    if [ "${NODE_METRICS:-1}" != 0 ]; then
+      node-metrics.sh &  # monitoring, as in k3s mode
+    fi
     exec registrar.sh
     ;;
   *)

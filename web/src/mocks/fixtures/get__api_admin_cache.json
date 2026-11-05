@@ -1,0 +1,75 @@
+{
+  "files": [
+    {
+      "repo": "org/big-GGUF",
+      "path": "Q4_K_M/big-Q4_K_M-00001-of-00002.gguf",
+      "revision": "9f2c4d1e8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c3d",
+      "size": 42949672960,
+      "total": 42949672960,
+      "mtime": 1762171080.5,
+      "last_served": 1762174680.25,
+      "downloading": false,
+      "partial": false,
+      "busy": false,
+      "used_by": []
+    },
+    {
+      "repo": "org/big-GGUF",
+      "path": "Q4_K_M/big-Q4_K_M-00002-of-00002.gguf",
+      "revision": "9f2c4d1e8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c3d",
+      "size": 21474836480,
+      "total": 21474836480,
+      "mtime": 1762171400.5,
+      "last_served": 1762174690.25,
+      "downloading": false,
+      "partial": false,
+      "busy": true,
+      "used_by": []
+    },
+    {
+      "repo": "org/model-GGUF",
+      "path": "model-Q4_K_M.gguf",
+      "revision": "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d",
+      "size": 4294967296,
+      "total": 4294967296,
+      "mtime": 1762081080.5,
+      "last_served": 1762174000.75,
+      "downloading": false,
+      "partial": false,
+      "busy": false,
+      "used_by": [{ "id": 1, "name": "m1", "enabled": true }]
+    },
+    {
+      "repo": "org/model-GGUF",
+      "path": "mmproj-F16.gguf",
+      "revision": "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d",
+      "size": 1038090240,
+      "total": 1038090240,
+      "mtime": 1762081100.5,
+      "last_served": 1762081300.5,
+      "downloading": false,
+      "partial": false,
+      "busy": false,
+      "used_by": []
+    },
+    {
+      "repo": "org/new-GGUF",
+      "path": "new-Q8_0.gguf",
+      "revision": "5d4c3b2a1908f7e6d5c4b3a291807f6e5d4c3b2a",
+      "size": 3221225472,
+      "total": 8589934592,
+      "mtime": null,
+      "last_served": null,
+      "downloading": true,
+      "partial": true,
+      "busy": false,
+      "written": 3221225472,
+      "used_by": []
+    }
+  ],
+  "used_bytes": 72978792448,
+  "limit_bytes": 161061273600,
+  "disk_total_bytes": 1099511627776,
+  "disk_free_bytes": 644245094400,
+  "disk_reserve_bytes": 164926744166
+}

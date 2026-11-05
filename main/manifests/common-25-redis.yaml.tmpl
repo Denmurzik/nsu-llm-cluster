@@ -8,6 +8,9 @@ metadata:
 # Общее состояние процессов шлюза и портала: счётчики rpm/tpm и cooldown LiteLLM, синхронизация моделей
 # между воркерами, кэш ключей песочницы портала. Без сохранения на диск: после перезапуска всё
 # восстанавливается само (ключи песочницы выдаются заново).
+# Пароль (requirepass, REDIS_PASSWORD из llm-secrets): поды главного живут в одном сетевом пространстве (hostNetwork), и без
+# него любой процесс с доступом к 127.0.0.1 писал бы в кэш авторизации ключей LiteLLM (SEC-2 M2). Пароль не попадает в argv:
+# redis-server читает его из файла конфигурации, redis-cli из REDISCLI_AUTH.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -28,14 +31,30 @@ spec:
       labels:
         app.kubernetes.io/name: redis
         app.kubernetes.io/part-of: nsu-llm
+      annotations:
+        # пароль читается при старте: новый REDIS_PASSWORD меняет шаблон, и под перезапускается (вместе с LiteLLM)
+        llm.nsu/redis-password: "$REDIS_PASSWORD_FINGERPRINT"
     spec:
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
-      nodeSelector:
-        kubernetes.io/hostname: llm-main
+      # только llm-main: по имени объекта Node (его не присвоить себе чужой ноде), а не по метке kubernetes.io/hostname,
+      # которую kubelet ставит себе сам; taint главного (entrypoint.sh) терпят только его поды
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchFields:
+                  - {key: metadata.name, operator: In, values: [llm-main]}
+      tolerations:
+        - {key: node-role.kubernetes.io/control-plane, operator: Exists, effect: NoSchedule}
       containers:
         - name: redis
           image: redis:7-alpine
+          command:
+            - sh
+            - -c
+            - umask 077 && printf 'requirepass %s\n' "$$REDIS_PASSWORD" >/tmp/redis.conf && exec redis-server /tmp/redis.conf "$$@"
+            - redis-server
           args:
             - --bind
             - 127.0.0.1
@@ -49,15 +68,23 @@ spec:
             - 256mb
             - --maxmemory-policy
             - allkeys-lru
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef: {name: llm-secrets, key: REDIS_PASSWORD}
+            - name: REDISCLI_AUTH
+              valueFrom:
+                secretKeyRef: {name: llm-secrets, key: REDIS_PASSWORD}
           ports:
             - name: redis
               containerPort: 6379
+          # PONG, а не код возврата: на ошибку (NOAUTH) redis-cli тоже завершается с 0
           readinessProbe:
             exec:
-              command: ["redis-cli", "-h", "127.0.0.1", "-p", "6379", "ping"]
+              command: ["sh", "-c", "redis-cli -h 127.0.0.1 -p 6379 ping | grep -qx PONG"]
             periodSeconds: 5
           livenessProbe:
             exec:
-              command: ["redis-cli", "-h", "127.0.0.1", "-p", "6379", "ping"]
+              command: ["sh", "-c", "redis-cli -h 127.0.0.1 -p 6379 ping | grep -qx PONG"]
             periodSeconds: 20
             failureThreshold: 3

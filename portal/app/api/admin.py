@@ -1,6 +1,5 @@
-"""Admin API: merged node list, join commands, users with keys and usage, logs of portal-owned pods."""
+"""Admin API: merged node list, join commands, logs of portal-owned pods."""
 
-import asyncio
 import json
 import logging
 from datetime import UTC, datetime, timedelta
@@ -12,25 +11,23 @@ from kubernetes_asyncio.client import ApiException
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app import audit, settings_store
 from app.auth.sessions import require_admin, require_csrf
 from app.catalog.estimate import node_capacity_bytes
 from app.config import Settings
 from app.controllers.backends import BACKEND_STATUS_KEY
 from app.db import get_session
-from app.deployments import service
-from app.deps import REDIS_ERRORS, get_k8s, get_litellm, get_settings_dep
-from app.k8s import K8sUnavailable
-from app.litellm_client import LiteLLMError, LiteLLMUnavailable
-from app.models import ApiKeyRef, ControllerTimer, NodeAssignment, NodeWake, StandaloneNode, User
-from app.nodes import relay, wake
+from app.deployments import schedule, service
+from app.deps import REDIS_ERRORS, get_k8s, get_settings_dep
+from app.k8s import MAIN_NODE, K8sUnavailable
+from app.models import AuditLog, ControllerTimer, NodeAssignment, NodeIdentity, NodeModels, NodeWake, StandaloneNode, User
+from app.nodes import cleanup, identity, registry, relay, wake
 
 log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/admin", dependencies=[Depends(require_admin)])
 
 _K8S_ERRORS = (K8sUnavailable, ApiException)
-USAGE_DAYS = 30
-USAGE_CONCURRENCY = 8
 
 
 def _iso(value: datetime | None) -> str | None:
@@ -79,9 +76,52 @@ async def collect_nodes(
         row = assignments.get(name)
         return row is not None and row.maintenance
 
+    identities = {r.name: r for r in (await db.scalars(select(NodeIdentity))).all()}
+    approval_required = await identity.approval_required(state)
+    claims = await identity.claims_by_name(db)
+    # what the admin compares a claim with: every address the portal knows for the name (only names with claims: rare)
+    known: dict[str, list[str]] = {}
+    for name in claims:
+        row = identities.get(name) or NodeIdentity(name=name)
+        known[name] = sorted(await identity.known_addresses(db, row, k8s))
+    since = datetime.now(UTC) - timedelta(seconds=identity.CLAIM_TTL_S)
+    refused_rows = await db.execute(
+        select(AuditLog.target, func.count())
+        .where(AuditLog.action == "node.claim_refused", AuditLog.at >= since)
+        .group_by(AuditLog.target)
+    )
+    refused = {target: count for target, count in refused_rows.all()}
+
+    def identity_of(name: str, is_main: bool = False) -> dict[str, Any]:
+        """Approved or waiting for the admin (app.nodes.identity), whether the node has its own key, the address it last
+        called from, and the claims on its name with the addresses the portal knows for it (what the admin compares)."""
+        if is_main:
+            return {
+                "approved": True, "has_key": False, "claim_ip": None, "legacy": False, "claims": [],
+                "known_addresses": [], "claims_refused": 0,
+            }
+        row = identities.get(name)
+        mine = known.get(name, [])
+        return {
+            "approved": identity.is_approved(row, approval_required),
+            "has_key": row is not None and row.key_hash is not None,
+            "claim_ip": row.last_ip if row is not None else None,
+            # a node of before without its own key (an old image): it works from its old address until the window ends
+            "legacy": row is not None and row.legacy and row.key_hash is None,
+            # other registrations of this name, for the admin to pick from or reject (never approved in bulk)
+            "claims": [
+                {"id": c.id, "ip": c.ip, "at": c.at.isoformat(), "known": bool(c.ip) and identity._norm(c.ip) in mine}
+                for c in claims.get(name, [])
+            ],
+            "known_addresses": mine,
+            "claims_refused": refused.get(name, 0),
+        }
+
     nics = set((await db.scalars(select(NodeWake.node_name))).all())
+    models = {m.node_name: m.models_bytes for m in (await db.scalars(select(NodeModels))).all()}
     timers = select(ControllerTimer).where(ControllerTimer.key.startswith(wake.TIMER_PREFIX))
     waking = {t.key.removeprefix(wake.TIMER_PREFIX): t for t in (await db.scalars(timers)).all()}
+    wol_max_tries = await settings_store.get(db, "wol_max_tries", settings)
 
     def wake_of(name: str) -> dict[str, Any]:
         """The node reported its NIC (the «Разбудить» button works), and the controller's attempts while it is down."""
@@ -90,7 +130,7 @@ async def collect_nodes(
         if t is not None:
             tries = int(t.members) if t.members.isdigit() else 0
             since = datetime.fromtimestamp(t.since, UTC).isoformat()
-            state = {"tries": tries, "max_tries": settings.wol_max_tries, "since": since}
+            state = {"tries": tries, "max_tries": wol_max_tries, "since": since}
         return {"wakeable": name in nics, "wake": state}
 
     result: list[dict[str, Any]] = []
@@ -128,7 +168,9 @@ async def collect_nodes(
                 "version": n.kubelet_version,
                 "is_main": n.is_main,
                 "maintenance": maintenance_of(name),
+                "models_bytes": models.get(name),
                 **wake_of(name),
+                **identity_of(name, n.is_main),
             }
         )
     cutoff = datetime.now(UTC) - timedelta(seconds=settings.standalone_ttl_s)
@@ -153,7 +195,9 @@ async def collect_nodes(
                 "version": s.version or None,
                 "is_main": False,
                 "maintenance": maintenance_of(name),
+                "models_bytes": models.get(name),
                 **wake_of(name),
+                **identity_of(name),
             }
         )
     return k8s_available, result, backends, heartbeat_at
@@ -204,6 +248,8 @@ async def wake_node(
     via = await _wake_via_node(request.app.state, db, settings, name, nic, k8s_nodes)
     if via is None and len(errors) >= len(addrs) * len(wake.PORTS):
         raise HTTPException(502, f"Пакет пробуждения не отправлен: {errors[0] if errors else 'нет адреса подсети'}")
+    await audit.record(db, user, "node.wake", "node", name, {"targets": addrs, "relay": via}, audit.client_ip(request))
+    await db.commit()
     return {"node": name, "targets": addrs, "relay": via}
 
 
@@ -215,7 +261,9 @@ async def _wake_via_node(state, db: AsyncSession, settings: Settings, name: str,
         return None
     nics = {w.node_name: w for w in (await db.scalars(select(NodeWake))).all()}
     live = await service.live_nodes(db, settings.standalone_ttl_s)
-    r = wake.pick_relay(name, nic.ip, nic.prefix, relay.candidates(k8s_nodes, live, nics))
+    candidates = relay.candidates(k8s_nodes, live, nics)
+    approved = await identity.approved_names(db, [c.name for c in candidates], await identity.approval_required(state))
+    r = wake.pick_relay(name, nic.ip, nic.prefix, [c for c in candidates if c.name in approved])
     if r is None:
         return None
     error = await relay.send_via(state, r, name, nic.mac, broadcast)
@@ -226,9 +274,89 @@ async def _wake_via_node(state, db: AsyncSession, settings: Settings, name: str,
     return r.name
 
 
+@router.post("/nodes/{name}/purge-models", dependencies=[Depends(require_csrf)])
+async def purge_models(
+    name: str,
+    request: Request,
+    db: AsyncSession = Depends(get_session),
+    k8s=Depends(get_k8s),
+    settings: Settings = Depends(get_settings_dep),
+    user: User = Depends(require_admin),
+) -> dict[str, Any]:
+    """The «Очистить модели» button: removes from the node's models volume (the model files and the rpc tensor cache)
+    everything its deployment does not need. A node without a deployment loses all of it. What the node serves
+    now, with its draft model and projector, stays, and so does the tensor cache of its split group. The answer comes
+    when the node has done it (a Job on a k3s node, the next heartbeats of a standalone one), or says `pending` when it has not
+    within the wait (app.nodes.cleanup)."""
+    name = name.strip().lower()
+    if name == MAIN_NODE:
+        raise HTTPException(409, "На главном сервере нет весов моделей класса")
+    k8s_error = False
+    try:
+        k8s_nodes = await k8s.list_nodes()
+    except _K8S_ERRORS as exc:
+        log.warning("purge models: cluster unavailable: %s", exc)
+        k8s_error, k8s_nodes = True, []
+    known = next((n for n in k8s_nodes if n.name.lower() == name), None)
+    if known is not None:
+        source, accel, live = "k8s", known.accel, known.ready
+    else:
+        record = await db.get(StandaloneNode, name)
+        if record is None:
+            raise HTTPException(503 if k8s_error else 404, "Кластер недоступен" if k8s_error else "Нода не найдена")
+        fresh = {sn.name.lower() for sn in await service.live_nodes(db, settings.standalone_ttl_s)}
+        source, accel, live = "standalone", record.accel, name in fresh
+    if not live:
+        raise HTTPException(409, "Нода не в сети: очистку выполняет сама нода, включите её и повторите")
+    deployments = await service.list_all(db)
+    _, needed = cleanup.node_deployments(
+        await db.get(NodeAssignment, name), deployments, accel, source, schedule.now_utc(), settings.schedule_drain_s
+    )
+    keep = cleanup.keep_for(needed)
+    state = request.app.state
+    ref, error = await cleanup.send(state, name, source, accel, keep)
+    if ref is None:
+        raise HTTPException(502, f"Не удалось передать команду ноде: {error}")
+    log.info(
+        "models cleanup: %s cleans node %s (%s), keeping %s%s", user.email, name, ref,
+        ", ".join(keep.files) or "no model files", ", the tensor cache" if keep.rpc else "",
+    )
+    outcome = await cleanup.wait(state, name, source, ref)
+    # one commit: the new size of the volume and the audit row; a failed attempt is logged too
+    if outcome.state == "done" and outcome.models_bytes is not None:
+        await registry.set_models(db, name, outcome.models_bytes)
+    details = {
+        "status": outcome.state, "freed_bytes": outcome.freed_bytes if outcome.state == "done" else None,
+        "kept": list(keep.files), "kept_rpc": keep.rpc, "skipped": outcome.skipped,
+    }
+    if outcome.state == "failed":
+        details["error"] = outcome.error
+    await audit.record(db, user, "node.purge_models", "node", name, details, audit.client_ip(request))
+    await db.commit()
+    if outcome.state == "failed":
+        raise HTTPException(502, f"Очистка не выполнена: {outcome.error}")
+    return {
+        "node": name,
+        "status": "done" if outcome.state == "done" else "pending",
+        "freed_bytes": outcome.freed_bytes if outcome.state == "done" else None,
+        "models_bytes": outcome.models_bytes,
+        "removed": outcome.removed,
+        "skipped": outcome.skipped,
+    }
+
+
 @router.get("/join")
-async def join(k8s=Depends(get_k8s), settings: Settings = Depends(get_settings_dep)) -> dict[str, str]:
+async def join(
+    request: Request,
+    admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_session),
+    k8s=Depends(get_k8s),
+    settings: Settings = Depends(get_settings_dep),
+) -> dict[str, str]:
     token = _agent_token(k8s, settings)
+    # the token joins nodes to the cluster: who looked at it and from where stays in the journal (finding L4)
+    await audit.record(db, admin, "node.join_token", "cluster", "agent_token", None, audit.client_ip(request))
+    await db.commit()
     host = settings.main_advertise_ip or settings.public_hostname
     linux = f"sudo ./run-node.sh --main {host} --token {token}"
     return {
@@ -248,54 +376,6 @@ def _agent_token(k8s, settings: Settings) -> str:
         raise HTTPException(503, "Токен подключения нод не создан: перезапустите главный сервер")
     full = k8s.read_token_file(settings.agent_token_file)
     return full if full and full.endswith("::node:" + raw) else raw
-
-
-async def _tokens_30d(litellm, user_ids: list[str]) -> dict[str, int | None]:
-    """Prompt plus completion tokens of the last 30 days per user; None when LiteLLM cannot tell."""
-    if not user_ids or not await litellm.health():
-        return dict.fromkeys(user_ids)
-    end = datetime.now(UTC).date()
-    start = end - timedelta(days=USAGE_DAYS - 1)
-    gate = asyncio.Semaphore(USAGE_CONCURRENCY)
-
-    async def one(user_id: str) -> int | None:
-        async with gate:
-            try:
-                activity = await litellm.user_activity(user_id, start, end)
-            except (LiteLLMUnavailable, LiteLLMError) as exc:
-                log.warning("admin users: no usage for %s: %s", user_id, exc)
-                return None
-            return activity.prompt_tokens + activity.completion_tokens
-
-    return dict(zip(user_ids, await asyncio.gather(*(one(u) for u in user_ids)), strict=True))
-
-
-@router.get("/users")
-async def users(db: AsyncSession = Depends(get_session), litellm=Depends(get_litellm)) -> list[dict[str, Any]]:
-    rows = (await db.scalars(select(User).order_by(User.created_at, User.email))).all()
-    counts = dict(
-        (
-            await db.execute(
-                select(ApiKeyRef.user_id, func.count())
-                .where(ApiKeyRef.is_playground.is_(False))
-                .group_by(ApiKeyRef.user_id)
-            )
-        ).all()
-    )
-    tokens = await _tokens_30d(litellm, [str(u.id) for u in rows])
-    return [
-        {
-            "id": str(u.id),
-            "email": u.email,
-            "full_name": u.full_name,
-            "role": u.role,
-            "created_at": _iso(u.created_at),
-            "last_login_at": _iso(u.last_login_at),
-            "keys": counts.get(u.id, 0),
-            "tokens_30d": tokens[str(u.id)],
-        }
-        for u in rows
-    ]
 
 
 @router.get("/pods/{name}/logs")

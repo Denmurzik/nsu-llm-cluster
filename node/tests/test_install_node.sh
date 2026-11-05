@@ -194,6 +194,10 @@ for a in "$@"; do [ "$prev" = -o ] && out="$a"; prev="$a"; url="$a"; done
 case "$url" in
   *:6443*) [ "${FAKE_K3S:-up}" = up ] && { printf 401; exit 0; }; printf 000; exit 28 ;;
 esac
+case "$url" in
+  */api/node-image) # the public name of the node image: FAKE_NODE_IMAGE is the JSON body (unset: an older main without the endpoint)
+    if [ -n "${FAKE_NODE_IMAGE:-}" ]; then [ -n "$out" ] && printf '%s' "$FAKE_NODE_IMAGE" > "$out"; printf 200; else printf 404; fi; exit 0 ;;
+esac
 case "${FAKE_READYZ:-ok}" in
   ok) [ -n "$out" ] && printf '{"db":true,"litellm":true}' > "$out"; printf 200 ;;
   503) [ -n "$out" ] && printf '{"db":true,"litellm":false}' > "$out"; printf 503 ;;
@@ -215,9 +219,11 @@ EOS
   # hermetic: run-node.ps1 keeps its state (state/labels, ca.crt, airgap) in a temp dir, never in the real C:\ProgramData
   mkdir -p "$TMP/nodedata"; export NSU_LLM_DATA_DIR="$(cygpath -w "$TMP/nodedata")"
   export FAKE_WIN_GPU='NVIDIA GeForce RTX 4070, 576.02, 12282' FAKE_WSL_GPU=1 FAKE_DISTROS='NSU-LLM' FAKE_RUNNING='NSU-LLM' \
-    FAKE_IMAGES='nsu-llm-node:0.1.0-gpu nsu-llm-node:0.1.0-cpu'
+    FAKE_IMAGES='nsu-llm-node:0.2.0-gpu nsu-llm-node:0.2.0-cpu'
   # Docker Desktop is detected by its docker-desktop distro or its exe; the dev machine has the exe, so point it away
   export NSU_LLM_DOCKER_DESKTOP_EXE='C:\no\Docker Desktop.exe'
+  # a developer may run the tests over ssh: the installer must not take this session for the remote one unless a test says so
+  export NSU_LLM_ASSUME_REMOTE=0
   # Network adapters with IPv4 addresses (Get-NetAdapter + Get-NetIPAddress), and Fast Startup, for Wake-on-LAN
   NIC_ETH='{"Name":"Ethernet","Description":"Intel(R) Ethernet Connection I219-V","Mac":"00-1A-2B-3C-4D-5E","Ip":"10.1.2.3","Prefix":24,"Hardware":true,"Virtual":false,"Media":"802.3","PmWake":"Disabled","MagicAdv":"0","S5":"0","Armed":false}'
   NIC_WSL='{"Name":"vEthernet (WSL (Hyper-V firewall))","Description":"Hyper-V Virtual Ethernet Adapter","Mac":"00-15-5D-01-02-03","Ip":"172.20.0.1","Prefix":20,"Hardware":false,"Virtual":true,"Media":"802.3"}'
@@ -252,12 +258,17 @@ EOS
   contains "standby off on DC" "$out" "powercfg /setdcvalueindex SCHEME_CURRENT SUB_SLEEP STANDBYIDLE 0"
   contains "hibernate idle off" "$out" "powercfg /setacvalueindex SCHEME_CURRENT SUB_SLEEP HIBERNATEIDLE 0"
   contains "hibernation off" "$out" "powercfg /hibernate off"
-  # firewall: Hyper-V rule (mirrored WSL) and Windows rule (run-node), both limited to -AllowFrom (default: /24 + main)
-  contains "hyper-v rule for WSL" "$out" "New-NetFirewallHyperVRule -Name NSU-LLM-Node"
+  # firewall (SEC-3, H2): run-node sets both firewalls; 18080 only for main, 18050 (RPC without authentication) only for main and,
+  # later, the nodes of the split group main names; the subnet of the class is never opened
+  contains "hyper-v rule for WSL" "$out" "New-NetFirewallHyperVRule -Name NSU-LLM-Node "
   contains "hyper-v rule VMCreatorId" "$out" "{40E0AC32-46A5-438A-A0B2-2B479E8F2E90}"
-  contains "hyper-v rule limited to class + main" "$out" "-RemoteAddresses 10.1.2.0/24,10.9.0.5"
-  contains "hyper-v rule k3s ports" "$out" "-LocalPorts 18080,18050"
-  contains "windows rule limited to class + main" "$out" "-LocalPort 18080,18050 -RemoteAddress 10.1.2.0/24,10.9.0.5"
+  contains "hyper-v inference rule: main only" "$out" "-LocalPorts 18080 -RemoteAddresses 10.9.0.5 -Action Allow"
+  contains "hyper-v RPC rule of its own: main only until the group is known" "$out" "New-NetFirewallHyperVRule -Name NSU-LLM-Node-RPC -DisplayName 'NSU LLM Node' -Direction Inbound -VMCreatorId '{40E0AC32-46A5-438A-A0B2-2B479E8F2E90}' -Protocol TCP -LocalPorts 18050 -RemoteAddresses 10.9.0.5"
+  contains "windows inference rule: main only" "$out" "-LocalPort 18080 -RemoteAddress 10.9.0.5 -Action Allow"
+  contains "windows RPC rule: main only until the group is known" "$out" "-DisplayName NSU-LLM-Node-RPC -Direction Inbound -Protocol TCP -LocalPort 18050 -RemoteAddress 10.9.0.5 -Action Allow"
+  lacks "the subnet of the class is not opened" "$out" "10.1.2.0/24"
+  lacks "the ports never share a rule" "$out" "18080,18050"
+  contains "the summary names the RPC rule" "$out" "TCP 18050 (RPC split) только с главного и нод текущей группы split"
   # boot task
   contains "boot task registered" "$out" "Register-ScheduledTask -TaskName NSU-LLM-Node"
   contains "boot task at startup" "$out" "-AtStartup"
@@ -265,7 +276,7 @@ EOS
   contains "boot task stores the password (runs without logon)" "$out" "-Password ***"
   # run-node.ps1 -Wsl is reused, not duplicated
   contains "run-node through WSL" "$out" "wsl -d NSU-LLM -u root -e docker run"
-  contains "run-node gpu image" "$out" "nsu-llm-node:0.1.0-gpu"
+  contains "run-node gpu image" "$out" "nsu-llm-node:0.2.0-gpu"
   contains "run-node node ip" "$out" "NODE_IP=10.1.2.3"
   contains "answers file would be saved" "$out" "install.json"
   log="$(cat "$TMP/fake.log")"
@@ -281,6 +292,21 @@ EOS
   # explicit -AllowFrom wins
   out="$(full -AllowFrom 192.168.50.0/23,10.9.0.5)"
   contains "explicit AllowFrom" "$out" "-RemoteAddresses 192.168.50.0/23,10.9.0.5"
+  contains "explicit AllowFrom does not widen the RPC rule" "$out" "-LocalPort 18050 -RemoteAddress 10.9.0.5 -Action Allow"
+  # a list saved by an older version opened the whole subnet of the node (and so the RPC port to every student): dropped with a warning
+  mkdir -p "$IDIR"; printf '{"Main":"10.9.0.5","AllowFrom":"10.1.2.0/24,10.9.0.5"}' > "$IDIR/install.json"
+  out="$(CLUSTER_TOKEN=T inst -DryRun -NonInteractive -NodeIp 10.1.2.3 -Name pc01 -TaskPassword pw -MemoryGB 28)"
+  contains "a saved subnet of an older version is dropped with a warning" "$out" "открывал порты всей подсети ноды"
+  lacks "a saved subnet is not applied to the rules" "$out" "-RemoteAddress 10.1.2.0/24"
+  contains "main only after the saved subnet is dropped" "$out" "-LocalPort 18080 -RemoteAddress 10.9.0.5 -Action Allow"
+  printf '{"Main":"10.9.0.5","AllowFrom":"10.9.0.5,10.9.0.6"}' > "$IDIR/install.json"
+  out="$(CLUSTER_TOKEN=T inst -DryRun -NonInteractive -NodeIp 10.1.2.3 -Name pc01 -TaskPassword pw -MemoryGB 28)"
+  contains "a saved list of single addresses is kept for the inference port" "$out" "-LocalPort 18080 -RemoteAddress 10.9.0.5,10.9.0.6 -Action Allow"
+  contains "but the RPC port stays main only" "$out" "-LocalPort 18050 -RemoteAddress 10.9.0.5 -Action Allow"
+  rm -rf "$IDIR"
+  out="$(full -CaSha256 zzz)"; rc=$?
+  [ $rc -ne 0 ] && pass "a malformed -CaSha256 stops the install" || fail "a malformed -CaSha256 stops the install"
+  contains "a malformed -CaSha256 is explained" "$out" "нужны 64 шестнадцатеричные цифры"
 
   # ---------------------------------------------------------------- Wake-on-LAN (task 2-18)
   out="$(full)"
@@ -351,10 +377,49 @@ EOS
   # no archive and no image: the image comes from main (registry https://<main>/v2/), pulled inside the distro after Docker is set up
   out="$(FAKE_DISTROS='' FAKE_RUNNING='' full)"; rc=$?
   [ $rc -eq 0 ] && pass "fresh distro without an image tar: dry run succeeds, the image comes from main" || { fail "fresh distro without an image tar: dry run succeeds (rc=$rc)"; echo "$out" | sed 's/^/    | /'; }
-  contains "no archive: the plan pulls the image from main" "$out" "скачать образ ноды nsu-llm-node:0.1.0-gpu с главного: https://10.9.0.5/v2/"
+  contains "no archive: the plan pulls the image from main" "$out" "скачать образ ноды nsu-llm-node:0.2.0-gpu с главного: https://10.9.0.5/v2/"
   contains "pull runs pull-image.sh in the distro as root" "$out" "-u root -e bash /mnt/"
-  contains "pull-image.sh gets the main and the image" "$out" "pull-image.sh --main 10.9.0.5 --image nsu-llm-node:0.1.0-gpu"
+  contains "pull-image.sh gets the main and the image" "$out" "pull-image.sh --main 10.9.0.5 --image nsu-llm-node:0.2.0-gpu"
   lacks "no archive: no docker load" "$out" "docker load"
+  # the root of main is checked before Docker pins it (pull-image.sh alone would take it on trust): fingerprint, then --ca
+  contains "the root of main is verified before the pull" "$out" "проверить корень CA главного (https://10.9.0.5/ca.crt)"
+  contains "the fingerprint question is announced when none is given" "$out" "(не задан: печатается и подтверждается)"
+  contains "the verified root goes to pull-image.sh" "$out" "--image nsu-llm-node:0.2.0-gpu --no-tofu --ca /var/lib/nsu-llm-node/state/ca.crt"
+  [ "$(before "$out" 'проверить корень CA главного')" -lt "$(before "$out" 'pull-image.sh --main')" ] && pass "the root is checked before the pull" || fail "the root is checked before the pull"
+  out2="$(full -CaSha256 "$(printf 'ab%.0s' $(seq 32))" -ImageSource main)"
+  contains "-CaSha256 is shown in the plan of the check" "$out2" "по отпечатку $(printf 'ab%.0s' $(seq 32))"
+  lacks "the pull-image.sh of the old version gets no --record" "$out" "--record"
+  # a pull-image.sh that knows --record records the image digest in the node state (the node reports it to main)
+  mkdir -p "$IDIR/scripts"; printf '# pull-image.sh [--record FILE]
+' > "$IDIR/scripts/pull-image.sh"
+  out="$(FAKE_DISTROS='' FAKE_RUNNING='' full)"
+  contains "pull-image.sh with --record: the digest file in the node state" "$out" "--image nsu-llm-node:0.2.0-gpu --no-tofu --ca /var/lib/nsu-llm-node/state/ca.crt --record /var/lib/nsu-llm-node/state/image.digest"
+  rm -rf "$IDIR"
+
+  # the tag comes from main (GET /api/node-image = NODE_IMAGE_TAG), not from a constant of the scripts (found on the 122b bed: main ran
+  # 0.1.1, install-node pulled 0.1.1-gpu and run-node then checked the GPU with 0.1.0-gpu)
+  NI='{"tag":"0.1.1","cpu":"nsu-llm-node:0.1.1-cpu","nvidia":"nsu-llm-node:0.1.1-gpu"}'
+  out="$(FAKE_NODE_IMAGE="$NI" FAKE_DISTROS='' FAKE_RUNNING='' full)"; rc=$?
+  [ $rc -eq 0 ] && pass "main names another tag: dry run succeeds" || { fail "main names another tag: dry run succeeds (rc=$rc)"; echo "$out" | sed 's/^/    | /'; }
+  contains "main's tag: the pull is for the image main names" "$out" "pull-image.sh --main 10.9.0.5 --image nsu-llm-node:0.1.1-gpu"
+  contains "main's tag: the plan says so" "$out" "скачать образ ноды nsu-llm-node:0.1.1-gpu с главного"
+  contains "main's tag: run-node starts that very image" "$out" "nsu-llm-node:0.1.1-gpu"
+  lacks "main's tag: no stale 0.1.0 image anywhere in the plan" "$out" "nsu-llm-node:0.2.0"
+  contains "the installer asked main without a token" "$(cat "$TMP/fake.log")" "https://10.9.0.5/api/node-image"
+  lacks "the token is not sent to the public endpoint" "$(grep 'api/node-image' "$TMP/fake.log")" "SECRETTOKEN7"
+  lacks "main names no digest: the pull is by tag, as before" "$out" "--digest"
+  DG="sha256:$(printf 'ab%.0s' $(seq 32))"
+  NI2='{"tag":"0.1.1","cpu":"nsu-llm-node:0.1.1-cpu","nvidia":"nsu-llm-node:0.1.1-gpu","digest":{"cpu":"","nvidia":"'"$DG"'"}}'
+  out="$(FAKE_NODE_IMAGE="$NI2" FAKE_DISTROS='' FAKE_RUNNING='' full)"
+  contains "main names a digest: the first pull goes by it" "$out" "--image nsu-llm-node:0.1.1-gpu --no-tofu --ca /var/lib/nsu-llm-node/state/ca.crt --digest $DG"
+  out="$(FAKE_NODE_IMAGE='{"cpu":"nsu-llm-node:0.1.1-cpu","nvidia":"nsu-llm-node:0.1.1-gpu","digest":{"nvidia":"sha256:zz"}}' FAKE_DISTROS='' FAKE_RUNNING='' full)"
+  lacks "a malformed digest is ignored" "$out" "--digest"
+  out="$(FAKE_NODE_IMAGE='{"cpu":"evil:1","nvidia":"nsu-llm-node:../x"}' FAKE_DISTROS='' FAKE_RUNNING='' full)"
+  contains "a name that is not ours is ignored: IMAGE_VERSION of the scripts" "$out" "pull-image.sh --main 10.9.0.5 --image nsu-llm-node:0.2.0-gpu"
+  [ "$(head -n1 "$NODE/IMAGE_VERSION" | tr -d '[:space:]')" = "0.2.0" ] && pass "IMAGE_VERSION is the one shared fallback" || fail "IMAGE_VERSION is the one shared fallback"
+  for f in install-node.ps1 run-node.ps1 run-node.sh; do
+    ! grep -nE '^[$]Version = .[0-9]|^VERSION="[0-9]' "$NODE/$f" >/dev/null && pass "$f has no version constant of its own" || fail "$f has no version constant of its own"
+  done
   [ "$(before "$out" 'wsl-setup.sh')" -lt "$(before "$out" 'pull-image.sh --main')" ] && pass "the pull comes after Docker is set up in the distro" || fail "the pull comes after Docker is set up in the distro"
   # -ImageSource tar keeps the old rule: no archive, no image -> stop with the fix
   out="$(FAKE_DISTROS='' FAKE_RUNNING='' full -ImageSource tar)"; rc=$?
@@ -362,7 +427,7 @@ EOS
   contains "-ImageSource tar: the fix names -ImageTar" "$out" "-ImageTar"
   # -ImageSource main pulls even when the image is already there (refresh after an update of main) and ignores archives
   out="$(full -ImageSource main -ImageTar 'C:\img\nsu-llm-node-0.1.0-gpu.tar.gz')"
-  contains "-ImageSource main pulls although the image exists" "$out" "pull-image.sh --main 10.9.0.5 --image nsu-llm-node:0.1.0-gpu"
+  contains "-ImageSource main pulls although the image exists" "$out" "pull-image.sh --main 10.9.0.5 --image nsu-llm-node:0.2.0-gpu"
   lacks "-ImageSource main ignores the archive" "$out" "docker load"
   contains "-ImageSource main is saved with the answers" "$out" "ImageSource=main"
   out="$(full)"
@@ -379,12 +444,12 @@ EOS
 
   # GPU: driver too old / no GPU in WSL -> cpu with an explanation; -Accel nvidia then fails
   out="$(FAKE_WIN_GPU='NVIDIA GeForce RTX 4070, 552.44, 12282' full)"
-  contains "old driver falls back to cpu" "$out" "nsu-llm-node:0.1.0-cpu"
+  contains "old driver falls back to cpu" "$out" "nsu-llm-node:0.2.0-cpu"
   contains "old driver explained" "$out" "570"
   out="$(FAKE_WIN_GPU='NVIDIA GeForce RTX 4070, 552.44, 12282' full -Accel nvidia)"; rc=$?
   [ $rc -ne 0 ] && pass "-Accel nvidia with an old driver fails" || fail "-Accel nvidia with an old driver fails"
   out="$(FAKE_WIN_GPU='' full)"
-  contains "no nvidia-smi -> cpu" "$out" "nsu-llm-node:0.1.0-cpu"
+  contains "no nvidia-smi -> cpu" "$out" "nsu-llm-node:0.2.0-cpu"
   lacks "cpu node gets no toolkit" "$out" "ACCEL=nvidia"
   out="$(FAKE_WSL_GPU=0 full)"
   contains "no GPU in WSL -> cpu" "$out" "ACCEL=cpu"
@@ -401,7 +466,8 @@ EOS
   contains "asks for the main" "$out" "Адрес главного сервера"
   contains "asks for the token" "$out" "Токен кластера"
   contains "mode question has a default" "$out" "[k3s]"
-  contains "allow-from question has the detected default" "$out" "[10.1.2.0/24,10.9.0.5]"
+  contains "allow-from question has main as the default (not the subnet)" "$out" "[10.9.0.5]"
+  lacks "allow-from question does not offer the subnet" "$out" "10.1.2.0/24"
   lacks "interactive token not echoed" "$out" "TOKEN9"
   out="$(printf '10.9.0.5\nTOKEN9\n\n\n\npw\n\nн\n' | inst -DryRun -NodeIp 10.1.2.3 -Name pc01)"; rc=$?
   [ $rc -ne 0 ] && pass "declined summary stops" || fail "declined summary stops"
@@ -481,7 +547,7 @@ EOS
 param([string]$Lib, [string]$Dir)
 $ErrorActionPreference = 'Stop'
 # Seam: a non-elevated test cannot make Administrators the owner, and Users-read-only would lock it out: same DACL plus this account.
-function New-SdDirSecurity([switch]$NoUsers, [switch]$NoOwner) {
+function New-SdDirSecurity([switch]$NoUsers, [switch]$NoOwner, [string[]]$ExtraSids = @()) {
     $global:DirSecCalls += , [pscustomobject]@{ NoUsers = [bool]$NoUsers; NoOwner = [bool]$NoOwner }
     $sec = New-Object Security.AccessControl.DirectorySecurity
     $sec.SetAccessRuleProtection($true, $false)
@@ -632,13 +698,13 @@ EOS
 
   # Find-ImageTar looks only next to the script, and only at archives an administrator controls
   NC="$TMP/nodecopy"; mkdir -p "$NC/node"
-  cp "$NODE"/install-node.ps1 "$NODE"/run-node.ps1 "$NODE"/node-boot.ps1 "$NODE"/wsl-setup.sh "$NODE"/pull-image.sh "$NODE"/secure-dir.ps1 "$NODE"/class-run.ps1 "$NC/node/"
+  cp "$NODE"/install-node.ps1 "$NODE"/run-node.ps1 "$NODE"/node-boot.ps1 "$NODE"/wsl-setup.sh "$NODE"/pull-image.sh "$NODE"/secure-dir.ps1 "$NODE"/class-run.ps1 "$NODE"/IMAGE_VERSION "$NC/node/"
   echo img > "$NC/nsu-llm-node-0.1.0-gpu.tar.gz"                     # the parent (C:\ProgramData from the stage): not searched
   echo img > "$NC/node/nsu-llm-node-0.1.0-gpu.tar.gz"
   icacls "$(cygpath -w "$NC/node/nsu-llm-node-0.1.0-gpu.tar.gz")" /grant '*S-1-1-0:(M)' >/dev/null
   NCI="$(cygpath -w "$NC/node/install-node.ps1")"
   ncrun() { PATH="$FB:$PATH" FAKE_LOG="$(cygpath -w "$TMP/fake.log")" "$PS" -NoProfile -ExecutionPolicy Bypass -File "$NCI" \
-      -InstallDir "$(cygpath -w "$IDIR")" -WslConfigPath "$(cygpath -w "$TMP/wslconfig")" -DryRun -NonInteractive -Main 10.9.0.5 -Token T -NodeIp 10.1.2.3 -Name pc01 -MemoryGB 28 -TaskPassword pw 2>&1; }
+      -InstallDir "$(cygpath -w "$IDIR")" -WslConfigPath "$(cygpath -w "$TMP/wslconfig")" -DryRun -NonInteractive -Main 10.9.0.5 -Token T -NodeIp 10.1.2.3 -Name pc01 -MemoryGB 28 -TaskPassword pw "$@" 2>&1; }
   out="$(FAKE_DISTROS='' FAKE_RUNNING='' ncrun)"
   contains "image tar writable by others is skipped" "$out" "пропущен: его создал или может менять не администратор"
   lacks "image tar in the parent dir is never used" "$out" "nodecopy/nsu-llm-node-0.1.0-gpu.tar.gz"
@@ -650,6 +716,18 @@ EOS
   fsout="$(NSU_LLM_TEST_FS=exFAT FAKE_DISTROS='' FAKE_RUNNING='' ncrun)"
   contains "image tar on FAT/exFAT: says to copy it to NTFS" "$fsout" "скопируйте архив на NTFS-диск (например, C:\\)"
   contains "trusted image tar: the one next to the script" "$out" "nodecopy/node/nsu-llm-node-0.1.0-gpu.tar.gz"
+  # an archive of another version than main's image (NODE_IMAGE_TAG): docker load would give the wrong name, so main's image is pulled
+  icacls "$(cygpath -w "$NC/node/nsu-llm-node-0.1.0-gpu.tar.gz")" /remove:g '*S-1-1-0' >/dev/null
+  out="$(FAKE_NODE_IMAGE='{"tag":"0.1.1","cpu":"nsu-llm-node:0.1.1-cpu","nvidia":"nsu-llm-node:0.1.1-gpu"}' FAKE_DISTROS='' FAKE_RUNNING='' ncrun)"; rc=$?
+  [ $rc -eq 0 ] && pass "archive of another version: the dry run succeeds" || { fail "archive of another version: the dry run succeeds (rc=$rc)"; echo "$out" | sed 's/^/    | /'; }
+  contains "archive of another version: says it is not used" "$out" "архив не используется, образ nsu-llm-node:0.1.1-gpu будет скачан с главного"
+  contains "archive of another version: main's image is pulled" "$out" "pull-image.sh --main 10.9.0.5 --image nsu-llm-node:0.1.1-gpu"
+  lacks "archive of another version: nothing is loaded" "$out" "docker load"
+  out="$(FAKE_NODE_IMAGE='{"tag":"0.1.1","cpu":"nsu-llm-node:0.1.1-cpu","nvidia":"nsu-llm-node:0.1.1-gpu"}' FAKE_DISTROS='' FAKE_RUNNING='' ncrun -ImageTar "$(cygpath -w "$NC/node/nsu-llm-node-0.1.0-gpu.tar.gz")")"; rc=$?
+  [ $rc -ne 0 ] && pass "archive of another version named with -ImageTar: an error" || fail "archive of another version named with -ImageTar: an error"
+  contains "archive of another version named with -ImageTar: names the file that is needed" "$out" "nsu-llm-node-0.1.1-gpu.tar.gz"
+  out="$(FAKE_NODE_IMAGE='{"tag":"0.2.0","cpu":"nsu-llm-node:0.2.0-cpu","nvidia":"nsu-llm-node:0.2.0-gpu"}' FAKE_DISTROS='' FAKE_RUNNING='' ncrun)"
+  contains "archive of main's version is loaded as before" "$out" "docker load -i /mnt/"
   rm -rf "$NC" "$IDIR"
 
   # PSModulePath inherited from pwsh 7: install-node.ps1 drops the 7.x module paths at start-up (Get-Acl and friends load again)
@@ -757,9 +835,13 @@ EOS
   contains "desktop: bridge with published inference port" "$out" "-p 18080:18080"
   lacks "desktop: no wsl --shutdown (it would stop Docker Desktop)" "$out" "wsl --shutdown"
   lacks "desktop: no distro setup" "$out" "-e env ACCEL="
-  lacks "desktop: no boot task" "$out" "Register-ScheduledTask"
+  lacks "desktop: no boot task" "$out" "Register-ScheduledTask -TaskName NSU-LLM-Node -TaskPath"
+  contains "desktop: a SYSTEM task keeps the RPC rule in step with the split group" "$out" "Register-ScheduledTask -TaskName NSU-LLM-Node-FwSync"
+  contains "desktop: the sync task runs run-node -SyncFirewall" "$out" "run-node.ps1\" -SyncFirewall"
+  contains "desktop: the sync task runs as SYSTEM" "$out" "-User SYSTEM"
   contains "desktop: autostart limit explained" "$out" "после входа"
-  contains "desktop: firewall still limited" "$out" "-RemoteAddress 10.1.2.0/24,10.9.0.5"
+  contains "desktop: firewall limited to main" "$out" "-LocalPort 18080 -RemoteAddress 10.9.0.5 -Action Allow"
+  contains "desktop: the RPC port is published on the node address only" "$out" "-p 10.1.2.3:18050:18050"
   contains "desktop: power still set" "$out" "powercfg /hibernate off"
   contains "desktop: engine checked" "$(cat "$TMP/fake.log")" "docker info"
   # image archive goes to the Windows docker
@@ -767,8 +849,8 @@ EOS
   contains "desktop: image loaded by the Windows docker" "$out" "[dry-run] docker load -i C:\\img\\nsu-llm-node-0.1.0-gpu.tar.gz"
   # Docker Desktop: the Windows docker pulls itself, only when Windows already trusts the certificate of main; the installer never fetches or writes a CA there
   out="$(FAKE_DISTROS="$DD" FAKE_IMAGES='' inst -DryRun -NonInteractive -Main 10.9.0.5 -Token T -NodeIp 10.1.2.3 -Name pc01)"
-  contains "desktop: the image is pulled from main" "$out" "[dry-run] docker pull 10.9.0.5/nsu-llm-node:0.1.0-gpu"
-  contains "desktop: retagged to the local name" "$out" "[dry-run] docker tag 10.9.0.5/nsu-llm-node:0.1.0-gpu nsu-llm-node:0.1.0-gpu"
+  contains "desktop: the image is pulled from main" "$out" "[dry-run] docker pull 10.9.0.5/nsu-llm-node:0.2.0-gpu"
+  contains "desktop: retagged to the local name" "$out" "[dry-run] docker tag 10.9.0.5/nsu-llm-node:0.2.0-gpu nsu-llm-node:0.2.0-gpu"
   lacks "desktop: no CA is fetched with -k and nothing is written to certs.d" "$out" "certs.d"
   contains "desktop: Windows trust is probed first" "$out" "https://10.9.0.5/v2/ (сертификат главного должен приниматься Windows"
   # engine not running: clear message with the fix
@@ -795,6 +877,96 @@ EOS
   lacks "desktop uninstall not through WSL" "$out" "wsl -d NSU-LLM -u root -e docker rm"
   rm -rf "$IDIR"
 
+  # ---------------------------------------------------------------- a dropped ssh/WinRM session must not kill the install (task 2-28)
+  # from an ssh or WinRM session with a password the whole install runs as the one-time task (WSL and Docker Desktop)
+  out="$(NSU_LLM_ASSUME_REMOTE=1 full)"; rc=$?
+  [ $rc -eq 0 ] && pass "remote session with a password: dry run succeeds" || { fail "remote session with a password: dry run succeeds (rc=$rc)"; echo "$out" | sed 's/^/    | /'; }
+  contains "remote session: the install goes through the one-time task" "$out" "Register-ScheduledTask -TaskName NSU-LLM-Install"
+  contains "remote session: said why" "$out" "чтобы обрыв связи её не прервал"
+  contains "remote session: a dropped connection does not stop it, -Status and a re-run show the progress" "$out" "Обрыв ssh или WinRM её не остановит"
+  lacks "remote session: the steps do not run in the session" "$out" "[1/"
+  lacks "remote session: no warning about running unprotected" "$out" "Windows завершит установку на полпути"
+  lacks "remote session: password not printed" "$out" "TaskPassword=pw"
+  out="$(FAKE_DISTROS="$DD" NSU_LLM_ASSUME_REMOTE=1 inst -DryRun -NonInteractive -Main 10.9.0.5 -Token SECRETTOKEN7 -NodeIp 10.1.2.3 -Name pc01 -TaskPassword pw)"; rc=$?
+  [ $rc -eq 0 ] && pass "remote session on Docker Desktop: dry run succeeds" || { fail "remote session on Docker Desktop: dry run succeeds (rc=$rc)"; echo "$out" | sed 's/^/    | /'; }
+  contains "remote session on Docker Desktop: the one-time task too" "$out" "Register-ScheduledTask -TaskName NSU-LLM-Install"
+  contains "remote session on Docker Desktop: the child reads the saved answers" "$out" "FromTask=True"
+  lacks "remote session on Docker Desktop: the node is not started by the session" "$out" "docker run -d --name llm-node"
+  lacks "remote session on Docker Desktop: no boot task (it does not exist there)" "$out" "Register-ScheduledTask -TaskName NSU-LLM-Node"
+  lacks "remote session on Docker Desktop: token not in the task" "$out" "SECRETTOKEN7"
+  # no password: the install runs in the session, with a warning how to make it survive
+  out="$(FAKE_DISTROS="$DD" NSU_LLM_ASSUME_REMOTE=1 inst -DryRun -NonInteractive -Main 10.9.0.5 -Token T -NodeIp 10.1.2.3 -Name pc01)"; rc=$?
+  [ $rc -eq 0 ] && pass "remote session without a password on Docker Desktop: still installs" || { fail "remote session without a password on Docker Desktop: still installs (rc=$rc)"; echo "$out" | sed 's/^/    | /'; }
+  contains "remote session without a password: warned" "$out" "Windows завершит установку на полпути"
+  contains "remote session without a password: names -TaskPassword and NSU_LLM_TASK_PASSWORD" "$out" "-TaskPassword (или NSU_LLM_TASK_PASSWORD)"
+  contains "remote session without a password: runs in the session" "$out" "docker run -d --name llm-node"
+  lacks "remote session without a password: no install task" "$out" "NSU-LLM-Install"
+  # a local session is not touched; -ViaTask now works for Docker Desktop too
+  out="$(FAKE_DISTROS="$DD" inst -DryRun -NonInteractive -Main 10.9.0.5 -Token T -NodeIp 10.1.2.3 -Name pc01 -TaskPassword pw)"
+  lacks "local session on Docker Desktop with a password: no install task" "$out" "NSU-LLM-Install"
+  contains "local session on Docker Desktop with a password: runs directly" "$out" "docker run -d --name llm-node"
+  out="$(FAKE_DISTROS="$DD" inst -DryRun -NonInteractive -Main 10.9.0.5 -Token T -NodeIp 10.1.2.3 -Name pc01 -TaskPassword pw -ViaTask)"
+  contains "-ViaTask on Docker Desktop: the one-time task" "$out" "Register-ScheduledTask -TaskName NSU-LLM-Install"
+  out="$(FAKE_DISTROS="$DD" inst -DryRun -NonInteractive -Main 10.9.0.5 -Token T -NodeIp 10.1.2.3 -Name pc01 -ViaTask)"; rc=$?
+  [ $rc -ne 0 ] && pass "-ViaTask without a password fails" || fail "-ViaTask without a password fails"
+  contains "-ViaTask without a password names the password" "$out" "-TaskPassword"
+  # the session is told from sshd's variables or the WinRM sender info
+  out="$( unset NSU_LLM_ASSUME_REMOTE; SSH_CONNECTION='10.0.0.7 51234 10.1.2.3 22' full )"
+  contains "ssh session recognised by SSH_CONNECTION" "$out" "Register-ScheduledTask -TaskName NSU-LLM-Install"
+  out="$( unset NSU_LLM_ASSUME_REMOTE SSH_CONNECTION SSH_CLIENT SSH_TTY; full )"
+  lacks "no ssh variables: a local session" "$out" "NSU-LLM-Install"
+
+  # a re-run after the connection dropped attaches to the task that keeps running instead of starting again
+  mkdir -p "$IDIR/run"
+  printf 'Установка идёт\r\n[3/9] запустить ноду\r\nпоследняя строка\r\n' > "$IDIR/run/install-task.log"
+  printf 'install' > "$IDIR/run/action.txt"
+  printf '0' > "$IDIR/run/run.done"
+  out="$(NSU_LLM_TEST_INSTALL_TASK=Running inst -NonInteractive -Main 10.9.0.5 -Token T -NodeIp 10.1.2.3 -Name pc01 -TaskPassword pw)"; rc=$?
+  [ $rc -eq 0 ] && pass "re-run while the task is running: attaches and returns the task's code" || { fail "re-run while the task is running: attaches (rc=$rc)"; echo "$out" | sed 's/^/    | /'; }
+  contains "re-run: explains that it only shows the running install" "$out" "этот запуск ничего не меняет"
+  contains "re-run: shows the log of the task from the start" "$out" "Установка идёт"
+  contains "re-run: shows the last log lines" "$out" "последняя строка"
+  lacks "re-run: starts nothing" "$out" "Register-ScheduledTask"
+  lacks "re-run: runs no steps" "$out" "[1/"
+  printf '5' > "$IDIR/run/run.done"
+  out="$(NSU_LLM_TEST_INSTALL_TASK=Running inst -NonInteractive -Main 10.9.0.5 -Token T -NodeIp 10.1.2.3 -Name pc01 -TaskPassword pw)"; rc=$?
+  [ $rc -eq 5 ] && pass "re-run: the attached task's exit code is returned" || { fail "re-run: the attached task's exit code is returned (rc=$rc)"; echo "$out" | sed 's/^/    | /'; }
+  printf 'uninstall' > "$IDIR/run/action.txt"
+  out="$(NSU_LLM_TEST_INSTALL_TASK=Running inst -NonInteractive -Main 10.9.0.5 -Token T -NodeIp 10.1.2.3 -Name pc01 -TaskPassword pw)"; rc=$?
+  [ $rc -ne 0 ] && pass "re-run with another action than the running one is refused" || fail "re-run with another action than the running one is refused"
+  contains "re-run with another action: says what is running" "$out" "сейчас идёт удаление"
+  # -Status shows the running task and the result of the last one
+  printf 'install' > "$IDIR/run/action.txt"
+  out="$(NSU_LLM_TEST_INSTALL_TASK=Running inst -Status -Main 127.0.0.1 -Name pc01)"
+  contains "status: the running install is shown" "$out" "идёт установка в разовой задаче NSU-LLM-Install"
+  contains "status: with the last log lines" "$out" "последняя строка"
+  printf '1' > "$IDIR/run/run.done"
+  out="$(inst -Status -Main 127.0.0.1 -Name pc01)"
+  contains "status: a failed last run is a problem" "$out" "завершился с кодом 1"
+  printf '0' > "$IDIR/run/run.done"
+  out="$(inst -Status -Main 127.0.0.1 -Name pc01)"
+  contains "status: a successful last run is reported" "$out" "завершился успешно (код 0)"
+  rm -rf "$IDIR"
+
+  # ---------------------------------------------------------------- Docker Desktop autostart: a logged-on user is needed (task 2-28)
+  mkdir -p "$IDIR"
+  printf '{"Main":"127.0.0.1","Name":"pc01","Mode":"k3s","Docker":"desktop"}' > "$IDIR/install.json"
+  out="$(NSU_LLM_TEST_LOGON='PC01\student' FAKE_DISTROS="$DD" inst -Status)"
+  contains "desktop status: autostart only after a logon" "$out" "стартует только после входа пользователя в Windows"
+  contains "desktop status: Windows 10 class PCs need a logged-on user" "$out" "на Windows 10 ПК класса держит ноду, пока кто-то вошёл"
+  contains "desktop status: auto-logon is the administrator's choice" "$out" "Winlogon AutoAdminLogon"
+  contains "desktop status: the logged-on user" "$out" "вошёл в Windows: PC01\\student"
+  out="$(NSU_LLM_TEST_LOGON=none FAKE_DD_ENGINE=0 FAKE_DISTROS="$DD" inst -Status)"; rc=$?
+  contains "desktop status: nobody logged on is named as the reason" "$out" "в Windows никто не вошёл"
+  contains "desktop status: the fix mentions auto-logon" "$out" "автовход (netplwiz, Winlogon AutoAdminLogon) решает администратор"
+  [ $rc -eq 1 ] && pass "desktop status: no logon and no engine is a problem" || fail "desktop status: no logon and no engine is a problem (rc=$rc)"
+  out="$(NSU_LLM_TEST_LOGON=none FAKE_DISTROS="$DD" inst -Status)"
+  lacks "desktop status: a working engine with no listed user is not blamed on the logon" "$out" "в Windows никто не вошёл"
+  out="$(NSU_LLM_TEST_LOGON=unknown FAKE_DD_ENGINE=0 FAKE_DISTROS="$DD" inst -Status)"
+  lacks "desktop status: a failed logon query is not reported as «nobody logged on»" "$out" "в Windows никто не вошёл"
+  contains "desktop status: a dead engine is still a problem when the logon is unknown" "$out" "Docker Desktop не запущен"
+  rm -rf "$IDIR"
+
   # ---------------------------------------------------------------- old driver: interactive offer to continue as cpu
   OLD='NVIDIA GeForce RTX 4070, 552.44, 12282'
   out="$(printf '10.9.0.5\nTOKEN9\n\n\n\nн\n' | FAKE_WIN_GPU="$OLD" inst -DryRun -NodeIp 10.1.2.3 -Name pc01 -TaskPassword pw)"; rc=$?
@@ -803,7 +975,7 @@ EOS
   contains "old driver: how to update" "$out" "nvidia.com/Download"
   out="$(printf '10.9.0.5\nTOKEN9\n\n\n\nд\nд\n' | FAKE_WIN_GPU="$OLD" inst -DryRun -NodeIp 10.1.2.3 -Name pc01 -TaskPassword pw)"; rc=$?
   [ $rc -eq 0 ] && pass "old driver: accepting continues" || { fail "old driver: accepting continues (rc=$rc)"; echo "$out" | sed 's/^/    | /'; }
-  contains "old driver: accepted -> cpu image" "$out" "nsu-llm-node:0.1.0-cpu"
+  contains "old driver: accepted -> cpu image" "$out" "nsu-llm-node:0.2.0-cpu"
   out="$(FAKE_WIN_GPU="$OLD" full)"
   lacks "old driver: non-interactive never asks" "$out" "Продолжить как CPU-нода"
   contains "old driver: non-interactive says how to update" "$out" "nvidia.com/Download"
@@ -862,6 +1034,11 @@ EOS
   out="$(NSU_LLM_ASSUME_NO_CREDENTIALS=1 inst -DryRun -NonInteractive -Uninstall -Name pc01 -TaskPassword pw)"
   contains "uninstall: task mode" "$out" "Register-ScheduledTask -TaskName NSU-LLM-Install"
   contains "uninstall: task runs -Uninstall" "$out" "Uninstall=True"
+  lacks "uninstall: task without a token does not invent one" "$out" "Token=***"
+  # the token given now goes into the task (it would read the one saved at install time, stale after a reinstall of main), masked in the output
+  out="$(NSU_LLM_ASSUME_NO_CREDENTIALS=1 inst -DryRun -NonInteractive -Uninstall -Name pc01 -Main 10.9.0.5 -Token SeCr3tT0k -TaskPassword pw)"
+  contains "uninstall: task carries the fresh token" "$out" "Token=***"
+  lacks "uninstall: the token is never printed" "$out" "SeCr3tT0k"
   # installed by another account: refuse instead of touching this user's .wslconfig and distros
   printf '{"CreatedDistro":true,"Distro":"NSU-LLM","InstallUser":"PC\\\\other","InstallUserSid":"S-1-5-21-1-2-3-1001"}' > "$IDIR/state.json"
   out="$(inst -DryRun -NonInteractive -Uninstall -Name pc01)"; rc=$?
@@ -876,7 +1053,7 @@ EOS
   # desktop uninstall also removes the node images
   mkdir -p "$IDIR"; printf '{"Main":"10.9.0.5","Name":"pc01","Mode":"k3s","Docker":"desktop"}' > "$IDIR/install.json"
   out="$(FAKE_DISTROS="NSU-LLM docker-desktop" inst -DryRun -NonInteractive -Uninstall)"
-  contains "desktop uninstall removes the node images" "$out" "docker rmi nsu-llm-node:0.1.0-gpu"
+  contains "desktop uninstall removes the node images" "$out" "docker rmi nsu-llm-node:0.2.0-gpu"
   rm -rf "$IDIR"
 
   # -Uninstall: reverse of the install, using the saved state
@@ -895,6 +1072,8 @@ EOS
   contains "uninstall removes the node through run-node" "$out" "wsl -d NSU-LLM -u root -e docker rm -f llm-node"
   contains "uninstall removes the boot task" "$out" "Unregister-ScheduledTask -TaskName NSU-LLM-Node"
   contains "uninstall removes the hyper-v rule" "$out" "Remove-NetFirewallHyperVRule -Name NSU-LLM-Node"
+  contains "uninstall removes the RPC rule" "$out" "Remove-NetFirewallHyperVRule -Name NSU-LLM-Node-RPC; Remove-NetFirewallRule -DisplayName NSU-LLM-Node-RPC"
+  contains "uninstall removes the firewall sync task" "$out" "Unregister-ScheduledTask -TaskName NSU-LLM-Node-FwSync"
   contains "uninstall restores standby" "$out" "powercfg /setacvalueindex SCHEME_CURRENT SUB_SLEEP STANDBYIDLE 1800"
   contains "uninstall restores hibernation" "$out" "powercfg /hibernate on"
   contains "uninstall removes our .wslconfig" "$out" "Remove-Item"
@@ -907,6 +1086,7 @@ EOS
   contains "uninstall keeps the disk of a kept distro" "$out" "кроме wsl"
   lacks "uninstall does not wipe the install dir under a kept distro" "$out" "[dry-run] Remove-Item -Recurse -Force"
   contains "uninstall without a token warns about the main" "$out" "kubectl delete node pc01"
+  contains "uninstall without a token names the panel route" "$out" "«Удалить из кластера…»"
   rm -rf "$IDIR"
 
   # -Status: short report with fixes; reads only

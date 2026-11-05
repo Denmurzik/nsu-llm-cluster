@@ -13,6 +13,7 @@ from app.models import AuditLog, SystemSetting, User
 CONTRACT_KEYS = {
     "key_rpm_limit", "key_tpm_limit", "max_keys_per_user", "wol_enabled", "wol_delay_s", "wol_max_tries",
     "hf_mirror_max_gib", "model_cache_idle_s", "node_auto_update", "metrics_retention_days",
+    "session_max_days", "node_approval_required", "node_key_migration_days",
 }
 
 
@@ -240,10 +241,11 @@ async def test_out_models_describe_a_setting_and_an_audit_entry(app, db_session,
     out = SystemSettingOut.of(spec, 800, spec.default(env), row)
     assert out.model_dump(mode="json", exclude={"updated_at"}) == {
         "key": "hf_mirror_max_gib", "type": "int", "value": 800, "default": 500, "overridden": True,
-        "min": 1.0, "max": 1_000_000.0, "description": spec.description_ru, "restart_required": True,
+        "source": "db", "group": "Модели и кэш", "pending_restart": False, "min": 1.0, "max": 1_000_000.0, "description": spec.description_ru, "restart_required": True,
         "updated_by": "admin@g.nsu.ru",
     }
     plain = SystemSettingOut.of(ss.SETTINGS["wol_enabled"], True, True, None)
+    assert (plain.source, plain.group) == ("env", "Ноды и Wake-on-LAN")
     assert (plain.overridden, plain.updated_at, plain.updated_by, plain.restart_required) == (False, None, None, False)
 
     entry = AuditEntryOut.of((await audit_rows(db_session))[0])

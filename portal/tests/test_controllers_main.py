@@ -11,6 +11,8 @@ import pytest
 from app.controllers import __main__ as controllers_main
 from app.controllers.backends import BackendController
 from app.controllers.local_models import LocalModelsController
+from app.controllers.metrics import MetricsController
+from app.controllers.user_limits import UserLimitsController
 from app.controllers.workloads import WorkloadController
 
 pytestmark = pytest.mark.docker
@@ -19,7 +21,7 @@ PORTAL = Path(__file__).resolve().parent.parent
 
 
 async def test_controllers_process_runs_every_controller_until_stopped(settings, monkeypatch):
-    calls = {"workloads": 0, "backends": 0, "local-models": 0}
+    calls = {"workloads": 0, "backends": 0, "local-models": 0, "metrics": 0, "user-limits": 0}
     states = []
 
     def counter(name):
@@ -32,6 +34,8 @@ async def test_controllers_process_runs_every_controller_until_stopped(settings,
     monkeypatch.setattr(WorkloadController, "reconcile_once", counter("workloads"))
     monkeypatch.setattr(BackendController, "reconcile_once", counter("backends"))
     monkeypatch.setattr(LocalModelsController, "reconcile_once", counter("local-models"))
+    monkeypatch.setattr(MetricsController, "reconcile_once", counter("metrics"))
+    monkeypatch.setattr(UserLimitsController, "reconcile_once", counter("user-limits"))
     # controllers_enabled is the API workers' switch: the controllers process ignores it
     s = settings.model_copy(update={"controller_interval_s": 0.01, "controllers_enabled": False})
     redis = fakeredis.FakeAsyncRedis(server=fakeredis.FakeServer(), decode_responses=True)
@@ -59,7 +63,7 @@ async def test_api_app_runs_controllers_only_when_enabled(settings, monkeypatch,
 
     from app.main import create_app
 
-    calls = {"workloads": 0, "backends": 0, "local-models": 0}
+    calls = {"workloads": 0, "backends": 0, "local-models": 0, "metrics": 0, "user-limits": 0}
 
     def counter(name):
         async def reconcile_once(self):
@@ -70,6 +74,8 @@ async def test_api_app_runs_controllers_only_when_enabled(settings, monkeypatch,
     monkeypatch.setattr(WorkloadController, "reconcile_once", counter("workloads"))
     monkeypatch.setattr(BackendController, "reconcile_once", counter("backends"))
     monkeypatch.setattr(LocalModelsController, "reconcile_once", counter("local-models"))
+    monkeypatch.setattr(MetricsController, "reconcile_once", counter("metrics"))
+    monkeypatch.setattr(UserLimitsController, "reconcile_once", counter("user-limits"))
     s = settings.model_copy(update={"controller_interval_s": 0.01, "controllers_enabled": enabled})
     application = create_app(s)
     application.state.redis = fakeredis.FakeAsyncRedis(server=fakeredis.FakeServer(), decode_responses=True)
@@ -77,9 +83,9 @@ async def test_api_app_runs_controllers_only_when_enabled(settings, monkeypatch,
         await asyncio.sleep(0.3)
         tasks = list(getattr(application.state, "controller_tasks", []))
     if enabled:
-        assert len(tasks) == 3 and min(calls.values()) >= 3
+        assert len(tasks) == 5 and min(calls.values()) >= 3
     else:
-        assert tasks == [] and calls == {"workloads": 0, "backends": 0, "local-models": 0}
+        assert tasks == [] and calls == {"workloads": 0, "backends": 0, "local-models": 0, "metrics": 0, "user-limits": 0}
 
 
 def test_module_is_runnable():

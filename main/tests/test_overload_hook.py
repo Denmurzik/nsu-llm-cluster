@@ -8,6 +8,7 @@ import importlib.util
 import sys
 import time
 import types
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 
@@ -112,6 +113,7 @@ class FakeRedis:
 
     def __init__(self):
         self.counts: dict[str, int] = {}
+        self.hashes: dict[str, dict[str, int]] = {}
         self.ttls: dict[str, int] = {}
         self.broken = False
 
@@ -127,6 +129,10 @@ class FakePipeline:
         self.ops.append(("incr", key))
         return self
 
+    def hincrby(self, key, field, amount=1):
+        self.ops.append(("hincrby", key, field, amount))
+        return self
+
     def expire(self, key, seconds):
         self.ops.append(("expire", key, seconds))
         return self
@@ -137,6 +143,9 @@ class FakePipeline:
         for op, key, *rest in self.ops:
             if op == "incr":
                 self.redis.counts[key] = self.redis.counts.get(key, 0) + 1
+            elif op == "hincrby":
+                h = self.redis.hashes.setdefault(key, {})
+                h[rest[0]] = h.get(rest[0], 0) + rest[1]
             else:
                 self.redis.ttls[key] = rest[0]
 
@@ -158,7 +167,7 @@ def redis(hook, monkeypatch):
 def test_saturation_429_is_counted_in_the_current_minute_bucket(hook, redis):
     call(hook, RateLimitError(f"litellm.RateLimitError: {SATURATION_TEXT} Deployment model_group=m"))
     assert redis.counts == {"portal:gw:429:100": 1}
-    assert redis.ttls == {"portal:gw:429:100": 7200}
+    assert redis.ttls == {"portal:gw:429:100": 7200, "portal:gwm:100": 7200}
 
 
 def test_no_deployment_available_counts_as_429(hook, redis):
@@ -232,3 +241,81 @@ def test_counter_writes_in_flight_are_bounded_when_redis_hangs(hook, monkeypatch
 def test_finished_counter_writes_are_not_kept(hook, redis):
     call(hook, ServerError(500))
     assert len(hook._pending) == 0
+
+
+# ---------------------------------------------------------------- per-model traffic (monitoring page, Redis)
+
+
+def success(hook, model="gemma-4-e4b", stream=False, ttft_s=None, drain=True, **extra):
+    """Run the success event the way LiteLLM calls it."""
+    start = datetime(2026, 11, 4, 10, 0, 0, tzinfo=timezone.utc)
+    kwargs = {"litellm_params": {"metadata": {"model_group": model}}, "stream": stream, **extra}
+    if ttft_s is not None:
+        kwargs["completion_start_time"] = start + timedelta(seconds=ttft_s)
+
+    async def run():
+        await hook.handler.async_log_success_event(kwargs, None, start, start + timedelta(seconds=5))
+        if drain:
+            await asyncio.gather(*list(hook._pending))
+
+    asyncio.run(run())
+
+
+def test_a_success_counts_a_request_of_its_model_in_the_minute_hash(hook, redis):
+    success(hook)
+    assert redis.hashes == {"portal:gwm:100": {"gemma-4-e4b:req": 1}}
+    assert redis.ttls["portal:gwm:100"] == 7200
+
+
+@pytest.mark.parametrize(
+    "ttft_s, kind",
+    [(0.05, "t100"), (0.1, "t100"), (0.3, "t500"), (1.0, "t1000"), (29.0, "t30000"), (61.0, "tinf")],
+)
+def test_the_time_to_the_first_token_of_a_stream_goes_into_a_histogram(hook, redis, ttft_s, kind):
+    success(hook, stream=True, ttft_s=ttft_s)
+    assert redis.hashes["portal:gwm:100"] == {"gemma-4-e4b:req": 1, f"gemma-4-e4b:{kind}": 1}
+
+
+def test_a_whole_answer_has_no_first_token_time(hook, redis):
+    success(hook, stream=False, ttft_s=0.2)  # a non-streamed call: completion_start_time is the end, not the first token
+    assert redis.hashes["portal:gwm:100"] == {"gemma-4-e4b:req": 1}
+
+
+def test_the_model_comes_from_the_standard_payload_or_the_request_model(hook, redis):
+    start = datetime(2026, 11, 4, tzinfo=timezone.utc)
+
+    async def run():
+        await hook.handler.async_log_success_event({"standard_logging_object": {"model_group": "a"}}, None, start, start)
+        await hook.handler.async_log_success_event({"model": "b"}, None, start, start)
+        await hook.handler.async_log_success_event({}, None, start, start)  # no model: nothing to count
+        await asyncio.gather(*list(hook._pending))
+
+    asyncio.run(run())
+    assert redis.hashes["portal:gwm:100"] == {"a:req": 1, "b:req": 1}
+
+
+def test_failures_count_in_the_model_hash_too(hook, redis):
+    call(hook, ServerError(503), model="m1")
+    call(hook, RouterRateLimitError("m1", 5), model="m1")
+    call(hook, ServerError(400), model="m1")  # not an overload or a server error: not counted
+    assert redis.hashes["portal:gwm:100"] == {"m1:req": 2, "m1:5xx": 1, "m1:429": 1}
+    assert redis.counts == {"portal:gw:5xx:100": 1, "portal:gw:429:100": 1}  # the totals are as before
+
+
+def test_a_long_model_name_is_cut(hook, redis):
+    call(hook, ServerError(500), model="x" * 500)
+    (field,) = [f for f in redis.hashes["portal:gwm:100"] if f.endswith(":5xx")]
+    assert len(field) == hook.MODEL_NAME_MAX + len(":5xx")
+
+
+def test_model_counts_never_fail_the_request_when_redis_is_down(hook, redis):
+    redis.broken = True
+    success(hook)  # no exception
+    assert redis.hashes == {}
+
+
+def test_a_broken_success_event_is_swallowed(hook, redis):
+    async def run():
+        await hook.handler.async_log_success_event(None, None, None, None)
+
+    asyncio.run(run())  # kwargs is None: logged, never raised

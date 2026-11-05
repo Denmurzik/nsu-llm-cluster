@@ -3,11 +3,17 @@ import { Route, Routes, Navigate } from "react-router-dom";
 import { api, ApiError, onUnauthorized } from "./api";
 import { MeContext } from "./auth";
 import { Shell } from "./components/Shell";
+import { AdminBackups } from "./pages/AdminBackups";
 import { AdminDeploymentEdit } from "./pages/AdminDeploymentEdit";
 import { AdminDeploymentNew, AdminDeployments } from "./pages/AdminDeployments";
 import { AdminLocalModels } from "./pages/AdminLocalModels";
+import { AdminModelCache } from "./pages/AdminModelCache";
+import { AdminMonitoring } from "./pages/AdminMonitoring";
 import { AdminNodes } from "./pages/AdminNodes";
+import { AdminSettings } from "./pages/AdminSettings";
 import { AdminStatus } from "./pages/AdminStatus";
+import { AdminUsage } from "./pages/AdminUsage";
+import { AdminAudit } from "./pages/AdminAudit";
 import { AdminUsers } from "./pages/AdminUsers";
 import { Forbidden, RequireAdmin } from "./components/Guard";
 import { Keys } from "./pages/Keys";
@@ -93,6 +99,14 @@ export function App() {
             }
           />
           <Route
+            path="/admin/cache"
+            element={
+              <RequireAdmin>
+                <AdminModelCache />
+              </RequireAdmin>
+            }
+          />
+          <Route
             path="/admin/nodes"
             element={
               <RequireAdmin>
@@ -109,10 +123,50 @@ export function App() {
             }
           />
           <Route
+            path="/admin/monitoring"
+            element={
+              <RequireAdmin>
+                <AdminMonitoring />
+              </RequireAdmin>
+            }
+          />
+          <Route
             path="/admin/users"
             element={
               <RequireAdmin>
                 <AdminUsers />
+              </RequireAdmin>
+            }
+          />
+          <Route
+            path="/admin/backups"
+            element={
+              <RequireAdmin>
+                <AdminBackups />
+              </RequireAdmin>
+            }
+          />
+          <Route
+            path="/admin/usage"
+            element={
+              <RequireAdmin>
+                <AdminUsage />
+              </RequireAdmin>
+            }
+          />
+          <Route
+            path="/admin/settings"
+            element={
+              <RequireAdmin>
+                <AdminSettings />
+              </RequireAdmin>
+            }
+          />
+          <Route
+            path="/admin/audit"
+            element={
+              <RequireAdmin>
+                <AdminAudit />
               </RequireAdmin>
             }
           />

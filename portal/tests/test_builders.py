@@ -7,6 +7,8 @@ import pytest
 
 from app.config import Settings, key_fingerprint
 from app.k8s import OwnedWorkload
+from app.nodes import versions
+from app.workloads import builders
 from app.workloads.builders import (
     RpcWorker,
     leader_groups,
@@ -67,14 +69,17 @@ def test_replicas_daemonset_contract():
     assert labels.items() <= m["spec"]["selector"]["matchLabels"].items()
     assert m["spec"]["selector"]["matchLabels"].items() <= pod(m)["metadata"]["labels"].items()
     spec = pod(m)["spec"]
-    assert spec["nodeSelector"] == {"llm.nsu/deployment": "gemma-4-e4b", "llm.nsu/accel": "cpu"}
+    # the portal's own node label, which a kubelet cannot set (NodeRestriction): an approved node only (task SEC-1)
+    assert spec["nodeSelector"] == {"node-restriction.kubernetes.io/llm-deployment": "gemma-4-e4b", "llm.nsu/accel": "cpu"}
     assert spec["hostNetwork"] is True and spec["dnsPolicy"] == "Default"
     c = container(m)
-    assert c["image"] == "nsu-llm-node:0.1.0-cpu" and c["imagePullPolicy"] == "IfNotPresent"
+    # main's registry has told nothing about the tag: the bare tag, which can move, so the node asks the registry every time
+    assert c["image"] == "nsu-llm-node:0.2.0-cpu" and c["imagePullPolicy"] == "Always"
     assert c["command"] == ["/opt/llm/bin/serve-llama.sh"]
     assert env(m) == {
         "MODEL_REPO": "org/model-GGUF", "MODEL_FILE": "model-Q4_K_M.gguf", "PUBLIC_MODEL_NAME": "gemma-4-e4b",
         "INFER_PORT": "18080", "CTX_SIZE": "16384", "PARALLEL_SLOTS": "2", "ACCEL": "cpu",
+        "LLAMA_API_KEY_FILE": "/run/llm-backend/key",  # the node's own backend key (task SEC-1)
     }
     assert {"name": "models", "hostPath": {"path": "/var/lib/llm-models", "type": "DirectoryOrCreate"}} in spec["volumes"]
     assert {"name": "models", "mountPath": "/var/lib/llm-models"} in c["volumeMounts"]
@@ -111,7 +116,7 @@ def test_gpu_variant_runtime_and_limit():
     assert pod(m)["spec"]["runtimeClassName"] == "nvidia"
     assert pod(m)["spec"]["nodeSelector"]["llm.nsu/accel"] == "nvidia"
     assert container(m)["resources"] == {"limits": {"nvidia.com/gpu": 1}}
-    assert container(m)["image"] == "nsu-llm-node:0.1.0-gpu"
+    assert container(m)["image"] == "nsu-llm-node:0.2.0-gpu"
     assert env(m)["ACCEL"] == "nvidia"
 
 
@@ -121,7 +126,7 @@ def test_vllm_daemonset_args_and_parsers():
     assert m["metadata"]["name"] == "llm-gemma-4-e4b-vllm"
     c = container(m)
     assert c["image"] == "vllm/vllm-openai:v0.32.0"
-    assert c["command"] == ["vllm", "serve"]
+    assert c["command"][:2] == ["/bin/sh", "-c"] and c["command"][3] == "vllm"  # the wrapper reads the key file
     args = c["args"]
     assert args[0] == "google/gemma-4-E4B-it-qat-w4a16-ct"
     flags = dict(zip(args[1:], args[2:], strict=False))
@@ -150,7 +155,7 @@ def test_rpc_daemonset_contract():
     cpu = rpc_daemonset(dep(mode="split"), "cpu", S)
     assert cpu["metadata"]["name"] == "llm-gemma-4-e4b-rpc-cpu"
     assert cpu["metadata"]["labels"]["llm.nsu/role"] == "rpc"
-    assert pod(cpu)["spec"]["nodeSelector"] == {"llm.nsu/deployment": "gemma-4-e4b", "llm.nsu/accel": "cpu"}
+    assert pod(cpu)["spec"]["nodeSelector"] == {"node-restriction.kubernetes.io/llm-deployment": "gemma-4-e4b", "llm.nsu/accel": "cpu"}
     c = container(cpu)
     assert c["command"] == ["/opt/llm/bin/serve-rpc.sh"]
     # the tensor cache (-c) lives on the models volume, so a restarted group does not resend the weights
@@ -170,7 +175,7 @@ def test_rpc_daemonset_contract():
     assert gpu["metadata"]["name"] == "llm-gemma-4-e4b-rpc-gpu"
     assert pod(gpu)["spec"]["runtimeClassName"] == "nvidia"
     assert container(gpu)["resources"]["limits"] == {"nvidia.com/gpu": 1}
-    assert container(gpu)["image"] == "nsu-llm-node:0.1.0-gpu"
+    assert container(gpu)["image"] == "nsu-llm-node:0.2.0-gpu"
     assert env(gpu)["RPC_DEVICES"] == "CUDA0,CPU"  # VRAM and RAM of the node
     assert env(rpc_daemonset(dep(mode="split", use_node_ram=False), "nvidia", S))["RPC_DEVICES"] == "CUDA0"
 
@@ -322,7 +327,8 @@ def test_split_leader_contract():
     assert m["metadata"]["labels"]["llm.nsu/role"] == "split-leader"
     assert m["spec"]["strategy"] == {"type": "Recreate"} and m["spec"]["replicas"] == 1
     terms = pod(m)["spec"]["affinity"]["nodeAffinity"]["requiredDuringSchedulingIgnoredDuringExecution"]["nodeSelectorTerms"]
-    assert terms == [{"matchExpressions": [{"key": "kubernetes.io/hostname", "operator": "In", "values": ["a"]}]}]
+    # by the Node's name, not by kubernetes.io/hostname, which a kubelet may set on its own Node (task SEC-1)
+    assert terms == [{"matchFields": [{"key": "metadata.name", "operator": "In", "values": ["a"]}]}]
     assert "nodeName" not in pod(m)["spec"]
     e = env(m)
     assert e["RPC_SERVERS"] == "127.0.0.1:18050,10.0.0.3:18050"
@@ -330,7 +336,7 @@ def test_split_leader_contract():
     assert "TENSOR_SPLIT" not in e
     c = container(m)
     assert "resources" not in c and "runtimeClassName" not in pod(m)["spec"]
-    assert c["image"] == "nsu-llm-node:0.1.0-cpu"
+    assert c["image"] == "nsu-llm-node:0.2.0-cpu"
     assert c["ports"] == [{"containerPort": 18080, "hostPort": 18080}]
     a = annotations(m)
     assert a["llm.nsu/group-members"] == "a,b"  # read back by the controller to keep the group stable
@@ -343,7 +349,7 @@ def test_split_leader_contract():
     # an nvidia group: the gpu image (the only one on those nodes) and the runtime, but no GPU limit and no visible devices
     gpu = split_leader(d, 1, group("g1", "g2", accel="nvidia"), S)
     assert gpu["metadata"]["name"] == "llm-big-g1"
-    assert container(gpu)["image"] == "nsu-llm-node:0.1.0-gpu"
+    assert container(gpu)["image"] == "nsu-llm-node:0.2.0-gpu"
     assert pod(gpu)["spec"]["runtimeClassName"] == "nvidia"
     assert "resources" not in container(gpu)
     ge = env(gpu)
@@ -410,22 +416,29 @@ def test_names_and_labels_are_valid_k8s():
         assert m["spec"]["selector"]["matchLabels"].items() <= pod(m)["metadata"]["labels"].items()
 
 
-def secret_ref():
-    return {"name": "llm-node-secrets", "key": "BACKEND_API_KEY"}
+KEY_MOUNT = {"name": "backend-key", "mountPath": "/run/llm-backend", "readOnly": True}
+KEY_VOLUME = {"name": "backend-key", "hostPath": {"path": "/var/lib/llm-node/backend", "type": "DirectoryOrCreate"}}
 
 
-def test_inference_pods_get_the_backend_key_from_the_secret_in_the_servers_own_variable():
+def test_inference_pods_read_their_nodes_own_backend_key_from_the_node():
+    """Rule 3 of task SEC-1: no pod references the shared BACKEND_API_KEY any more; each reads the key of the node it runs
+    on (written by the node container's registrar.sh), so a stolen node knows its own key only."""
     d = dep(mode="split")
-    for m in (
-        replicas_daemonset(d, "cpu", S),
-        replicas_daemonset(d, "nvidia", S),
-        split_leader(d, 0, group("a", "b"), S),
-    ):
-        assert secret_env(m) == {"LLAMA_API_KEY": secret_ref()}  # a reference, never the value
-    assert secret_env(vllm_daemonset(dep(engine="vllm", file=None), S)) == {"VLLM_API_KEY": secret_ref()}
-    assert secret_env(rpc_daemonset(d, "cpu", S)) == {}  # RPC has no authentication of its own
     keyed = Settings(backend_api_key="hex-secret")
-    assert "hex-secret" not in str(replicas_daemonset(d, "cpu", keyed))
+    for m, var in (
+        (replicas_daemonset(d, "cpu", keyed), "LLAMA_API_KEY_FILE"),
+        (replicas_daemonset(d, "nvidia", keyed), "LLAMA_API_KEY_FILE"),
+        (split_leader(d, 0, group("a", "b"), keyed), "LLAMA_API_KEY_FILE"),
+        (vllm_daemonset(dep(engine="vllm", file=None), keyed), "VLLM_API_KEY_FILE"),
+    ):
+        assert env(m)[var] == "/run/llm-backend/key"
+        assert secret_env(m) == {}  # no Secret at all with the mirror off and no HF token
+        assert KEY_MOUNT in container(m)["volumeMounts"] and KEY_VOLUME in pod(m)["spec"]["volumes"]
+        assert "hex-secret" not in str(m) and "BACKEND_API_KEY" not in str(m)
+        # never the state directory with the node's own key
+        assert not any(v.get("hostPath", {}).get("path") == "/var/lib/llm-node" for v in pod(m)["spec"]["volumes"])
+    assert secret_env(rpc_daemonset(d, "cpu", S)) == {}  # RPC has no authentication of its own
+    assert "backend-key" not in str(rpc_daemonset(d, "cpu", S))
 
 
 def test_the_key_never_reaches_a_command_line():
@@ -437,29 +450,24 @@ def test_the_key_never_reaches_a_command_line():
     ):
         c = container(m)
         argv = c.get("command", []) + c.get("args", [])
-        assert "--api-key" not in argv and not any("API_KEY" in a or "hex-secret" in a for a in argv)
+        assert "--api-key" not in argv and "hex-secret" not in str(argv)
 
 
-def test_pod_template_carries_the_key_fingerprint_so_a_rotation_restarts_the_pods():
-    keyed = Settings(backend_api_key="key-one")
-    other = Settings(backend_api_key="key-two")
+def test_a_rotated_shared_key_no_longer_restarts_the_pods():
+    """The shared key is not in the pods any more, so it is no part of their template either."""
     for build in (
         lambda s: replicas_daemonset(dep(), "cpu", s),
         lambda s: split_leader(dep(mode="split"), 0, group("a", "b"), s),
         lambda s: vllm_daemonset(dep(engine="vllm", file=None), s),
     ):
-        a, b, none = build(keyed), build(other), build(S)
-        tag = annotations(a)["llm.nsu/backend-key"]
-        assert tag == key_fingerprint("key-one") and len(tag) == 12
-        assert annotations(a)["llm.nsu/spec-hash"] != annotations(b)["llm.nsu/spec-hash"]  # a new key: new pods
-        assert "llm.nsu/backend-key" not in annotations(none)
-        assert "key-one" not in str(a)
-    assert "llm.nsu/backend-key" not in annotations(rpc_daemonset(dep(mode="split"), "cpu", keyed))
+        a, b = build(Settings(backend_api_key="key-one")), build(Settings(backend_api_key="key-two"))
+        assert annotations(a)["llm.nsu/spec-hash"] == annotations(b)["llm.nsu/spec-hash"]
+        assert "llm.nsu/backend-key" not in annotations(a)
 
 
-def test_hf_token_stays_next_to_the_backend_key():
+def test_hf_token_is_the_only_secret_reference():
     m = replicas_daemonset(dep(), "cpu", direct(hf_token="hf_abc"))
-    assert secret_env(m) == {"HF_TOKEN": {"name": "llm-node-secrets", "key": "HF_TOKEN", "optional": True}, "LLAMA_API_KEY": secret_ref()}
+    assert secret_env(m) == {"HF_TOKEN": {"name": "llm-node-secrets", "key": "HF_TOKEN", "optional": True}}
 
 
 @pytest.mark.skipif(shutil.which("grep") is None, reason="needs grep")
@@ -494,7 +502,7 @@ def all_env(manifest):
 
 
 def test_inference_pods_download_through_the_mirror_on_main():
-    with_token = Settings(node_image_tag="0.1.0", public_hostname="llm.example", hf_token="hf_real")
+    with_token = Settings(node_image_tag="0.1.0", public_hostname="llm.example", hf_token="hf_real", hf_mirror_token="mirror-key")
     for m in (
         replicas_daemonset(dep(), "cpu", with_token),
         replicas_daemonset(dep(), "nvidia", with_token),
@@ -507,8 +515,10 @@ def test_inference_pods_download_through_the_mirror_on_main():
         assert e["NODE_NAME"] == {"name": "NODE_NAME", "valueFrom": {"fieldRef": {"fieldPath": "spec.nodeName"}}}
         assert names.index("NODE_NAME") < names.index("HF_ENDPOINT")
         assert e["HF_ENDPOINT"]["value"] == "https://llm.example/hf/c/$(NODE_NAME)"
-        # the nodes get the mirror key, the real Hugging Face token stays on main
-        assert secret_env(m)["HF_TOKEN"] == {"name": "llm-node-secrets", "key": "HF_MIRROR_TOKEN"}
+        # the nodes get a mirror token for the deployment's repositories (rule 4 of task SEC-1), the real Hugging Face
+        # token and the mirror's own key stay on main
+        assert e["HF_TOKEN"]["value"].startswith("nsm1.") and "HF_TOKEN" not in secret_env(m)
+        assert "mirror-key" not in str(m)
         assert "llm.nsu/hf-token" not in annotations(m)
         assert {"name": "llm-ca", "mountPath": "/etc/llm-ca", "readOnly": True} in container(m)["volumeMounts"]
         assert {"name": "llm-ca", "configMap": {"name": "llm-ca", "optional": True}} in pod(m)["spec"]["volumes"]
@@ -523,11 +533,15 @@ def test_own_model_files_always_come_from_the_mirror_on_main():
     """local/<name> is served by the mirror only: even with HF_MIRROR_ENABLED=false the pods of an own model go there,
     with the mirror key, and llama.cpp gets the repository as it is (--hf-repo local/<name> --hf-file <file>)."""
     own = dict(repo="local/qwen3-235b", file="Qwen3-235B-A22B-Q2_K-00001-of-00002.gguf")
-    off = Settings(node_image_tag="0.1.0", public_hostname="llm.example", hf_mirror_enabled=False, hf_token="hf_real")
+    off = Settings(
+        node_image_tag="0.1.0", public_hostname="llm.example", hf_mirror_enabled=False, hf_token="hf_real",
+        hf_mirror_token="mirror-key",
+    )
     for m in (replicas_daemonset(dep(**own), "cpu", off), split_leader(dep(mode="split", **own), 0, group("a", "b"), off)):
         e = all_env(m)
         assert e["HF_ENDPOINT"]["value"] == "https://llm.example/hf/c/$(NODE_NAME)"
-        assert secret_env(m)["HF_TOKEN"] == {"name": "llm-node-secrets", "key": "HF_MIRROR_TOKEN"}
+        assert e["HF_TOKEN"]["value"].startswith("nsm1.") and "HF_TOKEN" not in secret_env(m)
+        assert "mirror-key" not in str(m)
         assert (env(m)["MODEL_REPO"], env(m)["MODEL_FILE"]) == (own["repo"], own["file"])
         assert "llm.nsu/hf-token" not in annotations(m)  # the real token is not used by these pods
         assert any(v["name"] == "llm-ca" for v in pod(m)["spec"]["volumes"])
@@ -599,8 +613,14 @@ def test_the_vllm_wrapper_sets_the_ca_bundle_only_when_the_configmap_is_there(tm
     (fake / "vllm").chmod(0o755)
     bundle = tmp_path / "bundle.crt"
 
+    key = tmp_path / "key"
+    key.write_text("k" * 64, encoding="utf-8")
+
     def run():
-        env = {**os.environ, "PATH": f"{fake}{os.pathsep}{os.environ['PATH']}", "LLM_CA_BUNDLE": str(bundle)}
+        env = {
+            **os.environ, "PATH": f"{fake}{os.pathsep}{os.environ['PATH']}", "LLM_CA_BUNDLE": str(bundle),
+            "VLLM_API_KEY_FILE": str(key),
+        }
         env.pop("SSL_CERT_FILE", None)
         return subprocess.run(["sh", *c["command"][1:], *c["args"][:3]], env=env, capture_output=True, text=True).stdout
 
@@ -639,3 +659,99 @@ def test_plan_groups_new_group_leads_with_the_node_with_most_ram():
     # a running group keeps its order
     running = plan_groups([w("nsu-4060", 7793), w("nsu-4070", 10951)], 2, existing={0: ["nsu-4060", "nsu-4070"]})
     assert names_of(running) == {0: ["nsu-4060", "nsu-4070"]}
+
+
+# ---------- the node image is pinned by digest (task 2-30) ----------
+
+DIGEST = "sha256:" + "ab" * 32
+DIGEST_2 = "sha256:" + "cd" * 32
+
+
+@pytest.fixture
+def registry():
+    """The process-wide cache of main's registry, empty before and after: builders read it without awaiting."""
+    versions.REGISTRY.reset()
+    yield versions.REGISTRY
+    versions.REGISTRY.reset()
+
+
+def offer(registry, tag, digest, settings=S):
+    registry.put(settings, tag, None if digest is None else versions.ImageInfo(tag, digest))
+
+
+def test_pods_run_the_image_main_registry_reports_by_its_digest(registry):
+    offer(registry, "0.1.0-cpu", DIGEST)
+    offer(registry, "0.1.0-gpu", DIGEST_2)
+    c = container(replicas_daemonset(dep(), "cpu", S))
+    assert c["image"] == f"nsu-llm-node@{DIGEST}" and c["imagePullPolicy"] == "IfNotPresent"
+    assert container(replicas_daemonset(dep(), "nvidia", S))["image"] == f"nsu-llm-node@{DIGEST_2}"
+    # the rpc server and the leader of a split group run the same image
+    assert container(rpc_daemonset(dep(mode="split"), "nvidia", S))["image"] == f"nsu-llm-node@{DIGEST_2}"
+    leader = container(split_leader(dep(mode="split"), 0, group("g1", "g2", accel="nvidia"), S))
+    assert leader["image"] == f"nsu-llm-node@{DIGEST_2}" and leader["imagePullPolicy"] == "IfNotPresent"
+
+
+def test_the_repository_of_the_settings_stays_in_the_pinned_name(registry):
+    # k3s asks main's registry for ghcr.io/<owner>/nsu-llm-node and for the bare name alike (entrypoint.sh of the node)
+    mirrored = Settings(node_image_repo="ghcr.io/nsu/nsu-llm-node", node_image_tag="0.1.0")
+    offer(registry, "0.1.0-cpu", DIGEST, mirrored)
+    assert container(replicas_daemonset(dep(), "cpu", mirrored))["image"] == f"ghcr.io/nsu/nsu-llm-node@{DIGEST}"
+
+
+def test_a_tag_main_registry_does_not_have_stays_a_tag_that_is_always_pulled(registry):
+    offer(registry, "0.1.0-cpu", None)  # the registry answered 404
+    for make in (
+        lambda: replicas_daemonset(dep(), "cpu", S),
+        lambda: rpc_daemonset(dep(mode="split"), "cpu", S),
+        lambda: split_leader(dep(mode="split"), 0, group("g1", "g2"), S),
+    ):
+        c = container(make())
+        assert c["image"] == "nsu-llm-node:0.2.0-cpu" and c["imagePullPolicy"] == "Always"
+
+
+def test_pinning_can_be_switched_off(registry):
+    off = Settings(node_image_tag="0.1.0", node_image_pin=False, hf_mirror_enabled=False)
+    offer(registry, "0.1.0-cpu", DIGEST, off)
+    c = container(replicas_daemonset(dep(), "cpu", off))
+    assert c["image"] == "nsu-llm-node:0.2.0-cpu" and c["imagePullPolicy"] == "IfNotPresent"
+
+
+def test_the_pod_template_changes_with_the_digest_and_only_with_it(registry):
+    spec_hash = lambda: annotations(replicas_daemonset(dep(), "cpu", S))["llm.nsu/spec-hash"]  # noqa: E731
+    offer(registry, "0.1.0-cpu", DIGEST)
+    first = spec_hash()
+    registry.put(S, "0.1.0-cpu", versions.ImageInfo("0.1.0-cpu", DIGEST, version="9", revision="x"))  # labels are not the image
+    assert spec_hash() == first  # the registry asked again, same image: the deployments do not restart
+    offer(registry, "0.1.0-cpu", DIGEST_2)
+    assert spec_hash() != first  # an image pushed under the same tag is a new pod template
+    offer(registry, "0.1.0-gpu", DIGEST_2)
+    assert spec_hash() != first
+
+
+def test_the_wake_job_keeps_the_tag_the_node_image_has_on_the_node(registry):
+    offer(registry, "0.1.0-gpu", DIGEST)
+    job = builders.wake_job("pc03", "nvidia", "pc01", "00:1a:2b:3c:4d:5e", "10.1.2.255", S)
+    (c,) = job["spec"]["template"]["spec"]["containers"]
+    # `Never` pulls nothing, so the name must be the one the node imported from its archive
+    assert c["image"] == "nsu-llm-node:0.2.0-gpu" and c["imagePullPolicy"] == "Never"
+
+
+def test_the_pods_mirror_token_names_the_repositories_of_their_deployment_only():
+    """Rule 4 of task SEC-1: the pods of a deployment can fetch its model, draft and own projector through the mirror, and
+    nothing else the operator's HF_TOKEN sees."""
+    import base64
+    import hashlib
+    import hmac
+    import json
+
+    s = Settings(node_image_tag="0.1.0", public_hostname="llm.example", hf_mirror_token="mirror-key")
+    d = dep(draft_repo="org/draft-GGUF", draft_file="d.gguf", mmproj_file="local/vision/mmproj.gguf")
+    token = env(replicas_daemonset(d, "cpu", s))["HF_TOKEN"]
+    prefix, payload, sig = token.split(".")
+    body = f"{prefix}.{payload}"
+    want = base64.urlsafe_b64encode(hmac.new(b"mirror-key", body.encode(), hashlib.sha256).digest()).rstrip(b"=").decode()
+    assert prefix == "nsm1" and sig == want
+    claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+    assert claims == {"c": "*", "r": ["local/vision", "org/draft-GGUF", "org/model-GGUF"]}
+    # the same repositories give the same token: the template, and so the pods, do not change
+    assert env(replicas_daemonset(d, "cpu", s))["HF_TOKEN"] == token

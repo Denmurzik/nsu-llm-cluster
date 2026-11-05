@@ -38,6 +38,14 @@ def blob(n: int, seed: int = 1) -> bytes:
     return bytes((i * 31 + seed) % 251 for i in range(n))
 
 
+class QuietServer(ThreadingHTTPServer):
+    """A client that drops the connection (a cancelled download) is not an error worth a traceback."""
+
+    def handle_error(self, request, client_address):
+        if not isinstance(sys.exc_info()[1], (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)):
+            super().handle_error(request, client_address)
+
+
 class FakeHub:
     """Two servers: `hub` answers the API and /resolve (LFS files redirect to `cdn`, a different host:port)."""
 
@@ -183,8 +191,8 @@ class FakeHub:
                     if hub.chunk_delay:
                         time.sleep(hub.chunk_delay)
 
-        self.hub_server = ThreadingHTTPServer(("127.0.0.1", 0), Hub)
-        self.cdn_server = ThreadingHTTPServer(("127.0.0.1", 0), Cdn)
+        self.hub_server = QuietServer(("127.0.0.1", 0), Hub)
+        self.cdn_server = QuietServer(("127.0.0.1", 0), Cdn)
         self.hub_server.daemon_threads = self.cdn_server.daemon_threads = True
         self.cdn_port = self.cdn_server.server_address[1]
         self.url = f"http://127.0.0.1:{self.hub_server.server_address[1]}"
@@ -953,3 +961,14 @@ def test_the_disk_reserve_stays_above_the_kubelet_eviction_threshold(tmp_path, m
     monkeypatch.setattr(hf_mirror.shutil, "disk_usage", usage(4 * GiB, 2 * GiB))  # a tiny disk: the 1 GiB floor
     assert m.make_room(GiB + 1) == "full" and m.make_room(GiB) == "ok"
     assert DISK_RESERVE_OF(1000 * GiB) == 150 * GiB and DISK_RESERVE_OF(GiB) == hf_mirror.DISK_RESERVE
+
+
+def test_the_panel_limit_wins_over_the_env_limit():
+    """The portal's setting `hf_mirror_max_gib` reaches the mirror as HF_MIRROR_MAX_GIB_OVERRIDE (a ConfigMap, read at
+    start); an empty or absent one leaves the .env value."""
+    assert hf_mirror.max_gib_setting({}) == 500
+    assert hf_mirror.max_gib_setting({"HF_MIRROR_MAX_GIB": "2000"}) == 2000
+    assert hf_mirror.max_gib_setting({"HF_MIRROR_MAX_GIB": "2000", "HF_MIRROR_MAX_GIB_OVERRIDE": ""}) == 2000
+    assert hf_mirror.max_gib_setting({"HF_MIRROR_MAX_GIB": "2000", "HF_MIRROR_MAX_GIB_OVERRIDE": "800"}) == 800
+    with pytest.raises(ValueError):  # main() turns it into «bad setting» and exit code 2
+        hf_mirror.max_gib_setting({"HF_MIRROR_MAX_GIB_OVERRIDE": "lots"})

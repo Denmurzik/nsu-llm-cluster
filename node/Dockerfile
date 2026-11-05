@@ -3,6 +3,8 @@
 # Build context is this directory (node/).
 
 ARG LLAMA_TAG=b12033
+# the commit of that tag (git ls-remote https://github.com/ggml-org/llama.cpp refs/tags/b12033): a moved tag fails the build
+ARG LLAMA_COMMIT=785322d17f2d51e5185cf996a1f4e46d87640841
 ARG K3S_VERSION=v1.36.5+k3s1
 # NVIDIA device plugin for the GPU image: nvcr.io answers 403 from Russia, so the plugin is built from the sources of
 # the release tag (github.com, vendored Go modules) and runs from this image (main/manifests/common-45).
@@ -10,14 +12,17 @@ ARG DEVICE_PLUGIN_TAG=v0.19.3
 ARG DEVICE_PLUGIN_COMMIT=570e776d6813cb9f3e9c8c105cf8d79989db6650
 
 # ---------------------------------------------------------------- build-cpu
-FROM ubuntu:24.04 AS build-cpu
+FROM ubuntu:24.04@sha256:fe81560990fae86dc4743202b2cb4d3df98d0bcf949173cecef15ce1127ef852 AS build-cpu
 ARG LLAMA_TAG
+ARG LLAMA_COMMIT
 ARG JOBS=4
 RUN apt-get update \
  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
       build-essential cmake git ca-certificates libcurl4-openssl-dev libssl-dev \
  && rm -rf /var/lib/apt/lists/*
-RUN git clone --depth 1 --branch "${LLAMA_TAG}" https://github.com/ggml-org/llama.cpp /src
+RUN git clone --depth 1 --branch "${LLAMA_TAG}" https://github.com/ggml-org/llama.cpp /src \
+ && [ "$(git -C /src rev-parse HEAD)" = "${LLAMA_COMMIT}" ] \
+ || { echo "llama.cpp ${LLAMA_TAG} is not commit ${LLAMA_COMMIT}" >&2; exit 1; }
 WORKDIR /src
 RUN grep -n add_executable tools/rpc/CMakeLists.txt
 # Device limits 16 -> 64 (split over VRAM + RAM of 15 nodes = 30 RPC devices); fails the build if the sources differ.
@@ -35,14 +40,17 @@ RUN cmake -B build \
  && strip build/bin/llama-server build/bin/ggml-rpc-server
 
 # ---------------------------------------------------------------- build-gpu
-FROM nvidia/cuda:12.8.1-devel-ubuntu24.04 AS build-gpu
+FROM nvidia/cuda:12.8.1-devel-ubuntu24.04@sha256:520292dbb4f755fd360766059e62956e9379485d9e073bbd2f6e3c20c270ed66 AS build-gpu
 ARG LLAMA_TAG
+ARG LLAMA_COMMIT
 ARG JOBS=4
 RUN apt-get update \
  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
       build-essential cmake git ca-certificates libcurl4-openssl-dev libssl-dev \
  && rm -rf /var/lib/apt/lists/*
-RUN git clone --depth 1 --branch "${LLAMA_TAG}" https://github.com/ggml-org/llama.cpp /src
+RUN git clone --depth 1 --branch "${LLAMA_TAG}" https://github.com/ggml-org/llama.cpp /src \
+ && [ "$(git -C /src rev-parse HEAD)" = "${LLAMA_COMMIT}" ] \
+ || { echo "llama.cpp ${LLAMA_TAG} is not commit ${LLAMA_COMMIT}" >&2; exit 1; }
 WORKDIR /src
 RUN grep -n add_executable tools/rpc/CMakeLists.txt
 # Device limits 16 -> 64 (split over VRAM + RAM of 15 nodes = 30 RPC devices); fails the build if the sources differ.
@@ -64,7 +72,7 @@ RUN cmake -B build \
 # ---------------------------------------------------------------- device-plugin
 # bookworm: the binary links glibc dynamically (cgo, go-nvml), and glibc 2.36 runs on Ubuntu 24.04 (2.39). The link
 # flags are those of the release Makefile (go-nvml resolves NVML symbols at run time); vendored modules, no download.
-FROM golang:1.26.4-bookworm AS device-plugin
+FROM golang:1.26.4-bookworm@sha256:b305420a68d0f229d91eb3b3ed9e519fcf2cf5461da4bef997bf927e8c0bfd2b AS device-plugin
 ARG DEVICE_PLUGIN_TAG
 ARG DEVICE_PLUGIN_COMMIT
 RUN git clone --depth 1 --branch "${DEVICE_PLUGIN_TAG}" https://github.com/NVIDIA/k8s-device-plugin /src \
@@ -78,7 +86,7 @@ RUN CGO_ENABLED=1 GOFLAGS=-mod=vendor GOPROXY=off GOTOOLCHAIN=local go build \
  && /out/nvidia-device-plugin --version
 
 # ---------------------------------------------------------------- k3s
-FROM ubuntu:24.04 AS k3s
+FROM ubuntu:24.04@sha256:fe81560990fae86dc4743202b2cb4d3df98d0bcf949173cecef15ce1127ef852 AS k3s
 ARG K3S_VERSION
 RUN apt-get update \
  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates curl \
@@ -93,7 +101,7 @@ RUN set -eux; \
     chmod +x /k3s
 
 # ---------------------------------------------------------------- cpu
-FROM ubuntu:24.04 AS cpu
+FROM ubuntu:24.04@sha256:fe81560990fae86dc4743202b2cb4d3df98d0bcf949173cecef15ce1127ef852 AS cpu
 RUN apt-get update \
  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
       ca-certificates curl jq iptables iproute2 libcurl4 libssl3 libgomp1 \
@@ -104,11 +112,16 @@ COPY --from=k3s /k3s /opt/llm/bin/k3s
 COPY rootfs/ /
 RUN chmod +x /opt/llm/bin/*
 ENV PATH=/opt/llm/bin:$PATH LLAMA_CACHE=/var/lib/llm-models
-LABEL org.opencontainers.image.version=0.1.0
+# Build arguments given last (another commit does not rebuild the layers above): the node reports them to the portal
+# (env NODE_VERSION, NODE_REVISION; registrar.sh, task 2-30); release/release.sh passes both.
+ARG VERSION=dev
+ARG GIT_COMMIT=unknown
+LABEL org.opencontainers.image.version=$VERSION org.opencontainers.image.revision=$GIT_COMMIT
+ENV NODE_VERSION=$VERSION NODE_REVISION=$GIT_COMMIT
 ENTRYPOINT ["/opt/llm/bin/entrypoint.sh"]
 
 # ---------------------------------------------------------------- gpu
-FROM nvidia/cuda:12.8.1-runtime-ubuntu24.04 AS gpu
+FROM nvidia/cuda:12.8.1-runtime-ubuntu24.04@sha256:ebef3c171eeef0298e4eb2e4be843105edf3b8b0ac45e0b43acee358e8046867 AS gpu
 RUN apt-get update \
  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
       ca-certificates curl jq iptables iproute2 libcurl4 libssl3 libgomp1 gnupg \
@@ -130,5 +143,10 @@ COPY --from=k3s /k3s /opt/llm/bin/k3s
 COPY rootfs/ /
 RUN chmod +x /opt/llm/bin/*
 ENV PATH=/opt/llm/bin:$PATH LLAMA_CACHE=/var/lib/llm-models
-LABEL org.opencontainers.image.version=0.1.0
+# Build arguments given last (another commit does not rebuild the layers above): the node reports them to the portal
+# (env NODE_VERSION, NODE_REVISION; registrar.sh, task 2-30); release/release.sh passes both.
+ARG VERSION=dev
+ARG GIT_COMMIT=unknown
+LABEL org.opencontainers.image.version=$VERSION org.opencontainers.image.revision=$GIT_COMMIT
+ENV NODE_VERSION=$VERSION NODE_REVISION=$GIT_COMMIT
 ENTRYPOINT ["/opt/llm/bin/entrypoint.sh"]

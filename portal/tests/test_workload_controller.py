@@ -93,7 +93,7 @@ def trace(k8s):
         await delete_(kind, name)
 
     async def traced_patch(name, labels):
-        events.append(("label", name, labels["llm.nsu/deployment"]))
+        events.append(("label", name, labels["node-restriction.kubernetes.io/llm-deployment"]))
         await patch(name, labels)
 
     async def traced_delete_pod(name, grace_period_seconds=None):
@@ -297,7 +297,7 @@ async def test_split_creates_rpc_then_leaders_from_ready_rpc_pods(db_session, k8
     assert names(k8s) == {"llm-sp-rpc-cpu", "llm-sp-g0"}
     leader = k8s.workloads[("Deployment", "llm-sp-g0")]
     terms = leader["spec"]["template"]["spec"]["affinity"]["nodeAffinity"]["requiredDuringSchedulingIgnoredDuringExecution"]
-    assert terms["nodeSelectorTerms"][0]["matchExpressions"][0]["values"] == ["a"]
+    assert terms["nodeSelectorTerms"][0]["matchFields"][0]["values"] == ["a"]
     assert env(k8s, "Deployment", "llm-sp-g0")["RPC_SERVERS"] == "127.0.0.1:18050,10.0.0.2:18050"
 
 
@@ -408,6 +408,31 @@ async def test_a_group_with_ram_that_does_not_fit_gets_no_leader_and_the_status_
     status = await service.deployment_status(db_session, k8s, FakeLiteLLM(), dep)
     (problem,) = status["placement_problems"]
     assert problem.startswith("Группа a, b не запущена: модель не помещается в память нод (нужно ")
+
+
+async def test_the_status_lists_the_group_in_the_ram_order_the_controller_leads_it_by(db_session, k8s, controller):
+    """The node with the most RAM leads a new group (the last GPU node's RAM holds nothing), so a model that does not fit
+    the groups in name order can still fit the group the controller forms: the status page must show that group and no
+    «не помещается»."""
+    hf = make_hf()
+    hf.layouts[(REPO, FILE)] = GgufLayout([GiB * 5 // 4] * 32, GiB, GiB // 4, GiB, 1000)  # 40 GiB of layers
+    dep = await service.create(
+        db_session, hf, dep_in(name="big", mode="split", accel="nvidia", nodes=["a", "b"], ctx_per_request=1024, parallel=1)
+    )
+    k8s.add_node("a", accel="nvidia", internal_ip="10.0.0.1", vram_mib=12282, mem_mib=32000, ram_mib=20000)
+    k8s.add_node("b", accel="nvidia", internal_ip="10.0.0.2", vram_mib=12282, mem_mib=64000, ram_mib=60000)
+    by_name = [pl.NodeMemory(n, "nvidia", 12282, r) for n, r in (("a", 20000), ("b", 60000))]
+    assert not pl.plan_split(dep.meta, by_name, 1024, True, 70).fits  # a leading: b's RAM holds nothing
+    assert pl.plan_split(dep.meta, by_name[::-1], 1024, True, 70).fits
+    status = await service.deployment_status(db_session, k8s, FakeLiteLLM(), dep)  # no leader yet: the groups are planned
+    assert status["groups"] == [["b", "a"]]
+    assert status["placement_problems"] == []
+    add_rpc_pods(k8s, "big", "a", "b")
+    await controller.reconcile_once()
+    await controller.reconcile_once()
+    assert env(k8s, "Deployment", "llm-big-g0")["RPC_SERVERS"] == "127.0.0.1:18050,10.0.0.1:18050"  # b leads, a is remote
+    status = await service.deployment_status(db_session, k8s, FakeLiteLLM(), dep)
+    assert status["groups"] == [["b", "a"]] and status["placement_problems"] == []
 
 
 async def test_the_rpc_memory_limit_follows_every_node_of_the_accel_not_the_members(db_session, k8s, controller):

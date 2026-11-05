@@ -1,0 +1,205 @@
+/* Monitoring (task 2-33): live bars on «Состояние» and the line charts of «Мониторинг». One accent, a muted grid,
+   fixed heights so that nothing jumps while the data loads. */
+
+/* ---------- live bars ---------- */
+
+.load-cell {
+  display: grid;
+  grid-template-columns: minmax(48px, 1fr) 64px;
+  align-items: center;
+  gap: var(--s2);
+  min-width: 140px;
+}
+.load-cell .meter {
+  width: 100%;
+}
+.load-cell .meter i {
+  background: var(--accent);
+}
+.load-cell .meter.over i {
+  background: var(--bad);
+}
+.load-cell .val {
+  text-align: right;
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 16px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.load-sub {
+  display: block;
+  color: var(--text-3);
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 16px;
+  white-space: nowrap;
+}
+table.data td.load {
+  height: 52px;
+  vertical-align: middle;
+}
+
+/* ---------- charts ---------- */
+
+.range-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--s3);
+}
+.chart-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(360px, 1fr));
+  gap: var(--s4);
+}
+.mchart {
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--s3);
+  padding: var(--s5);
+  border: 1px solid var(--line);
+  border-radius: var(--r-card);
+  background: var(--card);
+  min-width: 0;
+}
+.mchart-head {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s1);
+  min-height: 40px;
+}
+/* the series values (two of them can wrap on a narrow card, and a value can be «—»): room for two value lines, always */
+.mchart-head.two {
+  min-height: 64px;
+}
+.mchart-title {
+  font-weight: 500;
+}
+.mchart-values {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--s1) var(--s3);
+  font-size: 12px;
+  line-height: 16px;
+  font-variant-numeric: tabular-nums;
+}
+.mchart-value {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--s1);
+  white-space: nowrap;
+}
+.mchart .sw {
+  width: 8px;
+  height: 8px;
+  border-radius: 2px;
+  background: var(--accent);
+}
+.mchart .sw.muted {
+  background: var(--text-3);
+}
+.mchart .sw.warn {
+  background: var(--warn);
+}
+.mchart .sw.bad {
+  background: var(--bad);
+}
+.mchart-body {
+  display: grid;
+  grid-template-columns: 52px minmax(0, 1fr);
+  grid-template-rows: 140px 16px;
+  column-gap: var(--s2);
+  row-gap: var(--s1);
+}
+.mchart-y {
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  text-align: right;
+  color: var(--text-3);
+  font-size: 12px;
+  line-height: 16px;
+  margin: -8px 0;
+  white-space: nowrap;
+}
+.mchart-plot {
+  position: relative;
+  min-width: 0;
+  touch-action: pan-y;
+}
+.mchart-plot svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+}
+.mchart-plot .grid {
+  stroke: var(--line);
+  stroke-width: 1;
+}
+.mchart-plot .cursor {
+  stroke: var(--line-strong);
+  stroke-width: 1;
+}
+.mchart-plot .line {
+  fill: none;
+  stroke: var(--accent);
+  stroke-width: 1.5;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+}
+.mchart-plot .line.muted {
+  stroke: var(--text-3);
+}
+.mchart-plot .line.warn {
+  stroke: var(--warn);
+}
+.mchart-plot .line.bad {
+  stroke: var(--bad);
+}
+.mchart-time {
+  position: absolute;
+  top: 0;
+  padding: 0 var(--s1);
+  border-radius: 2px;
+  background: var(--card);
+  font-size: 12px;
+  line-height: 16px;
+  white-space: nowrap;
+  pointer-events: none;
+}
+.mchart-time.left {
+  left: 0;
+}
+.mchart-time.right {
+  right: 0;
+}
+.mchart-empty {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.mchart-x {
+  grid-column: 2;
+  display: flex;
+  justify-content: space-between;
+  color: var(--text-3);
+  font-size: 12px;
+  line-height: 16px;
+}
+.mchart-x span:nth-child(2) {
+  text-align: center;
+}
+
+@media (max-width: 560px) {
+  .chart-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .mchart {
+    padding: var(--s4);
+  }
+}

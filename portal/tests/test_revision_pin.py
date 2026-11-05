@@ -29,7 +29,7 @@ FILE = "model-Q4_K_M.gguf"
 FILE8 = "model-Q8_0.gguf"
 GiB = 2**30
 META = GgufMeta("llama", 32, 32, 8, 128, 4096, 32768)
-ADMIN = {"sub": "adm", "email": "admin@g.nsu.ru"}
+ADMIN = {"sub": "adm", "email": "admin@g.nsu.ru", "email_verified": True}
 
 
 # ---------- the Hugging Face client ----------

@@ -20,7 +20,7 @@ from app.controllers.backends import BACKEND_STATUS_KEY, BackendController, mana
 from app.controllers.workloads import WorkloadController
 from app.deployments import service
 from app.litellm_client import ManagedModel
-from app.models import StandaloneNode
+from app.models import NodeIdentity, StandaloneNode
 from app.nodes import registry
 from tests.fakes.k8s import FakeK8s
 from tests.fakes.litellm import FakeLiteLLM
@@ -89,10 +89,26 @@ async def litellm(app):
     return app.state.litellm
 
 
+NODE_KEYS = {"worker-1": "bk-worker-1", "worker-2": "bk-worker-2"}  # the nodes' own backend keys (app.nodes.identity)
+
+
+async def set_node_key(app, name: str, key: str | None) -> None:
+    async with app.state.sessionmaker() as db:
+        row = await db.get(NodeIdentity, name)
+        if row is None:
+            row = NodeIdentity(name=name, approved=True)
+            db.add(row)
+        row.key_hash = None if key is None else "h-" + key
+        row.backend_key = key
+        await db.commit()
+
+
 @pytest.fixture
 async def k8s(app):
     app.state.k8s = FakeK8s()
     app.state.k8s.add_node("worker-1", accel="cpu", internal_ip=HOST)
+    for name, key in NODE_KEYS.items():  # the pods of a cluster node read its own key (builders.BACKEND_KEY_FILE)
+        await set_node_key(app, name, key)
     return app.state.k8s
 
 
@@ -246,12 +262,17 @@ async def test_redis_failure_does_not_stop_reconcile(controller, app, litellm, k
 
 
 async def test_entries_get_the_current_backend_key_in_place(controller, app, litellm, k8s, monkeypatch):
+    """Each entry carries its node's own key (rule 3 of task SEC-1); a node that gets a new key (reset and registered
+    again) has its entries patched in place, never deleted and added."""
     async with backend() as b:
         add_ready_pod(k8s, b.port)
         base = f"{b.base}/v1"
         mid = model_id(base, "gemma-4-e4b", 8192)
+        monkeypatch.setattr(app.state.settings, "backend_api_key", SecretStr("shared-key"))
+        litellm.backend_api_key = "shared-key"
         await controller.reconcile_once()
-        assert litellm.models[mid].key_fingerprint == ""  # registered while no key was configured
+        assert litellm.models[mid].key_fingerprint == key_fingerprint("bk-worker-1")
+        assert litellm.api_keys[mid] == "bk-worker-1"  # the node's own key, never the shared one
 
         deleted, updated = [], []
         original_delete, original_update = litellm.delete_model, litellm.update_model_key
@@ -260,27 +281,31 @@ async def test_entries_get_the_current_backend_key_in_place(controller, app, lit
             deleted.append(model_id)
             await original_delete(model_id)
 
-        async def spy_update(model_id):
+        async def spy_update(model_id, api_key=None):
             updated.append(model_id)
-            await original_update(model_id)
+            await original_update(model_id, api_key)
 
         litellm.delete_model, litellm.update_model_key = spy_delete, spy_update
 
-        monkeypatch.setattr(app.state.settings, "backend_api_key", SecretStr("hex-backend-key"))
-        litellm.backend_api_key = "hex-backend-key"
         await controller.reconcile_once()
-        assert litellm.models[mid].key_fingerprint == key_fingerprint("hex-backend-key") and len(litellm.models) == 1
+        assert updated == []  # an entry that carries its key is left alone
+
+        await set_node_key(app, "worker-1", "bk-new")
+        await controller.reconcile_once()
         assert updated == [mid] and deleted == []  # the same entry, patched: it never leaves the router
+        assert litellm.api_keys[mid] == "bk-new" and litellm.models[mid].key_fingerprint == key_fingerprint("bk-new")
 
-        await controller.reconcile_once()
-        assert updated == [mid]  # an entry that carries the key is left alone
 
-        # key rotation: another fingerprint is patched in place again
-        monkeypatch.setattr(app.state.settings, "backend_api_key", SecretStr("rotated-key"))
-        litellm.backend_api_key = "rotated-key"
+async def test_a_cluster_node_without_its_own_key_gets_no_entry(controller, app, litellm, k8s, monkeypatch):
+    """A pod reads its node's own key; a node that has none (it never registered: an old node image) is not given the
+    shared key of before: it gets no LiteLLM entry at all."""
+    monkeypatch.setattr(app.state.settings, "backend_api_key", SecretStr("shared-key"))
+    litellm.backend_api_key = "shared-key"
+    await set_node_key(app, "worker-1", None)
+    async with backend() as b:
+        add_ready_pod(k8s, b.port)
         await controller.reconcile_once()
-        assert updated == [mid, mid] and deleted == []
-        assert litellm.models[mid].key_fingerprint == key_fingerprint("rotated-key")
+    assert litellm.models == {}
 
 
 async def test_a_failed_key_update_is_logged_and_retried(controller, app, litellm, k8s, monkeypatch):
@@ -290,16 +315,15 @@ async def test_a_failed_key_update_is_logged_and_retried(controller, app, litell
         add_ready_pod(k8s, b.port)
         mid = model_id(f"{b.base}/v1", "gemma-4-e4b", 8192)
         await controller.reconcile_once()
-        monkeypatch.setattr(app.state.settings, "backend_api_key", SecretStr("k"))
-        litellm.backend_api_key = "k"
+        await set_node_key(app, "worker-1", "k")
         original = litellm.update_model_key
 
-        async def refuse(model_id):
+        async def refuse(model_id, api_key=None):
             raise LiteLLMError(400, "nope")
 
         litellm.update_model_key = refuse
         await controller.reconcile_once()  # no exception, the entry is still registered
-        assert mid in litellm.models and litellm.models[mid].key_fingerprint == ""
+        assert mid in litellm.models and litellm.models[mid].key_fingerprint == key_fingerprint("bk-worker-1")
         litellm.update_model_key = original
         await controller.reconcile_once()
         assert litellm.models[mid].key_fingerprint == key_fingerprint("k")
@@ -315,7 +339,7 @@ async def test_adds_ready_k8s_endpoint_with_max_tokens(controller, app, litellm,
         assert litellm.models == {
             model_id(base, "gemma-4-e4b", 8192): ManagedModel(
                 model_id(base, "gemma-4-e4b", 8192), "gemma-4-e4b", base, "k8s", "worker-1", 8192,
-                max_parallel_requests=2, access_groups=("public",),
+                key_fingerprint("bk-worker-1"), max_parallel_requests=2, access_groups=("public",),
             )
         }
         status = app.state.backend_status

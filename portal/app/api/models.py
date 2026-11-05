@@ -10,7 +10,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.auth.sessions import current_user
 from app.db import get_session
 from app.deployments import service
-from app.deps import get_backend_counts
+from app.config import Settings
+from app.deps import get_backend_counts, get_settings_dep
 from app.models import User
 
 router = APIRouter()
@@ -39,8 +40,13 @@ async def list_models(
 
 
 @router.get("/api/public/status")
-async def public_status(db: AsyncSession = Depends(get_session), counts=Depends(get_backend_counts)) -> dict:
+async def public_status(
+    db: AsyncSession = Depends(get_session),
+    counts=Depends(get_backend_counts),
+    settings: Settings = Depends(get_settings_dep),
+) -> dict:
     return {
+        "login_provider": settings.login_provider_name.strip() or "SSO",
         "models": [
             {"name": dep.name, "status": status, "ready_backends": ready}
             for dep, ready, status in await service.catalog(db, counts)

@@ -49,8 +49,16 @@ spec:
     spec:
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
-      nodeSelector:
-        kubernetes.io/hostname: llm-main
+      # только llm-main: по имени объекта Node (его не присвоить себе чужой ноде), а не по метке kubernetes.io/hostname,
+      # которую kubelet ставит себе сам; taint главного (entrypoint.sh) терпят только его поды
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchFields:
+                  - {key: metadata.name, operator: In, values: [llm-main]}
+      tolerations:
+        - {key: node-role.kubernetes.io/control-plane, operator: Exists, effect: NoSchedule}
       containers:
         - name: postgres
           image: postgres:17-alpine
@@ -141,8 +149,16 @@ spec:
           restartPolicy: Never
           hostNetwork: true
           dnsPolicy: ClusterFirstWithHostNet
-          nodeSelector:
-            kubernetes.io/hostname: llm-main
+          # только llm-main: по имени объекта Node (его не присвоить себе чужой ноде), а не по метке kubernetes.io/hostname,
+          # которую kubelet ставит себе сам; taint главного (entrypoint.sh) терпят только его поды
+          affinity:
+            nodeAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                nodeSelectorTerms:
+                  - matchFields:
+                      - {key: metadata.name, operator: In, values: [llm-main]}
+          tolerations:
+            - {key: node-role.kubernetes.io/control-plane, operator: Exists, effect: NoSchedule}
           containers:
             - name: backup
               # тот же образ, что у сервера: pg_dump другой старшей версии не снимает копию с этого сервера

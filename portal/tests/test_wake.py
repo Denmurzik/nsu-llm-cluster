@@ -218,7 +218,7 @@ def test_wake_job_runs_the_sender_on_the_relay_node():
     assert "runtimeClassName" not in pod and "serviceAccountName" not in pod
     assert pod["automountServiceAccountToken"] is False
     (c,) = pod["containers"]
-    assert c["image"] == "nsu-llm-node:0.1.0-gpu" and c["imagePullPolicy"] == "Never"
+    assert c["image"] == "nsu-llm-node:0.2.0-gpu" and c["imagePullPolicy"] == "Never"
     assert c["command"] == ["wol-send.sh", "00:1a:2b:3c:4d:5e", "10.1.2.255"]
     assert c["securityContext"] == {"allowPrivilegeEscalation": False, "privileged": False}
     assert "env" not in c and "envFrom" not in c  # no secrets in the relay pod

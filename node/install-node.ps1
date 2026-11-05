@@ -16,7 +16,14 @@
 #   главного всегда (обновление образа), -ImageSource tar берёт только архив. Корень CA главного закрепляется в Docker один раз,
 #   только для этого реестра (/etc/docker/certs.d), и дальше проверяется по нему (Docker Desktop: только если Windows доверяет сертификату). Подробности: docs\release.md.
 #   -ViaTask: шаги выполняет одноразовая задача планировщика со входом по паролю (сеанс ssh по ключу или WinRM не
-#   имеет учётных данных пользователя); включается сама, если такой сеанс обнаружен.
+#   имеет учётных данных пользователя); включается сама, если такой сеанс обнаружен. Из сеанса ssh или WinRM с -TaskPassword
+#   (или NSU_LLM_TASK_PASSWORD) установка тоже идёт такой задачей, на WSL и на Docker Desktop: обрыв сеанса убивает всё, что он
+#   запустил, а задача планировщика живёт сама. После обрыва повторный запуск показывает ход (журнал задачи), -Status тоже.
+#   Брандмауэр: 18080 (инференс) открыт только главному (-AllowFrom добавляет адреса), 18050 (RPC split, без аутентификации) только
+#   главному и нодам текущей группы split: главный называет их в ответе «desired» (rpc_peers), правила обновляются раз в минуту
+#   (node-boot.ps1; Docker Desktop: задача NSU-LLM-Node-FwSync от SYSTEM). Подсеть класса целиком никогда не открывается.
+#   -CaSha256 <hex>: отпечаток корня CA главного (SHA-256 от DER, страница «Подключение ноды»); скачанный /ca.crt сверяется с ним.
+#   Без него отпечаток печатается, а корень принимается только по ответу «да» (или -AcceptCa: доверие при первом обращении).
 #   Wake-on-LAN: физическая сетевая карта с адресом ноды получает «Wake on Magic Packet» и право будить ПК, быстрый
 #   запуск Windows выключается, MAC и подсеть уходят ноде (портал будит выключенный ПК). -PowerButton nothing (по
 #   умолчанию) — кнопка питания ничего не делает, -PowerButton keep — оставить как есть.
@@ -35,6 +42,7 @@ param(
     [string]$Name = '',
     [string]$NodeIp = '',
     [string]$AllowFrom = '',
+    [string]$CaSha256 = '',
     [int]$MemoryGB = 0,
     [string]$Distro = '',
     [string]$DistroSource = '',
@@ -47,6 +55,7 @@ param(
     [string]$Proxy = '',
     [ValidateSet('', 'nothing', 'keep')][string]$PowerButton = '',
     [switch]$InsecureTls,
+    [switch]$AcceptCa,
     [switch]$NonInteractive,
     [switch]$Yes,
     [switch]$DryRun,
@@ -68,15 +77,21 @@ if ($PSVersionTable.PSEdition -ne 'Core') {
 # --- PSModulePath end
 # Защита каталогов и файлов (общая с class-deploy.ps1); без неё ставить нельзя.
 $SecureLib = Join-Path $PSScriptRoot 'secure-dir.ps1'
-if (-not (Test-Path -LiteralPath $SecureLib)) { Write-Host "ОШИБКА: нет $SecureLib рядом с install-node.ps1" -ForegroundColor Red; Write-Host 'Как исправить: скопируйте каталог node целиком (install-node.ps1, run-node.ps1, node-boot.ps1, wsl-setup.sh, pull-image.sh, secure-dir.ps1, class-run.ps1).'; exit 1 }
+if (-not (Test-Path -LiteralPath $SecureLib)) { Write-Host "ОШИБКА: нет $SecureLib рядом с install-node.ps1" -ForegroundColor Red; Write-Host 'Как исправить: скопируйте каталог node целиком (install-node.ps1, run-node.ps1, node-boot.ps1, wsl-setup.sh, pull-image.sh, IMAGE_VERSION, secure-dir.ps1, class-run.ps1).'; exit 1 }
 . $SecureLib
 $env:WSL_UTF8 = '1'   # иначе wsl.exe пишет UTF-16 и вывод не разобрать
 try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch { }
 
-$Version = '0.1.0'
+# Версия образа ноды: единственная константа в скриптах — IMAGE_VERSION рядом (общая с install-node.ps1 и run-node.sh; её проверяет
+# release.sh). Это запасное значение: версию называет главный (NODE_IMAGE_TAG, GET /api/node-image и ответ «desired»).
+$Version = ''
+try { $Version = "$(Get-Content -LiteralPath (Join-Path $PSScriptRoot 'IMAGE_VERSION') -TotalCount 1 -ErrorAction Stop)".Trim() } catch { }
+if ($Version -notmatch '^\d+\.\d+\.\d+(-[0-9A-Za-z.]+)?$') { throw "Нет файла IMAGE_VERSION рядом со скриптом (или в нём не версия вида 1.2.3): скопируйте каталог node целиком" }
 $TaskName = 'NSU-LLM-Node'
 $TaskPath = '\NSU-LLM\'
 $FwRule = 'NSU-LLM-Node'
+$FwRuleRpc = 'NSU-LLM-Node-RPC'
+$SyncTaskName = 'NSU-LLM-Node-FwSync'                  # Docker Desktop: раз в минуту run-node.ps1 -SyncFirewall (для WSL это делает node-boot.ps1)
 $WslCreator = '{40E0AC32-46A5-438A-A0B2-2B479E8F2E90}'   # VMCreatorId WSL в Hyper-V firewall
 $MinWsl = [version]'2.4.4'                                # wsl --install --name/--location/--from-file
 $MinDriver = 570                                          # образ собран на CUDA 12.8
@@ -85,7 +100,7 @@ $CurlExe = $(if ($env:NSU_LLM_CURL) { $env:NSU_LLM_CURL } else { 'curl.exe' })  
 $InstallTaskName = 'NSU-LLM-Install'
 $DockerDesktopExe = $(if ($env:NSU_LLM_DOCKER_DESKTOP_EXE) { $env:NSU_LLM_DOCKER_DESKTOP_EXE } else { Join-Path $env:ProgramFiles 'Docker\Docker\Docker Desktop.exe' })
 $DriverFix = "Скачайте драйвер NVIDIA $MinDriver или новее на https://www.nvidia.com/Download/index.aspx (GeForce, RTX 40 Series, ваша модель, Windows 11) или через приложение NVIDIA App, установите и перезагрузите ПК; проверка: nvidia-smi (Driver Version не ниже $MinDriver). Затем запустите установку снова."
-$DesktopFix = 'Войдите в Windows под этой учётной записью и запустите Docker Desktop (по ssh он не запускается), дождитесь «Engine running» и повторите; чтобы он стартовал сам: Settings, General, «Start Docker Desktop when you sign in».'
+$DesktopFix = 'Войдите в Windows под этой учётной записью и запустите Docker Desktop (по ssh он не запускается), дождитесь «Engine running» и повторите; чтобы он стартовал сам: Settings, General, «Start Docker Desktop when you sign in». ПК класса на Windows 10 держит ноду, только пока в Windows вошёл пользователь; автовход (netplwiz, Winlogon AutoAdminLogon) решает администратор.'
 if (-not $InstallDir) { $InstallDir = Join-Path $env:ProgramData 'NSU-LLM' }
 if (-not $WslConfigPath) { $WslConfigPath = Join-Path $env:USERPROFILE '.wslconfig' }
 $ScriptsDir = Join-Path $InstallDir 'scripts'
@@ -97,7 +112,8 @@ $StatePath = Join-Path $InstallDir 'state.json'
 $BootLog = Join-Path $InstallDir 'boot.log'
 $RunDir = Join-Path $InstallDir 'run'                    # разовая задача (-ViaTask): параметры, журнал, код
 $InstallLog = Join-Path $RunDir 'install-task.log'
-$ScriptFiles = @('install-node.ps1', 'run-node.ps1', 'node-boot.ps1', 'wsl-setup.sh', 'pull-image.sh', 'secure-dir.ps1', 'class-run.ps1')
+$InstallActionFile = Join-Path $RunDir 'action.txt'      # что делает задача: install или uninstall (повторный запуск подключается к ней)
+$ScriptFiles = @('install-node.ps1', 'run-node.ps1', 'node-boot.ps1', 'wsl-setup.sh', 'pull-image.sh', 'secure-dir.ps1', 'class-run.ps1', 'IMAGE_VERSION')
 $Self = $(if ($PSCommandPath) { $PSCommandPath } else { Join-Path $ScriptsDir 'install-node.ps1' })
 
 # ------------------------------------------------------------------ вспомогательное
@@ -314,6 +330,14 @@ function Test-AddrAllowed([string]$ip, [string]$list) {
     }
     return $false
 }
+# Сохранённый список прежней версии: подсеть (не одиночный адрес), в которую входит сама нода.
+function Test-LegacyAllow([string]$list, [string]$nodeIp) {
+    if (-not $nodeIp) { return $false }
+    foreach ($e in ($list -split ',')) {
+        if ($e -match '/(\d+)$' -and [int]$matches[1] -lt 32 -and (Test-AddrAllowed $nodeIp $e)) { return $true }
+    }
+    return $false
+}
 # Округление: ПК «32 ГБ» сообщает около 31,8 ГиБ.
 function Get-TotalRamGB { try { return [int][math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB) } catch { return 0 } }
 # Ключи .wslconfig по https://learn.microsoft.com/windows/wsl/wsl-config (секции [wsl2], [general], [experimental]).
@@ -364,7 +388,40 @@ function Get-IniValue([string]$text, [string]$section, [string]$key) {
     }
     return ''
 }
-function Get-ImageName([string]$acc) { return "nsu-llm-node:$Version-" + $(if ($acc -eq 'nvidia') { 'gpu' } else { 'cpu' }) }
+# Имя образа называет главный (GET /api/node-image, без токена: NODE_IMAGE_TAG главного), а не константа скрипта: раньше скрипт искал
+# nsu-llm-node:0.1.0-gpu, когда главный работал на 0.1.1. Нет ответа (главный старее, недоступен, -DryRun без сети): IMAGE_VERSION.
+$ImageNames = @{}
+$ImageDigests = @{}
+function Get-ImageDigest([string]$img) {
+    $flavour = $(if ($img -like '*-gpu') { 'nvidia' } else { 'cpu' })
+    [void](Get-ImageName $flavour)
+    if ($ImageDigests.ContainsKey($flavour) -and $ImageNames[$flavour] -eq $img) { return $ImageDigests[$flavour] }
+    return ''
+}
+function Get-ImageName([string]$acc) {
+    $flavour = $(if ($acc -eq 'nvidia') { 'nvidia' } else { 'cpu' })
+    if (-not $ImageNames.ContainsKey($flavour)) {
+        $n = ''
+        if ($Main) {
+            try {
+                $r = Invoke-HttpsGet "https://$Main/api/node-image"
+                if ($r.Code -eq '200') {
+                    $j = $r.Body | ConvertFrom-Json
+                    $n = "$($j.$flavour)"
+                    # digest образа в реестре главного (portal отдаёт его вместе с именем): первая загрузка идёт по нему, а не по тегу
+                    $dg = ''; try { $dg = "$($j.digest.$flavour)" } catch { }
+                    if ($n -cmatch '^nsu-llm-node:[A-Za-z0-9._-]+-(cpu|gpu)$' -and $dg -cmatch '^sha256:[0-9a-f]{64}$') { $ImageDigests[$flavour] = $dg }
+                }
+            }
+            catch { }
+        }
+        if ($n -cnotmatch '^nsu-llm-node:[A-Za-z0-9._-]+-(cpu|gpu)$') { $n = "nsu-llm-node:$Version-" + $(if ($flavour -eq 'nvidia') { 'gpu' } else { 'cpu' }) }
+        $ImageNames[$flavour] = $n
+    }
+    return $ImageNames[$flavour]
+}
+# Версия образа, как её назвал главный: для имён архивов nsu-llm-node-<версия>-cpu|gpu.tar.gz
+function Get-NodeVersion { return ((Get-ImageName 'cpu') -replace '^nsu-llm-node:(.+)-cpu$', '$1') }
 # Файловая система тома (FAT32/exFAT не хранят прав доступа). NSU_LLM_TEST_FS подменяет ответ в тестах.
 function Get-FsFormat([string]$p) {
     if ($env:NSU_LLM_TEST_FS) { return $env:NSU_LLM_TEST_FS }
@@ -374,7 +431,7 @@ function Find-ImageTar([string]$acc) {
     $tag = $(if ($acc -eq 'nvidia') { 'gpu' } else { 'cpu' })
     # Только каталог скрипта: родитель раздачи — C:\ProgramData, куда может писать любой пользователь, а образ запускается с
     # токеном кластера в окружении. Найденный архив должен быть доверенным (владелец и права на запись — администраторы).
-    foreach ($pat in @("nsu-llm-node-$Version-$tag.tar*", "nsu-llm-node-*-$tag.tar*")) {
+    foreach ($pat in @("nsu-llm-node-$(Get-NodeVersion)-$tag.tar*", "nsu-llm-node-*-$tag.tar*")) {
         foreach ($f in @(Get-ChildItem -Path $PSScriptRoot -Filter $pat -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending)) {
             if (Test-TrustedPath $f.FullName) { return $f.FullName }
             $fs = Get-FsFormat $f.FullName
@@ -392,11 +449,78 @@ function Find-ImageTar([string]$acc) {
 # Windows, каталог ~/.docker/certs.d он не гарантирует), а добавлять CA главного в хранилище всей машины установщик не вправе. Поэтому
 # docker.exe качает образ, только если сертификат главного уже принимает Windows (свой сертификат НГУ или корень главного, добавленный
 # администратором); иначе остановка с понятным сообщением: запасные пути -Docker wsl и -ImageTar.
+# Корень CA главного для Docker в WSL закрепляется только после сверки с отпечатком: pull-image.sh без --ca берёт его с https://<главный>/ca.crt
+# без проверки (первый, кто ответил в сети, получил бы токен и образ ноды с правами root). Здесь корень скачивается, его SHA-256 (от DER)
+# сверяется с -CaSha256; без отпечатка он печатается и принимается только по ответу «да» или с -AcceptCa. Проверенный корень кладётся в
+# state ноды (его читает run-node.ps1) и передаётся pull-image.sh через --ca.
+function Get-PemSha256([string]$pem) {
+    if ($pem -notmatch '(?s)-----BEGIN CERTIFICATE-----(.+?)-----END CERTIFICATE-----') { return '' }
+    $der = [Convert]::FromBase64String(($matches[1] -replace '\s', ''))
+    return ((([Security.Cryptography.SHA256]::Create().ComputeHash($der)) | ForEach-Object { $_.ToString('x2') }) -join '')
+}
+function Confirm-MainCa([string]$fp) {
+    if ($CaSha256) {
+        if ($fp -eq $CaSha256) { Say "Корень CA главного совпал с -CaSha256 ($fp)."; return }
+        Fail "Корень CA, который отдал https://$Main/ca.crt, не совпал с -CaSha256: получен $fp, ожидался $CaSha256" 'Возможна подмена в сети (ARP, DNS) или CA главного сменили. Корень не сохранён, токен не отправлялся. Сверьте отпечаток со страницей «Подключение ноды».'
+    }
+    Say "Отпечаток корня CA главного (SHA-256): $fp"
+    if ($AcceptCa) { Warn 'отпечаток не задан (-CaSha256), корень принят по -AcceptCa без сверки: доверие при первом обращении. Сверьте отпечаток со страницей «Подключение ноды».'; return }
+    if ($NonInteractive) { Fail "Корень CA главного ($fp) не подтверждён: нет -CaSha256, а ответить некому (-NonInteractive)" 'Передайте отпечаток со страницы «Подключение ноды» (-CaSha256) или, если сеть доверенная, -AcceptCa.' }
+    if ((Read-Answer 'Сверьте отпечаток со страницей «Подключение ноды». Доверять этому корню? (д/н)' 'н') -notmatch '^(д|да|y|yes)$') { Fail 'Корень CA главного не принят' 'Повторите с -CaSha256 <отпечаток> или проверьте сеть.' }
+}
+$WslCaPath = '/var/lib/nsu-llm-node/state/ca.crt'
+function Save-WslCa([string]$pem) {
+    $save = Get-WslRoot @('bash', '-c', "umask 077; mkdir -p /var/lib/nsu-llm-node/state && chmod 700 /var/lib/nsu-llm-node /var/lib/nsu-llm-node/state && cat > $WslCaPath")
+    $pem | & $save[0] $save[1..($save.Count - 1)]
+    if ($LASTEXITCODE -ne 0) { Fail "Не удалось сохранить корень CA в $WslCaPath дистрибутива $Distro" "wsl -d $Distro -u root -e ls -la /var/lib/nsu-llm-node" }
+}
+function Confirm-WslCa {
+    if ($InsecureTls) { return $false }
+    if ($DryRun) { Show-Dry "проверить корень CA главного (https://$Main/ca.crt) по отпечатку $(if ($CaSha256) { $CaSha256 } else { '(не задан: печатается и подтверждается)' }), сохранить в $WslCaPath дистрибутива $Distro и передать pull-image.sh через --ca"; return $true }
+    if ((Invoke-Read (Get-WslRoot @('test', '-s', $WslCaPath))).Code -eq 0) { return $true }
+    # Токен K10<sha256 CA k3s>::... проверяет корень главного сам (подпись /ca.crt.p7s CA k3s): доверять первому ответившему не нужно.
+    # Явный -CaSha256 имеет приоритет; токен без K10 или главный без подписи: решает отпечаток ниже.
+    if (-not $CaSha256) {
+        $t = Test-MainCaByToken $Main $Token $CurlExe
+        if ($t.Status -eq 'verified') { Say "Корень CA главного проверен по токену (CA k3s), отпечаток SHA-256 $($t.Fp)."; Save-WslCa $t.Pem; return $true }
+        if ($t.Status -eq 'mismatch') { Fail "$($t.Why)" 'Корень не сохранён, токен не отправлялся. Сверьте токен со страницей «Подключение ноды»; если CA главного сменили намеренно, возьмите новый токен.' }
+        if ($t.Status -eq 'unreachable') { Fail "Корень главного не удалось проверить: $($t.Why)" 'Проверьте, что главный запущен, а порты 443 и 6443 доступны с этого ПК, и повторите. Без проверки образ не качается: pull-image.sh взял бы корень без сверки.' }
+        if ($t.Status -eq 'public') {
+            # У главного свой публичный сертификат: pull-image.sh должен проверить его системными корнями дистрибутива. Если те его не приняли,
+            # pull-image.sh сам взял бы /ca.crt с -k и закрепил (подмена CA = чужой образ с root): проверяем заранее и отказываем.
+            $sh = "c=`$(curl -sS -m 15 -o /dev/null -w '%{http_code}' https://$Main/v2/ 2>/dev/null); case `$c in 000|'') exit 1;; esac; exit 0"
+            if ((Invoke-Read (Get-WslRoot @('bash', '-c', $sh))).Code -ne 0) { Fail "Реестр https://$Main/v2/ не принят системными корнями дистрибутива $Distro, а /ca.crt главный не отдаёт" 'Это подмена в сети или сертификат главного не из доверенных. Образ не качается: используйте архив (-ImageTar) или проверьте сертификат главного.' }
+            return $false
+        }
+        Say "Проверить корень главного по токену нечем: $($t.Why)."
+    }
+    $tmp = [IO.Path]::GetTempFileName()
+    $pem = ''
+    try {
+        $r = Invoke-Read @($CurlExe, '-sSf', '-k', '--ssl-no-revoke', '--connect-timeout', '5', '-m', '15', '-o', $tmp, "https://$Main/ca.crt")
+        if ($r.Code -eq 0 -and (Test-Path -LiteralPath $tmp)) { $pem = [IO.File]::ReadAllText($tmp) }
+    }
+    finally { Remove-Item -Force -LiteralPath $tmp -ErrorAction SilentlyContinue }
+    # Портал со своим сертификатом (--certs) /ca.crt не отдаёт: проверка по системным корням, закреплять нечего.
+    if ($pem -notmatch 'BEGIN CERTIFICATE') { return $false }
+    Confirm-MainCa (Get-PemSha256 $pem)
+    Save-WslCa $pem
+    return $true
+}
 function Invoke-ImagePull([string]$img, [bool]$desktop) {
-    $fixArchive = "Или возьмите образ из архива: -ImageTar <путь к nsu-llm-node-$Version-$(if ($img -like '*-gpu') { 'gpu' } else { 'cpu' }).tar.gz> (docs\deploy-class.md, «Распространение образов»)."
+    $fixArchive = "Или возьмите образ из архива: -ImageTar <путь к nsu-llm-node-$(Get-NodeVersion)-$(if ($img -like '*-gpu') { 'gpu' } else { 'cpu' }).tar.gz> (docs\deploy-class.md, «Распространение образов»)."
     if (-not $desktop) {
         $sh = ConvertTo-WslPath (Join-Path $ScriptsDir 'pull-image.sh')
-        Invoke-Change (Get-WslRoot @('bash', $sh, '--main', $Main, '--image', $img)) "Не удалось скачать образ $img с главного" "Проверьте, что главный запущен и в нём есть реестр (https://$Main/v2/, docs\release.md) и что адрес ПК входит в REGISTRY_ALLOW_FROM главного. Сообщение «не совпал с сохранённым корнем»: либо подмена в сети, либо CA главного сменили намеренно (тогда удалите /etc/docker/certs.d/$Main/ca.crt в дистрибутиве $Distro). $fixArchive" | Out-Null
+        $caOk = Confirm-WslCa
+        $pullArgs = @('bash', $sh, '--main', $Main, '--image', $img, '--no-tofu')   # --no-tofu: без закреплённого корня pull-image.sh не берёт /ca.crt без проверки
+        if ($caOk) { $pullArgs += @('--ca', $WslCaPath) }
+        $imgDigest = Get-ImageDigest $img
+        if ($imgDigest) { $pullArgs += @('--digest', $imgDigest) }
+        # pull-image.sh записывает «<id образа> <digest реестра>» в state ноды (run-node.ps1 передаёт его контейнеру, нода сообщает главному);
+        # флаг есть не у всех версий скрипта, а без него всё работает, только digest неизвестен.
+        $pullSh = Join-Path $ScriptsDir 'pull-image.sh'
+        if ((Test-Path -LiteralPath $pullSh) -and (Select-String -LiteralPath $pullSh -Pattern '--record' -SimpleMatch -Quiet)) { $pullArgs += @('--record', '/var/lib/nsu-llm-node/state/image.digest') }
+        Invoke-Change (Get-WslRoot $pullArgs) "Не удалось скачать образ $img с главного" "Проверьте, что главный запущен и в нём есть реестр (https://$Main/v2/, docs\release.md) и что адрес ПК входит в REGISTRY_ALLOW_FROM главного. Сообщение «не совпал с сохранённым корнем»: либо подмена в сети, либо CA главного сменили намеренно (тогда удалите /etc/docker/certs.d/$Main/ca.crt в дистрибутиве $Distro). $fixArchive" | Out-Null
         if (-not $DryRun -and -not (Test-WslImage $img)) { Fail "После загрузки с главного образа $img нет" $fixArchive }
         return
     }
@@ -408,15 +532,18 @@ function Invoke-ImagePull([string]$img, [bool]$desktop) {
             Fail "Реестр главного https://$Main/v2/ недоступен для Windows (ответ: $($r.Out)): сертификат главного, вероятно, не доверенный (внутренний CA), а Docker Desktop не позволяет доверить CA одному реестру без ручной настройки" "Используйте -Docker wsl (Docker CE в WSL закрепляет корень главного сам). $fixArchive Либо добавьте корень главного (http://$Main/ca.crt) в доверенные корневые центры Windows вручную: так вы доверяете ему на всей машине."
         }
     }
-    Invoke-Change @('docker', 'pull', "$Main/$img") "Не удалось скачать образ $img с главного" "Реестр главного: https://$Main/v2/. $fixArchive" | Out-Null
-    Invoke-Change @('docker', 'tag', "$Main/$img", $img) "docker tag $img не выполнился" | Out-Null
-    Invoke-Change @('docker', 'rmi', "$Main/$img") "docker rmi $Main/$img" -AllowFail | Out-Null
+    $imgDigest = Get-ImageDigest $img
+    $remoteRef = $(if ($imgDigest) { "$Main/nsu-llm-node@$imgDigest" } else { "$Main/$img" })   # по digest, который назвал главный, если он его назвал
+    Invoke-Change @('docker', 'pull', $remoteRef) "Не удалось скачать образ $img с главного" "Реестр главного: https://$Main/v2/. $fixArchive" | Out-Null
+    Invoke-Change @('docker', 'tag', $remoteRef, $img) "docker tag $img не выполнился" | Out-Null
+    Invoke-Change @('docker', 'rmi', $remoteRef) "docker rmi $remoteRef" -AllowFail | Out-Null
     if (-not $DryRun -and -not (Test-WinImage $img)) { Fail "После загрузки с главного образа $img нет" $fixArchive }
 }
 function Get-FileSig([string]$p) { $i = Get-Item -LiteralPath $p; return "$($i.Length)|$($i.LastWriteTimeUtc.Ticks)" }
 function Get-CurrentUser { return [Security.Principal.WindowsIdentity]::GetCurrent().Name }
 function Get-BootArgs { return "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$(Join-Path $ScriptsDir 'node-boot.ps1')`" -Distro $Distro -Log `"$BootLog`"" }
 function Get-BootTask { try { return (Get-ScheduledTask -TaskPath $TaskPath -TaskName $TaskName -ErrorAction Stop) } catch { return $null } }
+function Get-SyncTask { try { return (Get-ScheduledTask -TaskPath $TaskPath -TaskName $SyncTaskName -ErrorAction Stop) } catch { return $null } }
 function Get-FwPorts([string]$m) { return $(if ($m -eq 'standalone') { '18080' } else { '18080,18050' }) }
 
 # ------------------------------------------------------------------ ответы
@@ -492,6 +619,35 @@ function Test-UserCredentials {
     }
     catch { return $false }
 }
+# Сеанс ssh или WinRM (PowerShell remoting): когда он обрывается, Windows завершает всё, что он запустил (задания сеанса), и установка
+# умирает на полпути. Задача планировщика живёт сама. NSU_LLM_ASSUME_REMOTE=1|0 — только для тестов.
+function Test-RemoteSession {
+    if ($env:NSU_LLM_ASSUME_REMOTE) { return $env:NSU_LLM_ASSUME_REMOTE -eq '1' }
+    if ($env:SSH_CONNECTION -or $env:SSH_CLIENT -or $env:SSH_TTY) { return $true }
+    return [bool](Get-Variable -Name PSSenderInfo -ErrorAction SilentlyContinue)
+}
+# Идёт ли разовая задача установки или удаления (NSU_LLM_TEST_INSTALL_TASK=Running — только для тестов).
+function Get-InstallTaskRunning {
+    if ($env:NSU_LLM_TEST_INSTALL_TASK) { return $(if ($env:NSU_LLM_TEST_INSTALL_TASK -eq 'Running') { [pscustomobject]@{ State = 'Running' } } else { $null }) }
+    try { $t = Get-ScheduledTask -TaskPath $TaskPath -TaskName $InstallTaskName -ErrorAction Stop; if ("$($t.State)" -eq 'Running') { return $t } } catch { }
+    return $null
+}
+# Кто вошёл в Windows (владельцы explorer.exe, в любом сеансе, включая RDP); $null, если узнать не удалось. NSU_LLM_TEST_LOGON=none|unknown|имя — только для тестов.
+function Get-LoggedOnUsers {
+    if ($env:NSU_LLM_TEST_LOGON) {
+        if ($env:NSU_LLM_TEST_LOGON -eq 'unknown') { return $null }
+        return ,@($env:NSU_LLM_TEST_LOGON -split ',' | Where-Object { $_ -and $_ -ne 'none' })
+    }
+    $names = @()
+    try {
+        foreach ($proc in @(Get-CimInstance Win32_Process -Filter "Name='explorer.exe'" -ErrorAction Stop)) {
+            $o = Invoke-CimMethod -InputObject $proc -MethodName GetOwner -ErrorAction Stop
+            if ($o.User) { $names += "$($o.Domain)\$($o.User)" }
+        }
+    }
+    catch { return $null }   # запрос не удался (нет прав): «неизвестно», а не «никто не вошёл»
+    return ,@($names | Select-Object -Unique)   # запятая: пустой список остаётся списком (известно, что никто не вошёл), $null не путается с ним
+}
 # end secrets
 # Прокси с паролем: в выводе и в открытом поле install.json — http://user:***@host; полный адрес — только под DPAPI.
 function Get-MaskedUrl([string]$u) { return ($u -replace '^(https?://[^:@/]+):[^@/]+@', '$1:***@') }
@@ -563,7 +719,10 @@ function Resolve-Answers {
     # Адрес ноды сохраняется, только если его задали явно (иначе он определяется заново: DHCP может его сменить).
     $script:NodeIp = Pick $NodeIp 'NodeIp'
     $script:NodeIpExplicit = [bool]$NodeIp
+    $script:AllowFromExplicit = [bool]$AllowFrom
     $script:AllowFrom = (Pick $AllowFrom 'AllowFrom').Replace(' ', '')
+    $script:CaSha256 = ((Pick $CaSha256 'CaSha256') -replace '[:\s]', '').ToLowerInvariant()
+    if ($CaSha256 -and $script:CaSha256 -notmatch '^[0-9a-f]{64}$') { Fail 'Недопустимый -CaSha256: нужны 64 шестнадцатеричные цифры' 'Отпечаток SHA-256 корня CA главного: страница «Подключение ноды» портала.' }
     $px = Pick $Proxy 'Proxy'
     $pm = Get-Prop $answers 'ProxyMachine'
     if (-not $Proxy -and $pm) { try { $px = Unprotect-Secret $pm } catch { Warn 'прокси с паролем из файла ответов не расшифровывается: передайте -Proxy' } }
@@ -609,6 +768,7 @@ function Show-Status {
 
     $running = $false
     if ($desk) {
+        $logonQ = Get-LoggedOnUsers; $logonKnown = ($null -ne $logonQ); $logon = @($logonQ)
         if (Test-WinDocker) {
             Ok 'Docker Desktop работает'
             $c = Invoke-Read @('docker', 'ps', '-a', '--filter', 'name=llm-node', '--format', '{{.Status}}')
@@ -619,8 +779,9 @@ function Show-Status {
             $imgs = (Invoke-Read @('docker', 'images', 'nsu-llm-node', '--format', '{{.Repository}}:{{.Tag}}')).Out -split "`r?`n" | Where-Object { $_ }
             Info "образы: $(if ($imgs) { $imgs -join ', ' } else { 'нет' })"
         }
-        else { Bad 'Docker Desktop не запущен (docker info завершился ошибкой)' $DesktopFix }
-        Info 'автозапуск: нода возвращается после входа пользователя (Docker Desktop стартует при входе); без входа: -Docker wsl'
+        else { Bad "Docker Desktop не запущен (docker info завершился ошибкой)$(if ($logonKnown -and -not $logon) { '; в Windows никто не вошёл' })" $DesktopFix }
+        Info 'автозапуск: Docker Desktop, а с ним и нода, стартует только после входа пользователя в Windows (на Windows 10 ПК класса держит ноду, пока кто-то вошёл; автовход — netplwiz или Winlogon AutoAdminLogon — решает администратор); без входа: -Docker wsl (Windows 11 22H2+)'
+        if ($logon) { Info "вошёл в Windows: $($logon -join ', ')" }
     }
     elseif ($v) {
         $all = Get-Distros
@@ -667,13 +828,42 @@ function Show-Status {
         }
         catch { Bad "права $wd не читаются: $($_.Exception.Message)" 'запустите -Status от имени администратора' }
     }
-    $hv = $null; try { $hv = Get-NetFirewallHyperVRule -Name $FwRule -ErrorAction Stop } catch { }
-    if (-not (Get-Command Get-NetFirewallHyperVRule -ErrorAction SilentlyContinue)) { Ok "Hyper-V firewall в этой Windows нет (Windows 10): порты закрывает брандмауэр Windows" }
-    elseif ($hv) { Ok "Hyper-V firewall $FwRule`: порты $($hv.LocalPorts -join ','), с адресов $($hv.RemoteAddresses -join ',')" }
-    else { Bad "Нет правила Hyper-V firewall $FwRule (входящие в WSL закрыты)" $installer }
-    $wr = Get-NetFirewallRule -DisplayName $FwRule -ErrorAction SilentlyContinue
-    if ($wr) { Ok "Брандмауэр Windows $FwRule`: с адресов $((@($wr | Get-NetFirewallAddressFilter | ForEach-Object { $_.RemoteAddress }) | Select-Object -Unique) -join ',')" }
-    else { Bad "Нет правила брандмауэра Windows $FwRule" $installer }
+    $it = Get-InstallTaskRunning
+    $act = ''; try { $act = ([IO.File]::ReadAllText($InstallActionFile)).Trim() } catch { }
+    $doneFile = Join-Path $RunDir 'run.done'
+    if ($it) {
+        Info "идёт $(if ($act -eq 'uninstall') { 'удаление' } else { 'установка' }) в разовой задаче $InstallTaskName (журнал $InstallLog); повторный запуск install-node.ps1 покажет ход"
+        if (Test-Path -LiteralPath $InstallLog) { Get-Content -LiteralPath $InstallLog -Tail 5 -Encoding UTF8 | ForEach-Object { Write-Host "     $_" } }
+    }
+    elseif (Test-Path -LiteralPath $doneFile) {
+        $dc = ''; try { $dc = ([IO.File]::ReadAllText($doneFile)).Trim() } catch { }
+        if ($dc -in @('0', '3010')) { Info "последний запуск в разовой задаче $InstallTaskName завершился успешно (код $dc), журнал $InstallLog" }
+        else { Bad "последний запуск в разовой задаче $InstallTaskName завершился с кодом $dc" "прочитайте журнал $InstallLog и повторите установку" }
+    }
+    foreach ($rn in @($FwRule) + @($(if ($m -ne 'standalone') { $FwRuleRpc }))) {
+        $hv = $null; try { $hv = Get-NetFirewallHyperVRule -Name $rn -ErrorAction Stop } catch { }
+        if (-not (Get-Command Get-NetFirewallHyperVRule -ErrorAction SilentlyContinue)) { Ok "Hyper-V firewall в этой Windows нет (Windows 10): порты закрывает брандмауэр Windows" }
+        elseif ($hv) { Ok "Hyper-V firewall $rn`: порты $($hv.LocalPorts -join ','), с адресов $($hv.RemoteAddresses -join ',')" }
+        else { Bad "Нет правила Hyper-V firewall $rn (входящие в WSL закрыты)" $installer }
+        $wr = Get-NetFirewallRule -DisplayName $rn -ErrorAction SilentlyContinue
+        if ($wr) { Ok "Брандмауэр Windows $rn`: с адресов $((@($wr | Get-NetFirewallAddressFilter | ForEach-Object { $_.RemoteAddress }) | Select-Object -Unique) -join ',')" }
+        else { Bad "Нет правила брандмауэра Windows $rn" $installer }
+    }
+    if ($desk) {
+        # Docker Desktop разрешает com.docker.backend.exe на любые порты; запрет сильнее разрешения
+        $blk = Get-NetFirewallRule -DisplayName "$FwRule-Block" -ErrorAction SilentlyContinue
+        if ($blk) { Ok "Брандмауэр Windows $FwRule-Block`: запрет 18080 для всех, кроме главного (правило Docker Desktop на любые порты его не перекрывает)" }
+        else { Bad "Нет запрещающего правила $FwRule-Block: правило Docker Desktop на любые порты пропускает 18080 и 18050 всем" $installer }
+    }
+    elseif (Get-Command Get-NetFirewallHyperVVMSetting -ErrorAction SilentlyContinue) {
+        $vm = $null; try { $vm = Get-NetFirewallHyperVVMSetting -Name $WslCreator -ErrorAction Stop } catch { }
+        if ($vm -and "$($vm.DefaultInboundAction)" -eq 'Allow') { Bad 'Hyper-V firewall для WSL разрешает входящие по умолчанию: все правила бесполезны, порты 18080 и 18050 открыты всем' "Set-NetFirewallHyperVVMSetting -Name '$WslCreator' -DefaultInboundAction Block (от администратора; run-node.ps1 -SyncFirewall делает это сам)" }
+        elseif ($vm) { Ok "Hyper-V firewall для WSL: входящие по умолчанию $($vm.DefaultInboundAction)" }
+    }
+    if ($desk -and $m -ne 'standalone') {
+        if (Get-SyncTask) { Ok "задача $SyncTaskName есть (правила для 18050 следуют за группой split)" }
+        else { Bad "нет задачи ${SyncTaskName}: правила для 18050 не обновляются при смене группы split" $installer }
+    }
 
     $sip = $(if ($NodeIp) { $NodeIp } elseif ($Main) { Get-LocalIp (Resolve-MainIp $Main) } else { '' })
     $w = Find-WakeNic $sip
@@ -714,6 +904,10 @@ function Invoke-Uninstall {
         $ta = [ordered]@{ Uninstall = $true; NonInteractive = $true; Yes = $true; FromTask = $true; InstallDir = $InstallDir; Name = $Name }
         if ($KeepDistro) { $ta.KeepDistro = $true }
         if ($Main) { $ta.Main = $Main }
+        # The token given now (-Token, CLUSTER_TOKEN) goes along: the task would otherwise read the one saved at install time, and
+        # that one is stale once the main was reinstalled or its agent token changed (the DELETE answered 401, the node object stayed).
+        # The file with the task's parameters is DPAPI LocalMachine, Administrators and SYSTEM only, like the TaskPassword in it.
+        if ($Token) { $ta.Token = $Token }
         return (Invoke-InstallTask $ta -Removing)
     }
     $wslVer = Get-WslVersion
@@ -735,7 +929,7 @@ function Invoke-Uninstall {
     Say 'Будет сделано:'
     if ($desk) { Say "  - остановить и удалить ноду $Name в Docker Desktop (run-node.ps1 -Uninstall)" }
     elseif ($hasDistro) { Say "  - остановить и удалить ноду $Name (run-node.ps1 -Uninstall -Wsl $Distro)" }
-    Say "  - удалить задачу $TaskName, правила брандмауэра $FwRule, вернуть электропитание, Wake-on-LAN, быстрый запуск, кнопку питания и .wslconfig"
+    Say "  - удалить задачи $TaskName и $SyncTaskName, правила брандмауэра $FwRule и $FwRuleRpc, вернуть электропитание, Wake-on-LAN, быстрый запуск, кнопку питания и .wslconfig"
     if ($remove) { Say "  - удалить дистрибутив $Distro (wsl --unregister)" }
     Say "  - удалить $InstallDir$(if ($hasDistro -and -not $remove) { ' (кроме диска оставленного дистрибутива)' })"
     if (-not $NonInteractive -and -not $Yes -and -not $DryRun) {
@@ -756,15 +950,20 @@ function Invoke-Uninstall {
             }
         }
     }
-    if (-not ($Token -and $Main)) { Warn "без токена и адреса главного нода не удалена из кластера: на главном выполните docker exec llm-main k3s kubectl delete node $Name" }
+    if (-not ($Token -and $Main)) { Warn "без токена и адреса главного нода не удалена из кластера. Если нода ещё значится на странице «Ноды» портала, удалите её там (меню строки, «Удалить из кластера…») или на главном выполните docker exec llm-main k3s kubectl delete node $Name" }
 
     if ($DryRun) { Show-Dry "Stop-ScheduledTask -TaskPath $TaskPath -TaskName $TaskName; Unregister-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -Confirm:`$false" }
     elseif (Get-BootTask) { Stop-ScheduledTask -TaskPath $TaskPath -TaskName $TaskName -ErrorAction SilentlyContinue; Unregister-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -Confirm:$false }
 
-    if ($DryRun) { Show-Dry "Remove-NetFirewallHyperVRule -Name $FwRule; Remove-NetFirewallRule -DisplayName $FwRule" }
-    else {
-        try { Remove-NetFirewallHyperVRule -Name $FwRule -ErrorAction Stop } catch { }
-        Remove-NetFirewallRule -DisplayName $FwRule -ErrorAction SilentlyContinue
+    if ($DryRun) { Show-Dry "Stop-ScheduledTask -TaskPath $TaskPath -TaskName $SyncTaskName; Unregister-ScheduledTask -TaskName $SyncTaskName -TaskPath $TaskPath -Confirm:`$false" }
+    elseif (Get-SyncTask) { Stop-ScheduledTask -TaskPath $TaskPath -TaskName $SyncTaskName -ErrorAction SilentlyContinue; Unregister-ScheduledTask -TaskName $SyncTaskName -TaskPath $TaskPath -Confirm:$false }
+
+    foreach ($rn in @($FwRule, $FwRuleRpc, "$FwRule-Block", "$FwRuleRpc-Block")) {
+        if ($DryRun) { Show-Dry "Remove-NetFirewallHyperVRule -Name $rn; Remove-NetFirewallRule -DisplayName $rn" }
+        else {
+            try { Remove-NetFirewallHyperVRule -Name $rn -ErrorAction Stop } catch { }
+            Remove-NetFirewallRule -DisplayName $rn -ErrorAction SilentlyContinue
+        }
     }
 
     $pw = Get-Prop $state 'Power'
@@ -864,7 +1063,7 @@ function Invoke-Install {
             Say "  wsl     — Docker CE в отдельном дистрибутиве $Distro (основной путь): автозапуск без входа, mirrored-сеть; wsl --shutdown остановит и Docker Desktop."
             $dk = (Read-Answer 'Вариант: desktop или wsl' 'desktop').ToLowerInvariant()
         }
-        else { Warn "найден Docker Desktop: с -NonInteractive нода ставится в него (запасной путь, автозапуск только после входа пользователя). Основной путь: -Docker wsl"; $dk = 'desktop' }
+        else { Warn "найден Docker Desktop: с -NonInteractive нода ставится в него (запасной путь, автозапуск только после входа пользователя: на Windows 10 ПК класса должен входить в Windows, автовход решает администратор). Основной путь: -Docker wsl"; $dk = 'desktop' }
     }
     if ($dk -notin @('wsl', 'desktop')) { Fail "Неизвестный вариант Docker: $dk" 'Ответьте desktop или wsl (параметр -Docker desktop|wsl).' }
     if ($dk -eq 'desktop' -and -not $hasDesktop) { Fail 'Docker Desktop не найден' 'Установите Docker Desktop или выберите основной путь: -Docker wsl.' }
@@ -872,8 +1071,17 @@ function Invoke-Install {
     $desk = $dk -eq 'desktop'
     if (-not $desk -and $build -lt 22621) { Fail "Windows сборки ${build}: режим networkingMode=mirrored требует Windows 11 22H2 (22621) или новее" 'Обновите Windows или используйте запасной путь с Docker Desktop: -Docker desktop (docs\deploy-class.md).' }
     if (-not $desk -and $hasDesktop) { Warn "Docker Desktop останется установленным, но нода будет в $Distro. Запись .wslconfig и wsl --shutdown остановят его движок; выключите его автозапуск, чтобы два Docker не делили память WSL." }
-    # Сеанс без учётных данных (ssh по ключу, WinRM): шаги для WSL выполняет одноразовая задача со входом по паролю.
-    $script:UseTask = (-not $FromTask) -and (-not $desk) -and ($ViaTask -or -not (Test-UserCredentials))
+    # Одноразовая задача со входом по паролю выполняет шаги вместо этого сеанса:
+    # - обязательно: -ViaTask, и для WSL сеанс без учётных данных (ssh по ключу, WinRM): WSL и DPAPI в нём не работают;
+    # - из сеанса ssh/WinRM, если пароль есть (-TaskPassword, NSU_LLM_TASK_PASSWORD): обрыв связи не должен убить установку,
+    #   на WSL и на Docker Desktop. Без пароля такая установка идёт в самом сеансе, о чём предупреждает ниже.
+    $noCredentials = (-not $desk) -and -not (Test-UserCredentials)
+    $remote = (-not $FromTask) -and (Test-RemoteSession)
+    $script:UseTask = (-not $FromTask) -and ($ViaTask -or $noCredentials -or ($remote -and [bool]$TaskPassword))
+    $script:TaskWhy = $(if ($ViaTask) { 'via' } elseif ($noCredentials) { 'credentials' } elseif ($script:UseTask) { 'remote' } else { '' })
+    if ($remote -and -not $script:UseTask) {
+        Warn 'сеанс ssh или WinRM: если связь оборвётся, Windows завершит установку на полпути. Передайте -TaskPassword (или NSU_LLM_TASK_PASSWORD): установка пойдёт разовой задачей планировщика, переживёт обрыв, а повторный запуск покажет её ход.'
+    }
     $ddUp = $false
     if ($desk) {
         $ddUp = Test-WinDocker
@@ -889,9 +1097,15 @@ function Invoke-Install {
     if (-not $mainIp) { Warn "адрес $Main не разрешается в IPv4" }
     if (-not $NodeIp) { $script:NodeIp = Get-LocalIp $mainIp }
     if (-not $NodeIp) { Fail "Не удалось определить адрес этой машины в сторону главного ($Main)" 'Проверьте сеть или укажите -NodeIp <LAN-адрес этой машины>.' }
-    $defAllow = @(($NodeIp -replace '\.\d+$', '.0/24'), $mainIp) | Where-Object { $_ } | Select-Object -Unique
-    if (-not $AllowFrom) { $script:AllowFrom = $(if ($ask) { Read-Answer 'С каких адресов пускать на 18080/18050 (через запятую)' ($defAllow -join ',') } else { $defAllow -join ',' }).Replace(' ', '') }
-    if ($AllowFrom -notmatch '^[0-9./]+(,[0-9./]+)*$') { Fail "Недопустимый список адресов: $AllowFrom" 'Пример: -AllowFrom 192.168.3.0/24,10.0.0.5' }
+    # AllowFrom по умолчанию: только главный (шлюз и пробы портала ходят только с него). Прежние версии открывали всю подсеть ноды,
+    # и ученик с соседнего ПК подключался к RPC (18050) без аутентификации: такой сохранённый список без явного -AllowFrom отбрасывается.
+    if ($AllowFrom -and -not $script:AllowFromExplicit -and (Test-LegacyAllow $AllowFrom $NodeIp)) {
+        Warn "сохранённый AllowFrom ($AllowFrom) открывал порты всей подсети ноды: теперь 18080 открыт только главному, 18050 главному и нодам группы split. Свой список: -AllowFrom."
+        $script:AllowFrom = ''
+    }
+    if (-not $AllowFrom -and -not $mainIp) { Fail "Адрес главного $Main не разрешается в IPv4: брандмауэру нечего разрешить" 'Укажите -AllowFrom <адрес главного> (через запятую можно несколько адресов).' }
+    if (-not $AllowFrom) { $script:AllowFrom = $(if ($ask) { Read-Answer 'С каких адресов пускать на 18080 (инференс; через запятую; на 18050 пускают главного и ноды группы split)' $mainIp } else { $mainIp }).Replace(' ', '') }
+    if ($AllowFrom -notmatch '^[0-9./]+(,[0-9./]+)*$') { Fail "Недопустимый список адресов: $AllowFrom" 'Пример: -AllowFrom 10.0.0.5 или 10.0.0.5,192.168.3.7' }
     if ($mainIp -and -not (Test-AddrAllowed $mainIp $AllowFrom)) { Warn "главный $mainIp не входит в -AllowFrom ($AllowFrom): шлюз не достанет до ноды" }
     foreach ($x in (Get-MainProbe $Main $Mode)) {
         if ($x.Ok) { Say "$($x.Text)." }
@@ -936,7 +1150,7 @@ function Invoke-Install {
         elseif ($alt) { Warn "архив образа $gone не найден, используется $alt"; $script:ImageTar = $alt }
         else {
             $ask2 = $(if ($ask) { Read-Answer "Архив образа $gone не найден, а образа $image нет. Путь к архиву образа (nsu-llm-node-*.tar.gz; пусто: скачать образ с главного)" } else { '' })
-            $fix = "Укажите -ImageTar <путь к nsu-llm-node-$Version-$(if ($acc -eq 'nvidia') { 'gpu' } else { 'cpu' }).tar.gz> (сборка и docker save: docs\deploy-class.md, «Распространение образов»)."
+            $fix = "Укажите -ImageTar <путь к nsu-llm-node-$(Get-NodeVersion)-$(if ($acc -eq 'nvidia') { 'gpu' } else { 'cpu' }).tar.gz> (сборка и docker save: docs\deploy-class.md, «Распространение образов»)."
             if ($ask2) { $ask2 = Get-AbsPath $ask2; $script:ImageTar = $ask2 }
             elseif ($ImageSource -ne 'tar' -and -not $script:ImageTarExplicit) { Warn "архив образа $gone не найден: образ $image будет скачан с главного (https://$Main/v2/)."; $script:ImageTar = '' }
             elseif ($script:UseTask) { Warn "архив образа $gone не найден, а образа $image этот сеанс не видит: образ проверит задача установки." }
@@ -945,13 +1159,28 @@ function Invoke-Install {
             if ($ask2 -and -not $DryRun -and -not (Test-Path -LiteralPath $ask2)) { Fail "Архив образа $ask2 не найден" $fix }
         }
     }
+    # Архив называется nsu-llm-node-<версия>-cpu|gpu.tar.gz: если его версия не та, что у образа главного (NODE_IMAGE_TAG), docker load даст
+    # образ с другим именем, а ноде нужен образ главного. Найденный сам или из файла ответов архив тогда не берётся, образ скачивается с главного
+    # (так же, как без архива); названный явно (-ImageTar, -ImageSource tar) это ошибка с понятным текстом.
+    if ($ImageTar) {
+        $wantVer = $image -replace '^nsu-llm-node:(.+)-(cpu|gpu)$', '$1'
+        $tarVer = $(if ((Split-Path -Leaf $ImageTar) -match '^nsu-llm-node-(.+)-(cpu|gpu)\.tar') { $matches[1] } else { '' })
+        if ($tarVer -and $tarVer -ne $wantVer) {
+            $mismatch = "архив $ImageTar с образом версии $tarVer, а главный ($Main) работает на версии $wantVer ($image)"
+            if ($ImageSource -eq 'tar' -or $script:ImageTarExplicit) {
+                Fail "Архив образа не подходит: $mismatch" "Возьмите архив nsu-llm-node-$wantVer-$(if ($acc -eq 'nvidia') { 'gpu' } else { 'cpu' }).tar.gz или уберите -ImageTar / -ImageSource tar: образ скачается с главного."
+            }
+            Warn "${mismatch}: архив не используется, образ $image будет скачан с главного (https://$Main/v2/)."
+            $script:ImageTar = ''
+        }
+    }
     $loadImage = $false
     if ($ImageTar) { $loadImage = $DryRun -or -not $haveImage -or ((Get-Prop $state 'ImageTarSig') -ne (Get-FileSig $ImageTar)) }
     elseif ($ImageSource -eq 'main') { $pullImage = $true }
     elseif ($script:UseTask -and -not $haveImage) { Warn "образ $image в этом сеансе не найден (WSL без учётных данных может его не видеть): образ проверит задача установки." }
     elseif ((($desk -and $ddUp) -or (-not $desk -and $wslVer)) -and -not $haveImage) {
         if ($ImageSource -eq 'tar') {
-            Fail "Образ $image не найден ни в $(if ($desk) { 'Docker Desktop' } else { 'WSL' }), ни рядом со скриптом" ("Положите nsu-llm-node-$Version-" + $(if ($acc -eq 'nvidia') { 'gpu' } else { 'cpu' }) + '.tar.gz рядом с install-node.ps1 или укажите -ImageTar <путь> (сборка и docker save: docs\deploy-class.md, «Распространение образов»).')
+            Fail "Образ $image не найден ни в $(if ($desk) { 'Docker Desktop' } else { 'WSL' }), ни рядом со скриптом" ("Положите nsu-llm-node-$(Get-NodeVersion)-" + $(if ($acc -eq 'nvidia') { 'gpu' } else { 'cpu' }) + '.tar.gz рядом с install-node.ps1 или укажите -ImageTar <путь> (сборка и docker save: docs\deploy-class.md, «Распространение образов»).')
         }
         $pullImage = $true   # умолчание: образ с главного сервера по локальной сети
     }
@@ -960,7 +1189,8 @@ function Invoke-Install {
     $user = Get-CurrentUser
     $task = Get-BootTask
     $taskOk = $desk -or ($task -and ($task.Actions[0].Execute -eq 'powershell.exe') -and ($task.Actions[0].Arguments -eq (Get-BootArgs)) -and ($user -like "*\$($task.Principal.UserId)" -or $user -eq $task.Principal.UserId))
-    if ($script:UseTask -and -not $ViaTask) { Warn "сеанс без учётных данных пользователя (вход по ssh-ключу или WinRM): WSL и задачу автозапуска установит одноразовая задача планировщика $InstallTaskName со входом по паролю $user" }
+    if ($script:TaskWhy -eq 'credentials') { Warn "сеанс без учётных данных пользователя (вход по ssh-ключу или WinRM): WSL и задачу автозапуска установит одноразовая задача планировщика $InstallTaskName со входом по паролю $user" }
+    elseif ($script:TaskWhy -eq 'remote') { Warn "сеанс ssh или WinRM: установка идёт разовой задачей планировщика $InstallTaskName (вход по паролю $user), чтобы обрыв связи её не прервал" }
     if ((-not $taskOk -or $script:UseTask) -and -not $TaskPassword) {
         if ($ask) { $script:TaskPassword = Read-Answer "Пароль учётной записи $user (задача автозапуска работает без входа; ввод скрыт)" -Secret }
         if (-not $TaskPassword) { Fail "Нужен пароль учётной записи $user для задачи автозапуска$(if ($script:UseTask) { ' и одноразовой задачи установки' })" 'Передайте -TaskPassword <пароль> или переменную NSU_LLM_TASK_PASSWORD (пароль не сохраняется).' }
@@ -1063,7 +1293,7 @@ function Invoke-Install {
                 if (-not $DryRun) {
                     Set-State 'ImageTarSig' (Get-FileSig $ImageTar); Save-State
                     $img = Get-ImageName $script:AccelFinal
-                    if (-not (Test-WinImage $img)) { Fail "После загрузки $ImageTar образа $img нет" "Нужен архив nsu-llm-node-$Version-$(if ($script:AccelFinal -eq 'nvidia') { 'gpu' } else { 'cpu' }).tar.gz; укажите его через -ImageTar." }
+                    if (-not (Test-WinImage $img)) { Fail "После загрузки $ImageTar образа $img нет" "Нужен архив nsu-llm-node-$(Get-NodeVersion)-$(if ($script:AccelFinal -eq 'nvidia') { 'gpu' } else { 'cpu' }).tar.gz; укажите его через -ImageTar." }
                 }
             }
         }
@@ -1079,7 +1309,7 @@ function Invoke-Install {
                 if (-not $DryRun) {
                     Set-State 'ImageTarSig' (Get-FileSig $ImageTar); Save-State
                     $img = Get-ImageName $script:AccelFinal
-                    if (-not (Test-WslImage $img)) { Fail "После загрузки $ImageTar образа $img нет" "Нужен архив nsu-llm-node-$Version-$(if ($script:AccelFinal -eq 'nvidia') { 'gpu' } else { 'cpu' }).tar.gz; укажите его через -ImageTar." }
+                    if (-not (Test-WslImage $img)) { Fail "После загрузки $ImageTar образа $img нет" "Нужен архив nsu-llm-node-$(Get-NodeVersion)-$(if ($script:AccelFinal -eq 'nvidia') { 'gpu' } else { 'cpu' }).tar.gz; укажите его через -ImageTar." }
                 }
             }
         }
@@ -1124,18 +1354,25 @@ function Invoke-Install {
                 Invoke-Change @('powercfg', '/setactive', 'SCHEME_CURRENT') 'powercfg не выполнился' | Out-Null
             }
         }
-        # Windows 10 has no Hyper-V firewall (New-NetFirewallHyperVRule appeared in Windows 11 22H2): only the Windows
-        # firewall rule guards the ports there, which is enough for Docker Desktop (its ports go through the Windows host).
-        if (Get-Command New-NetFirewallHyperVRule -ErrorAction SilentlyContinue) {
-            Add-Step "Hyper-V firewall для WSL$(if ($desk) { ' (порты Docker Desktop в mirrored-режиме)' }): входящие TCP $ports только с $AllowFrom" {
-                $cmd = "New-NetFirewallHyperVRule -Name $FwRule -DisplayName 'NSU LLM Node' -Direction Inbound -VMCreatorId '$WslCreator' -Protocol TCP -LocalPorts $ports -RemoteAddresses $AllowFrom -Action Allow"
-                if ($DryRun) { Show-Dry "Remove-NetFirewallHyperVRule -Name $FwRule; $cmd"; return }
-                try { Remove-NetFirewallHyperVRule -Name $FwRule -ErrorAction Stop } catch { }
-                New-NetFirewallHyperVRule -Name $FwRule -DisplayName 'NSU LLM Node' -Direction Inbound -VMCreatorId $WslCreator -Protocol TCP `
-                    -LocalPorts ($ports -split ',') -RemoteAddresses ($AllowFrom -split ',') -Action Allow | Out-Null
+        # Both firewalls (Windows Firewall and, on Windows 11 22H2+, Hyper-V firewall for WSL) are set by run-node.ps1 at the end of the
+        # install and kept in step with the split group afterwards (node-boot.ps1 for WSL; for Docker Desktop, which has no boot task,
+        # a SYSTEM task NSU-LLM-Node-FwSync once a minute). Windows 10 has no Hyper-V firewall: only the Windows rule guards the ports.
+        if ($desk -and $Mode -eq 'k3s') {
+            Add-Step "задача планировщика $SyncTaskName`: раз в минуту run-node.ps1 -SyncFirewall от SYSTEM (правила для 18050 следуют за группой split)" {
+                $rn = Join-Path $ScriptsDir 'run-node.ps1'
+                $syncArgs = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$rn`" -SyncFirewall"
+                if ($DryRun) {
+                    Show-Dry "Register-ScheduledTask -TaskName $SyncTaskName -TaskPath $TaskPath -Action (powershell.exe $syncArgs) -Trigger (каждую минуту) -User SYSTEM -RunLevel Highest"
+                    return
+                }
+                $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $syncArgs
+                $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).Date -RepetitionInterval (New-TimeSpan -Minutes 1) -RepetitionDuration (New-TimeSpan -Days 3650)
+                $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+                $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 2) -MultipleInstances IgnoreNew
+                if (Get-SyncTask) { Unregister-ScheduledTask -TaskName $SyncTaskName -TaskPath $TaskPath -Confirm:$false }
+                Register-ScheduledTask -TaskName $SyncTaskName -TaskPath $TaskPath -Action $action -Trigger $trigger -Principal $principal -Settings $settings `
+                    -Description 'NSU LLM: правила брандмауэра для RPC split следуют за группой' | Out-Null
             }
-        } else {
-            Say "Hyper-V firewall в этой Windows нет: порты $ports закрывает только брандмауэр Windows (правило $FwRule)"
         }
         if (-not $taskOk) {
             Add-Step "задача планировщика $TaskName`: при загрузке Windows, без входа пользователя, от $user" {
@@ -1167,10 +1404,13 @@ function Invoke-Install {
         }
         $where = $(if ($desk) { 'в Docker Desktop (bridge)' } else { "-Wsl $Distro" })
         Add-Step "запустить ноду: run-node.ps1 $where (режим $Mode, образ $image, адрес $NodeIp)" {
-            $p = @{ Main = $Main; Token = $Token; Mode = $Mode; Accel = $script:AccelFinal; Name = $Name; NodeIp = $NodeIp; AllowFrom = $AllowFrom }
+            $p = @{ Main = $Main; Token = $Token; Mode = $Mode; Accel = $script:AccelFinal; Name = $Name; NodeIp = $NodeIp; AllowFrom = $AllowFrom; Image = $image }
             if ($nic) { $p.WolMac = $nic.Mac; $p.WolIp = $nic.Ip; $p.WolPrefix = $nic.Prefix }
             if (-not $desk) { $p.Wsl = $Distro }
             if ($InsecureTls) { $p.InsecureTls = $true }
+            if ($CaSha256) { $p.CaSha256 = $CaSha256 }
+            if ($desk) { $p.DockerUserSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value }   # Docker Desktop читает каталог данных от этого пользователя
+            if ($AcceptCa) { $p.AcceptCa = $true }
             if ($DryRun) { $p.DryRun = $true }
             $logs = $(if ($desk) { 'docker logs --tail 50 llm-node' } else { "wsl -d $Distro -u root -e docker logs --tail 50 llm-node" })
             try { & (Join-Path $PSScriptRoot 'run-node.ps1') @p | Out-Host }
@@ -1181,7 +1421,7 @@ function Invoke-Install {
     # --- сводка и подтверждение
     Say ''
     Say "Нода $Name -> главный $Main ($mainIp), режим $Mode, ускоритель $acc$(if ($accNote) { " ($accNote)" }), адрес $NodeIp"
-    Say "Брандмауэр: TCP $ports только с $AllowFrom"
+    Say "Брандмауэр: TCP 18080 только с $AllowFrom$(if ($Mode -ne 'standalone') { '; TCP 18050 (RPC split) только с главного и нод текущей группы split' })"
     if ($nic) { Say "Wake-on-LAN: сетевая карта $($nic.Name) ($($nic.Description)), MAC $($nic.Mac), $($nic.Ip)/$($nic.Prefix)" }
     else { Say "Wake-on-LAN: не настроен ($($wol.Why))" }
     Say "Кнопка питания: $(if ($PowerButton -eq 'nothing') { 'ничего не делает' } else { 'как настроено в Windows' })"
@@ -1189,8 +1429,8 @@ function Invoke-Install {
         Say "Прокси: $(Get-MaskedUrl $Proxy) (wsl --install/--update, apt и Docker CE в WSL, демон Docker, контейнер ноды); NO_PROXY=$($script:NoProxyList)"
         if ($desk) { Warn 'Docker Desktop: прокси для загрузки образов задаётся в его настройках (Settings, Resources, Proxies); контейнер ноды получает HTTP_PROXY, HTTPS_PROXY и NO_PROXY.' }
     }
-    if ($script:UseTask) { Say "Выполнение: одноразовая задача $InstallTaskName (вход по паролю $user, исполнитель class-run.ps1), журнал $InstallLog." }
-    if ($desk) { Say 'Docker: Docker Desktop (запасной путь). Автозапуск: нода вернётся только после входа пользователя в Windows (Docker Desktop стартует при входе, контейнер — по --restart unless-stopped). Без входа: -Docker wsl.' }
+    if ($script:UseTask) { Say "Выполнение: одноразовая задача $InstallTaskName (вход по паролю $user, исполнитель class-run.ps1), журнал $InstallLog. Обрыв ssh или WinRM её не остановит: ход покажет повторный запуск и -Status." }
+    if ($desk) { Say 'Docker: Docker Desktop (запасной путь). Автозапуск: нода вернётся только после входа пользователя в Windows (Docker Desktop стартует при входе, контейнер — по --restart unless-stopped). На Windows 10 ПК класса должен входить в Windows сам: автовход (netplwiz, Winlogon AutoAdminLogon) решает администратор. Без входа: -Docker wsl (Windows 11 22H2+).' }
     else { Say "Docker: Docker CE в дистрибутиве $Distro, автозапуск без входа пользователя (задача $TaskName)." }
     Say 'Будет сделано:'
     $n = 0; foreach ($s in $steps) { $n++; Say "  $n. $($s.Title)" }
@@ -1205,7 +1445,7 @@ function Invoke-Install {
         try { $tokenEnc = Protect-Secret $Token; if ($hasPw) { $proxyEnc = Protect-Secret $Proxy } }
         catch { Warn "секрет не сохранён (DPAPI: $($_.Exception.Message)); при повторном запуске передайте -Token или CLUSTER_TOKEN" }
     }
-    $save = [ordered]@{ Main = $Main; Mode = $Mode; Accel = $Accel; Docker = $script:DockerFinal; Name = $Name; Distro = $Distro; AllowFrom = $AllowFrom; MemoryGB = $MemoryGB
+    $save = [ordered]@{ Main = $Main; Mode = $Mode; Accel = $Accel; Docker = $script:DockerFinal; Name = $Name; Distro = $Distro; AllowFrom = $AllowFrom; CaSha256 = $CaSha256; MemoryGB = $MemoryGB
         NodeIp = $(if ($script:NodeIpExplicit -or (Get-Prop $answers 'NodeIp')) { $NodeIp } else { '' })
         DistroSource = $DistroSource; ImageTar = $ImageTar; ImageSource = $ImageSource; InsecureTls = [bool]$InsecureTls; Proxy = $(if ($Proxy) { Get-MaskedUrl $Proxy } else { '' }); PowerButton = $PowerButton
         ProxyMachine = $proxyEnc; TokenMachine = $tokenEnc
@@ -1238,6 +1478,8 @@ function Invoke-Install {
     }
     Say ''
     if ($DryRun) { Say 'Пробный прогон (-DryRun): ничего не изменено.'; return 0 }
+    # Успешная установка в этом сеансе: след прошлого запуска в разовой задаче (run.done, action.txt) устарел, -Status не должен его показывать.
+    if (-not $FromTask) { foreach ($f in @((Join-Path $RunDir 'run.done'), $InstallActionFile)) { Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue } }
     Say "Готово. Состояние: powershell -ExecutionPolicy Bypass -File $(Join-Path $ScriptsDir 'install-node.ps1') -Status"
     Show-Status
     return 0
@@ -1253,7 +1495,7 @@ function Invoke-InstallTask($taskArgs, [switch]$Removing) {
     $runner = Join-Path $ScriptsDir 'class-run.ps1'
     $pf = Join-Path $RunDir 'run-params.bin'; $done = Join-Path $RunDir 'run.done'
     $arg = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$runner`" -Params `"$pf`" -Log `"$InstallLog`" -Done `"$done`""
-    $shownArgs = ($taskArgs.Keys | ForEach-Object { if ($_ -eq 'TaskPassword') { 'TaskPassword=***' } else { "$_=$($taskArgs[$_])" } }) -join ', '
+    $shownArgs = ($taskArgs.Keys | ForEach-Object { if ($_ -in @('TaskPassword', 'Token')) { "$_=***" } else { "$_=$($taskArgs[$_])" } }) -join ', '
     if ($DryRun) {
         Copy-ScriptFiles
         Show-Dry "параметры задачи в $pf (DPAPI LocalMachine, только Administrators и SYSTEM): $shownArgs"
@@ -1265,9 +1507,14 @@ function Invoke-InstallTask($taskArgs, [switch]$Removing) {
     Initialize-InstallDir
     Copy-ScriptFiles
     New-Item -ItemType Directory -Force -Path $RunDir | Out-Null
+    # Прошлая задача ещё идёт (например, связь оборвалась, а установка продолжается): ничего не запускать заново, показать её ход.
+    if (Get-InstallTaskRunning) {
+        Warn "прошлый запуск задачи $InstallTaskName ещё идёт: показываю его журнал, новые параметры не применялись"
+        return (Wait-InstallTask -Removing:$Removing -Attached)
+    }
     Remove-Item -LiteralPath $InstallLog, $done -Force -ErrorAction SilentlyContinue
+    [IO.File]::WriteAllText($InstallActionFile, $(if ($Removing) { 'uninstall' } else { 'install' }))
     $old = $null; try { $old = Get-ScheduledTask -TaskPath $TaskPath -TaskName $InstallTaskName -ErrorAction Stop } catch { }
-    if ($old -and "$($old.State)" -eq 'Running') { Fail "Ещё идёт прошлый запуск задачи $InstallTaskName" "Дождитесь его конца (журнал $InstallLog) или остановите: Stop-ScheduledTask -TaskPath '$TaskPath' -TaskName $InstallTaskName" }
     if ($old) { Unregister-ScheduledTask -TaskPath $TaskPath -TaskName $InstallTaskName -Confirm:$false }
     $json = [pscustomobject]@{ Script = $child; Args = [pscustomobject]$taskArgs; EnvProxy = '' } | ConvertTo-Json -Depth 4
     Add-Type -AssemblyName System.Security
@@ -1284,7 +1531,15 @@ function Invoke-InstallTask($taskArgs, [switch]$Removing) {
         Remove-Item -LiteralPath $pf -Force -ErrorAction SilentlyContinue
         Fail "Не удалось создать или запустить задачу $InstallTaskName от $user`: $($_.Exception.Message)" "Проверьте пароль учётной записи $user и право «Вход в качестве пакетного задания» (у Администраторов оно есть, если GPO его не забирает)."
     }
-    Say "$(if ($Removing) { 'Удаление' } else { 'Установка' }) идёт в задаче $InstallTaskName, журнал ${InstallLog}:"
+    return (Wait-InstallTask -Removing:$Removing)
+}
+
+# Ждёт конца разовой задачи и показывает её журнал по ходу. -Attached: задача уже шла (прошлый сеанс оборвался) и показывается с начала;
+# параметры файла запуска к ней не относятся. Возвращает код установщика.
+function Wait-InstallTask([switch]$Removing, [switch]$Attached) {
+    $user = Get-CurrentUser
+    $pf = Join-Path $RunDir 'run-params.bin'; $done = Join-Path $RunDir 'run.done'
+    Say "$(if ($Attached) { 'Подключился к идущей задаче: ' })$(if ($Removing) { 'Удаление' } else { 'Установка' }) идёт в задаче $InstallTaskName, журнал ${InstallLog}:"
     $enc = New-Object Text.UTF8Encoding $false
     $pos = [long]0; $buf = ''
     $pull = {
@@ -1334,6 +1589,20 @@ try {
     Initialize-Answers
     Resolve-Answers
     if ($Status) { Show-Status; exit $(if ($script:bad -gt 0) { 1 } else { 0 }) }
+    # Прошлый запуск (установка или удаление в разовой задаче) ещё идёт, а сеанс, который его начал, оборвался: подключиться к нему,
+    # а не начинать заново (задача держится планировщиком и сеанс ssh/WinRM ей не нужен).
+    if (-not $FromTask -and -not $DryRun) {
+        $busy = Get-InstallTaskRunning
+        if ($busy) {
+            $want = $(if ($Uninstall) { 'uninstall' } else { 'install' })
+            $has = ''; try { $has = ([IO.File]::ReadAllText($InstallActionFile)).Trim() } catch { }
+            if ($has -ne $want) {
+                Fail "В задаче $InstallTaskName сейчас идёт $(if ($has -eq 'uninstall') { 'удаление' } elseif ($has -eq 'install') { 'установка' } else { 'прошлый запуск' }), а запрошено: $(if ($Uninstall) { 'удаление' } else { 'установка' })" "Дождитесь его конца (-Status показывает ход, журнал $InstallLog) или остановите: Stop-ScheduledTask -TaskPath '$TaskPath' -TaskName $InstallTaskName"
+            }
+            Say "Идёт $(if ($want -eq 'uninstall') { 'удаление' } else { 'установка' }) в разовой задаче $InstallTaskName (начата прошлым запуском, возможно оборванным сеансом): показываю её журнал, этот запуск ничего не меняет."
+            exit (Wait-InstallTask -Removing:($want -eq 'uninstall') -Attached)
+        }
+    }
     if ($Uninstall) {
         if (-not $DryRun -and -not (Test-Admin)) { Fail 'Нужны права администратора' 'Запустите PowerShell от имени администратора.' }
         exit (Invoke-Uninstall)

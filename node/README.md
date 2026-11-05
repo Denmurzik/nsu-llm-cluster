@@ -32,8 +32,10 @@ docker build --provenance=false -f node/Dockerfile --target gpu --build-arg JOBS
 | `serve-llama.sh` | Запуск `llama-server` из переменных окружения (таблица ниже). |
 | `serve-rpc.sh` | `exec ggml-rpc-server -H 0.0.0.0 -p ${RPC_PORT:-18050} -t ${THREADS:-$(nproc)}`, плюс `-d $RPC_DEVICES` (например `CUDA0,CPU`: видеопамять и RAM ноды, порядок задаёт порядок `--tensor-split`) и `-c` при `RPC_CACHE=1` (кэш тензоров в `$LLAMA_CACHE/rpc`). Значения выставляет портал. `--print-cmd` печатает команду. Перед `exec` запускает в фоне `rpc-cache-gc.sh --loop`. |
 | `rpc-cache-gc.sh` | LRU-очистка кэша тензоров `ggml-rpc-server -c` (`$LLAMA_CACHE/rpc`): `RPC_CACHE_MAX_GIB` (по умолчанию 64, 0 — без лимита), `RPC_CACHE_MIN_FREE_PCT` (10 % файловой системы свободно), проход раз в `RPC_CACHE_GC_INTERVAL_S` (600 с). |
-| `registrar.sh` | Режим standalone: регистрация, heartbeat, запуск `llama-server` по `desired`. |
+| `registrar.sh` | Режим standalone: регистрация, heartbeat, запуск `llama-server` по `desired`. С `--wake-report` (k3s, фоном) один раз сообщает сетевую карту для Wake-on-LAN; с `--models-report` (k3s, фоном) раз в `MODELS_REPORT_S` (300 с) сообщает размер тома моделей. |
+| `models-cleanup.sh` | Удаляет с тома моделей файлы, которые не нужны развёртыванию ноды, и кэш тензоров (задача 2-26): раздел «Очистка весов» ниже. |
 | `detect-accel.sh` | `nvidia` или `cpu`; с `--vram` — VRAM первой GPU в МиБ; с `--ram` — память контейнера в МиБ (`MemTotal`, в WSL это память WSL; меньше, если у контейнера есть лимит cgroup). |
+| `node-metrics.sh` | Сборщик мониторинга (задача 2-33). Запускается `entrypoint.sh` в фоне в обоих режимах (k3s и standalone) и раз в `METRICS_INTERVAL_S` секунд (20; допустимо 10-60) отправляет нагрузку ноды на `POST $MAIN_URL/api/nodes/$NODE_NAME/metrics` с токеном агента, как отчёт сетевой карты. Отправляет: по каждой GPU загрузку, VRAM занято/всего, температуру и мощность (`nvidia-smi`; чего он не отдаёт, то `null`), RAM занято/всего в пределах лимита контейнера (в WSL это память WSL), CPU % с прошлой отправки (`/proc/stat`), размер кэша моделей `$LLAMA_CACHE` и свободное место под ним (`du` раз в 5 минут), признаки «запущен `llama-server`» и «запущен `ggml-rpc-server`» (в режиме k3s процессы подов видны в контейнере ноды). Ответ не используется; портал отвечает 429 на отправку чаще раза в 5 секунд. Один сбой пишется в журнал один раз. `NODE_METRICS=0` выключает сборщик. `--once` печатает JSON одного замера. |
 
 ### Переменные окружения
 
@@ -74,8 +76,8 @@ docker build --provenance=false -f node/Dockerfile --target gpu --build-arg JOBS
 | `RPC_SERVERS` | `--rpc … --fit off`; перед запуском скрипт до 300 с ждёт, пока каждый `host:port` примет TCP |
 | `TENSOR_SPLIT` | только вместе с `RPC_SERVERS`: `--tensor-split`, целые числа слоёв на каждое RPC-устройство в порядке `--rpc`, внутри сервера в порядке его `-d`; считает портал |
 
-Всегда: `--host 0.0.0.0 --port $INFER_PORT --jinja --cache-ram 512 -fa auto --ctx-size $CTX_SIZE
---parallel $PARALLEL_SLOTS --no-kv-unified`, плюс `--no-mmproj`, если нет `MMPROJ_FILE`. `--print-cmd` печатает команду и список скачиваемых частей, ничего не запуская.
+Всегда: `--host 0.0.0.0 --port $INFER_PORT --jinja --metrics --cache-ram 512 -fa auto --ctx-size $CTX_SIZE
+--parallel $PARALLEL_SLOTS --no-kv-unified`, плюс `--no-mmproj`, если нет `MMPROJ_FILE`. `--metrics` включает `/metrics` (Prometheus) для мониторинга портала: он закрыт тем же `LLAMA_API_KEY`, что и `/v1`, открытым остаётся только `/health`; администратор не может ни добавить, ни выключить флаг (он в `forbidden-flags`). Нода со старым образом `/metrics` не отдаёт: у такого развёртывания нет скорости токенов, очереди и слотов, пока образ не обновлён. `--print-cmd` печатает команду и список скачиваемых частей, ничего не запуская.
 
 **Флаг отключения общего KV-кэша в b12033: `--no-kv-unified`** (`-no-kvu`; проверено по `llama-server --help` собранного
 образа). С ним каждый слот получает ровно `CTX_SIZE / PARALLEL_SLOTS` токенов: при `CTX_SIZE=2048` и двух слотах
@@ -83,18 +85,50 @@ docker build --provenance=false -f node/Dockerfile --target gpu --build-arg JOBS
 `default_generation_settings.n_ctx = 1024`. Поэтому `ctx_size` в `desired` и `CTX_SIZE` пода — это суммарный контекст
 (`ctx_per_request × parallel`), а на запрос приходится `ctx_size / parallel`.
 
+## Очистка весов (`models-cleanup.sh`)
+
+Задача 2-26. Скрипт удаляет с тома моделей (`$LLAMA_CACHE`, по умолчанию `/var/lib/llm-models`) то, что ноде не нужно; что именно нужно, решает портал и передаёт аргументами
+(`docs/deploy-class.md`, «Очистка весов моделей на нодах»).
+
+```
+models-cleanup.sh [--dry-run] [--keep РЕПОЗИТОРИЙ:ФАЙЛ]... [--keep-rpc] [--keep-vllm]
+models-cleanup.sh --usage
+```
+
+* `--keep owner/repo:file.gguf` (можно несколько раз; `local/<имя>:файл` для своих моделей) оставляет файл. Из многофайловой модели (`…-00001-of-0000N.gguf`) остаются все части, у оставленного
+  файла остаются `.etag`, `.part`, `.part.etag`. Остальные файлы того же репозитория (старый квант) и каталоги других репозиториев удаляются.
+* `--keep-rpc` оставляет кэш тензоров `rpc/` (нода в группе split своего развёртывания), `--keep-vllm` кэш `huggingface/`. Без этих флагов содержимое каталога удаляется, сам каталог остаётся (rpc-сервер пишет в него).
+* Без аргументов удаляется всё. `--dry-run` ничего не удаляет и сообщает, сколько освободилось бы; `--usage` печатает размер тома в байтах (сумму размеров файлов).
+* Не трогаются файлы, изменённые за последние `MODELS_CLEANUP_MIN_AGE_S` (60) секунд, ссылки и всё, что не похоже на веса. Путь тома проверяется: абсолютный, не короче двух уровней, без `..`.
+* Вывод: строка `removed <путь> <байт>` на каждое удаление и последняя строка `RESULT {"freed_bytes":…,"models_bytes":…,"removed":[…],"skipped":[…],"dry_run":false}`
+  (`models_bytes` — сколько осталось). Код 2 — неверные аргументы или небезопасный путь.
+
+Откуда скрипт запускается: на ноде k3s из одноразового Job портала, на standalone-ноде из `registrar.sh` по приказу в ответе на heartbeat. Размер тома нода сообщает порталу сама:
+`registrar.sh --models-report` (k3s, фоном из `entrypoint.sh`, `POST /api/nodes/models` `{"name","models_bytes"}` каждые `MODELS_REPORT_S` секунд, по умолчанию 300) или поле `models_bytes` в register и heartbeat (standalone).
+
 ## Режим standalone (`registrar.sh`)
 
 Контракт реестра (реализован в портале, задача 10); везде заголовок `Authorization: Bearer $CLUSTER_TOKEN`. Портал принимает
 токен агента (сырой или `K10…::node:…`) и, один релиз, серверный токен k3s нод, установленных до токена агента:
 
-* `POST /api/nodes/register` `{"name","url","accel","vram_mib"|null,"ram_mib","version"}` → `{"ok":true,"heartbeat_interval":15}`;
-  `url = http://$NODE_IP:$INFER_PORT`.
+* Свой ключ ноды (задача SEC-1, `portal/app/nodes/identity.py`): первая регистрация имени возвращает `"node_key"` один раз;
+  `registrar.sh` хранит его в `$STATE_DIR/node.key` (0600) и шлёт как `X-Node-Key: <ключ>` (через файл заголовков, не argv)
+  во всех следующих вызовах, `node-metrics.sh` тоже. Из него выводится ключ бэкенда `sha256("nsu-llm-backend:" + ключ)` в
+  `$STATE_DIR/backend/key` (его монтируют поды k3s, `LLAMA_API_KEY_FILE`/`VLLM_API_KEY_FILE`). Ответ 403 с
+  `detail.code = node_key_invalid` (ключ сброшен администратором или нода удалена): ключ удаляется, нода регистрируется заново
+  и ждёт подтверждения (`"approved": false` в ответах). Регистрация без ключа несёт `X-Node-Enroll-Nonce` (`$STATE_DIR/enroll.nonce`, до сохранения ключа): потерянный ответ повторяется и получает новый ключ вместо 409. В режиме k3s `registrar.sh --report` сначала вызывает
+  `POST /api/nodes/enroll` `{"name"}` и остаётся в фоне: если ключа не стало, регистрирует ноду снова.
+* `POST /api/nodes/register` `{"name","url","accel","vram_mib"|null,"ram_mib","version"}` →
+  `{"ok":true,"heartbeat_interval":15,"approved":true|false,"node_key"?}`; `url = http://$NODE_IP:$INFER_PORT`. Занятое имя без
+  ключа: 409 `node_name_taken`.
 * `POST /api/nodes/heartbeat` `{"name","applied_spec_hash"|null}` → `{"ok":true,"heartbeat_interval":15,"desired":null|{…}}`;
   404 — зарегистрироваться заново. В `desired` есть `backend_api_key`: `registrar.sh` передаёт его `serve-llama.sh`
   в переменной окружения `LLAMA_API_KEY` (не в командной строке) и перезапускает сервер при его смене; `/health` ключа не требует.
 * Если `GET /ca.crt` отвечает 404 (главный запущен со своим сертификатом, `--certs`), `registrar.sh` проверяет TLS по
   системному хранилищу сертификатов.
+* В register и heartbeat есть необязательное `models_bytes` (размер тома моделей в байтах). Ответ на heartbeat может нести `purge`: приказы очистки `[{"id","keep":["репозиторий:файл"],"keep_rpc","keep_vllm"}]`.
+  `registrar.sh` выполняет их в фоне `models-cleanup.sh` (по одному, оставляя то, что запущено сейчас) и сообщает итог в следующем heartbeat: `purge_result` `{"id","freed_bytes","models_bytes","removed","skipped"}`
+  или `{"id","error"}`. Для нод k3s есть `POST /api/nodes/models` `{"name","models_bytes"}`.
 * `POST /api/nodes/{name}/stop` → 204 при остановке контейнера (нода выходит из маршрутизации, запись и сетевая карта для Wake-on-LAN остаются); `DELETE /api/nodes/{name}` → 204 только при `-Uninstall`.
 
 Поведение:
@@ -125,7 +159,7 @@ sudo ./run-node.sh --uninstall --main 192.168.3.21 --name "$(hostname)" --token 
 `--accel auto|cpu|nvidia`, `--node-ip IP`, `--name N` (имя хоста в нижнем регистре; как и портал, принимает только
 латинские буквы, цифры и дефис, до 63 символов), `--network bridge|host` (bridge),
 `--image I` (`nsu-llm-node:0.1.0-<cpu|gpu>`), `--data-dir D` (`/var/lib/nsu-llm-node`), `--insecure-tls`, `--dry-run`
-(печатает команды, ничего не выполняя), `--uninstall`. `HF_ENDPOINT`, `HF_TOKEN`, `THREADS` из окружения скрипта
+(печатает команды, ничего не выполняя), `--uninstall`. `HF_ENDPOINT`, `HF_TOKEN`, `THREADS`, `MODELS_REPORT_S` из окружения скрипта
 передаются в контейнер.
 
 * Образ должен быть на хосте (`docker load` или сборка). В режиме k3s скрипт делает
@@ -150,13 +184,21 @@ sudo ./run-node.sh --uninstall --main 192.168.3.21 --name "$(hostname)" --token 
 `run-node.ps1` принимает те же параметры в стиле PowerShell (`-Main`, `-Token`, `-Mode`, `-Accel`, `-NodeIp`, `-Name`,
 `-Network`, `-Image`, `-DataDir`, `-InsecureTls`, `-DryRun`, `-Uninstall`) и `-Wsl <дистрибутив>`: все команды docker идут
 через `wsl -d <дистрибутив> -u root -e docker …` (`-Wsl default` — дистрибутив по умолчанию), сеть по умолчанию `host`, данные
-внутри WSL; там же сохраняется CA портала и выполняется `DELETE` при `-Uninstall`. `HF_ENDPOINT`, `HF_TOKEN`, `THREADS` из
+внутри WSL; там же сохраняется CA портала и выполняется `DELETE` при `-Uninstall`. `HF_ENDPOINT`, `HF_TOKEN`, `THREADS`, `MODELS_REPORT_S` из
 окружения передаются в контейнер, как в `run-node.sh` (в WSL — через `WSLENV`). Ошибка любой команды docker останавливает скрипт.
 Скрипт проверяет `docker info`, для `-Accel` не `cpu` — `docker run --rm --pull never --gpus all --entrypoint nvidia-smi nsu-llm-node:0.1.0-gpu`
 (локальный образ, `-Image` его заменяет; без загруженного gpu-образа `-Accel auto` выбирает cpu),
 приводит имя хоста к нижнему регистру и создаёт правило брандмауэра `NSU-LLM-Node` (TCP 18080 и, в режиме k3s, 18050),
 если запущен от администратора, иначе печатает команду. `-AllowFrom 10.1.2.0/24,10.9.0.5` ограничивает правило этими адресами
 (иначе с любых). Порты и адреса правила сверяются при каждом запуске (правило пересоздаётся), `-Uninstall` удаляет правило.
+
+Обновление контейнера по запросу главного (кнопка «Обновить» на странице «Ноды», `NODE_AUTO_UPDATE`): `run-node.sh --update` и
+`run-node.ps1 -Update [-Wsl <дистрибутив>]`. Параметры (главный, токен, режим, адрес, сеть, каталог данных, сетевая карта) берутся у работающего
+контейнера `llm-node`; скрипт спрашивает главного (`GET /api/nodes/<имя>/desired`), и только если тот велит, скачивает образ (`pull-image.sh --ca
+state/ca.crt --record state/image.digest`) и создаёт контейнер заново обычным путём установки (без брандмауэра). Неудача уходит главному
+(`POST /api/nodes/<имя>/image`, поле `update_error`). Версию, коммит и digest образа контейнер сообщает сам (`registrar.sh --report` в режиме k3s,
+после регистрации в standalone; `NODE_VERSION`, `NODE_REVISION` из образа, `NODE_IMAGE`, `NODE_IMAGE_DIGEST` от `run-node`). `node-boot.ps1` вызывает
+`run-node.ps1 -Update` раз в минуту (`-UpdateEverySec`), на Linux это таймер systemd, подробнее: `docs/release.md`, «Обновление нод».
 
 `install-node.ps1` (Windows, от администратора) ставит ноду целиком: WSL2, дистрибутив `NSU-LLM`, Docker CE, `.wslconfig`,
 задачу автозапуска без входа пользователя (`node-boot.ps1`), электропитание, брандмауэр и Wake-on-LAN физической сетевой карты
@@ -171,7 +213,9 @@ sudo ./run-node.sh --uninstall --main 192.168.3.21 --name "$(hostname)" --token 
 ```bash
 bash node/tests/test_scripts.sh                 # без docker: синтаксис, serve-llama --print-cmd, run-node --dry-run
 bash node/tests/test_install_node.sh            # без WSL и docker: install-node.ps1 -DryRun, wsl-setup.sh, node-boot.ps1 с подменой команд
+bash node/tests/test_node_metrics.sh            # без docker: сборщик мониторинга с подменой nvidia-smi, curl и /proc, его запуск из entrypoint.sh, --metrics в serve-llama
 bash node/tests/test_dockerfile.sh              # без docker: патч пределов llama.cpp и его проводка в Dockerfile
+bash node/tests/test_update_node.sh            # без WSL и docker: run-node.ps1 -Update и цикл обновлений node-boot.ps1 с подменой wsl, docker, curl (Windows PowerShell 5.1)
 bash node/tests/test_standalone.sh              # docker: cpu-образ + mock_main.py, модель ggml-org/gemma-3-270m-it-GGUF
 bash node/tests/gpu_smoke.sh                    # только на GPU-сервере: gpu-образ в режиме standalone
 bash node/tests/test_class_deploy.sh            # без сети: class-deploy.ps1 с подменой WinRM/SMB (нужен Windows PowerShell 5.1)

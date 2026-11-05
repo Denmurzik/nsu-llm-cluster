@@ -9,6 +9,7 @@ export function Login() {
   const { pathname, search } = useLocation();
   const returnTo = encodeURIComponent(`${pathname}${search}`);
   const status = useResource(() => api.publicStatus(), [], { interval: 15000 });
+  const provider = status.data?.login_provider || "SSO";
   const host = typeof window === "undefined" ? "" : window.location.host;
 
   return (
@@ -19,13 +20,12 @@ export function Login() {
         </span>
         <h1>Языковые модели на машинах аудитории</h1>
         <p className="sub">
-          Войдите через NSU ID, выпустите ключ и обращайтесь к моделям кластера НГУ так же, как к OpenAI API.
+          Войдите через {provider}, выпустите ключ и обращайтесь к моделям кластера так же, как к OpenAI API.
         </p>
         <div className="login-actions">
           <a className="btn primary lg" href={`/auth/login?return_to=${returnTo}`}>
-            Войти через NSU ID
+            Войти через {provider}
           </a>
-          <span className="muted">Доступ для студентов и сотрудников НГУ</span>
         </div>
       </section>
 

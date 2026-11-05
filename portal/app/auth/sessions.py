@@ -8,10 +8,12 @@ from fastapi import Depends, HTTPException, Request, Response
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app import settings_store
+from app.auth import roles
 from app.config import Settings
 from app.db import get_session
 from app.deps import get_settings_dep
-from app.models import User, WebSession
+from app.models import ApiKeyRef, User, WebSession
 
 _MUTATING = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 DEFAULT_TTL_HOURS = 12
@@ -43,8 +45,11 @@ async def create_session(
     return raw, ws
 
 
-async def _load(db: AsyncSession, raw: str, ttl_hours: int) -> tuple[WebSession | None, bool]:
-    """Returns (session or None, whether the expiry was extended)."""
+async def _load(
+    db: AsyncSession, raw: str, ttl_hours: int, max_age: timedelta | None = None
+) -> tuple[WebSession | None, bool]:
+    """Returns (session or None, whether the expiry was extended). `max_age`: the absolute lifetime counted from the
+    login (finding L1): the sliding expiry never goes past it, and a session older than that is removed."""
     if not raw:
         return None, False
     ws = await db.get(WebSession, _hash(raw))
@@ -52,20 +57,31 @@ async def _load(db: AsyncSession, raw: str, ttl_hours: int) -> tuple[WebSession 
         return None, False
     now = _now()
     ttl = timedelta(hours=ttl_hours)
-    if ws.expires_at <= now:
+    limit = ws.created_at + max_age if max_age is not None else None
+    if ws.expires_at <= now or (limit is not None and limit <= now):
         await db.delete(ws)
         await db.commit()
         return None, False
     if ws.expires_at - now < ttl / 2:
-        ws.expires_at = now + ttl
-        await db.commit()
-        return ws, True
+        new_expiry = now + ttl if limit is None else min(now + ttl, limit)
+        if new_expiry > ws.expires_at:
+            ws.expires_at = new_expiry
+            await db.commit()
+            return ws, True
     return ws, False
 
 
-async def load_session(db: AsyncSession, raw: str, ttl_hours: int = DEFAULT_TTL_HOURS) -> WebSession | None:
-    """Expired sessions are removed and yield None; a session with less than half of the TTL left slides."""
-    ws, _ = await _load(db, raw, ttl_hours)
+async def session_max_age(state) -> timedelta:
+    """The absolute lifetime of a web session: the runtime setting `session_max_days` (panel), else SESSION_MAX_DAYS."""
+    return timedelta(days=int(await settings_store.live(state, "session_max_days")))
+
+
+async def load_session(
+    db: AsyncSession, raw: str, ttl_hours: int = DEFAULT_TTL_HOURS, max_age: timedelta | None = None
+) -> WebSession | None:
+    """Expired sessions are removed and yield None; a session with less than half of the TTL left slides (never past
+    `max_age` after its login)."""
+    ws, _ = await _load(db, raw, ttl_hours, max_age)
     return ws
 
 
@@ -87,12 +103,17 @@ async def end_user_sessions(db: AsyncSession, user_id) -> None:
     await db.execute(delete(WebSession).where(WebSession.user_id == user_id))
 
 
-async def on_user_blocked(db: AsyncSession, user: User) -> None:
-    """Hook for the panel (task 2-32) to call when it blocks a user, before its commit: the sessions end at once.
+async def on_user_blocked(db: AsyncSession, user: User, litellm=None) -> None:
+    """Called by the panel (api/admin_users.py) when it blocks a user, before its commit.
 
-    TODO(2-32): revoke the user's LiteLLM keys here (a blocked user's API keys must stop working too).
+    The sessions end at once, and with a LiteLLM client every key of the user (the Playground one too) is disabled
+    (`/key/block`: the key values survive, `unblock_keys` restores them). A LiteLLM error propagates, the caller rolls
+    the whole change back and nobody is left half-blocked (the client releases the keys it had already blocked).
     """
     await end_user_sessions(db, user.id)
+    if litellm is not None:
+        tokens = (await db.scalars(select(ApiKeyRef.litellm_token).where(ApiKeyRef.user_id == user.id))).all()
+        await litellm.block_keys(list(tokens))
 
 
 def set_session_cookie(response: Response, raw: str, settings: Settings) -> None:
@@ -146,7 +167,7 @@ async def current_web_session(
     settings: Settings = Depends(get_settings_dep),
 ) -> WebSession:
     raw = request.cookies.get(settings.cookie_name, "")
-    ws, slid = await _load(db, raw, settings.session_ttl_hours)
+    ws, slid = await _load(db, raw, settings.session_ttl_hours, await session_max_age(request.app.state))
     if ws is None:
         raise HTTPException(status_code=401, detail="Требуется вход")
     if slid:
@@ -167,15 +188,10 @@ async def current_user(
         await end_user_sessions(db, user.id)
         await db.commit()
         raise HTTPException(status_code=403, detail=blocked_message(user))
-    listed = user.email.lower() in settings.admin_email_set
-    if user.role_source == "manual":
-        pass  # the role was set in the panel: ADMIN_EMAILS does not touch it
-    elif user.role == "admin" and not listed:
-        # ADMIN_EMAILS changed since the login: the role follows the current list, not the one at login time
-        user.role = "user"
-    elif user.role == "user" and listed and not settings.admin_require_email_verified:
-        # without the email_verified requirement the list alone decides, also between logins
-        user.role = "admin"
+    if user.role_source != "manual":  # a role set in the panel: ADMIN_SUBS/ADMIN_EMAILS do not touch it
+        # the lists (and ADMIN_REQUIRE_EMAIL_VERIFIED) may have changed since the login: the role follows them now, with
+        # the email_verified the provider sent at that login (app.auth.roles)
+        user.role = roles.auto_role(user, settings)
     # end the transaction now: the handler may talk to LiteLLM for a long time and must not hold a pooled
     # connection meanwhile (the sessionmaker does not expire objects on commit, so `user` stays usable)
     await db.commit()

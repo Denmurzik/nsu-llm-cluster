@@ -3,6 +3,7 @@ import { useEffect, useRef, useState } from "react";
 import { api, ApiError } from "../api";
 import type { Deployment } from "../types";
 import { Confirm } from "./Modal";
+import { PrefetchButton } from "./PrefetchButton";
 import { ProbeCell } from "./ProbeCell";
 import { RowMenu, type RowMenuItem } from "./RowMenu";
 import "../styles/row-actions.css";
@@ -66,6 +67,10 @@ export function DeploymentRowActions({
   return (
     <div className="row-actions">
       <ProbeCell id={dep.id} name={dep.name} enabled={dep.enabled} />
+      {/* own files (local/…) lie on main: nothing to download ahead */}
+      {!dep.repo.startsWith("local/") && (
+        <PrefetchButton dep={dep} compact onResult={(_text, error) => onError(error)} />
+      )}
       <RowMenu label={`Действия: ${dep.name}`} items={items} disabled={busy} />
       {asking === "delete" && (
         <Confirm

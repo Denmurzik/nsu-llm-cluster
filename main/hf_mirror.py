@@ -10,8 +10,23 @@ Clients (llama.cpp `--hf-repo`, huggingface_hub, curl in serve-llama.sh) use:
 An optional `/c/<client>` prefix names the client (the node) for the progress report:
   GET      /_mirror/transfers   bytes sent to each client per file and the downloads in progress
   GET      /_mirror/health      liveness, without a token
-Every other request needs `Authorization: Bearer <HF_MIRROR_TOKEN>`; the mirror itself talks to Hugging Face with
-HF_TOKEN, which never leaves llm-main.
+Admin API of the portal (task 2-29; only with the admin key, never with a scoped token, and refused when the request came
+through a proxy: Caddy sets X-Forwarded-*, the portal on main connects to 127.0.0.1 directly):
+  GET    /admin/cache                  the files in cache/ (and the downloads in progress) with the volume totals
+  DELETE /admin/cache/<owner>/<repo>[/<path>]   one file or a whole repository; 409 while it is served or downloaded
+  POST   /admin/prefetch               {repo, revision?, files[]}: download files into cache/ in the background
+  GET    /admin/prefetch               the prefetch jobs: state, bytes done, total, speed, error
+  DELETE /admin/prefetch/<id>          cancel a job (a finished one is removed from the list); without id: clear the list
+Every other request needs `Authorization: Bearer <token>`; the mirror itself talks to Hugging Face with HF_TOKEN, which
+never leaves llm-main. Tokens (SEC-1 rule 4, SEC-2 L2):
+  HF_MIRROR_ADMIN_TOKEN  the portal on main: every repository, /_mirror/transfers and the admin API. Never leaves main.
+                         Without it (tests, a mirror started by hand) HF_MIRROR_TOKEN plays this role.
+  HF_MIRROR_TOKEN        only signs the scoped tokens; not accepted as a Bearer token when an admin key is set. Never leaves
+                         main either (not in llm-node-secrets, not in a node's desired state).
+  nsm1.<payload>.<sig>   a node or the pods of a deployment (portal/app/mirror_tokens.py): payload {"c": client, "r": [repos]},
+                         sig = HMAC-SHA256(HF_MIRROR_TOKEN, "nsm1." + payload), base64url without padding. Opens files and
+                         metadata of the repositories in "r" only: the operator's HF_TOKEN fetches nothing else for a node
+                         (gated or private repositories it sees) and a node cannot push other files into the cache.
 
 Data directory (HF_MIRROR_DIR):
   cache/<owner>/<repo>/<path>     downloaded files, served for any revision; under HF_MIRROR_MAX_GIB, evicted least
@@ -31,6 +46,7 @@ Data directory (HF_MIRROR_DIR):
                                              once abandoned
   .mirror/api/<sha1>.json                    last good metadata answers (at most API_CACHE_MAX_FILES), used while
                                              Hugging Face is unreachable
+  .mirror/prefetch.json                      the prefetch jobs (queued and running ones continue after a restart)
 """
 
 from __future__ import annotations
@@ -60,6 +76,10 @@ DISK_RESERVE_PCT = 15
 STALL_S = 300  # a reader gives up when the download it waits for makes no progress this long
 TRANSFER_TTL_S = 6 * 3600  # finished transfers stay in the progress report this long
 API_MAX_BYTES = 64 << 20
+PREFETCH_CONCURRENCY = 2  # prefetch downloads running at once
+PREFETCH_HISTORY = 100  # finished prefetch jobs kept in the list
+PREFETCH_MAX_FILES = 200  # files in one prefetch request
+ADMIN_BODY_MAX = 1 << 20
 API_CACHE_MAX_FILES = 2000
 # the metadata endpoints llama.cpp b12033 (common/hf-cache.cpp: refs, tree) and huggingface_hub (model_info, revision,
 # list_repo_tree) read; everything else of the Hugging Face API is refused
@@ -68,6 +88,10 @@ _COMMIT = re.compile(r"[0-9a-f]{40}")
 _REPO_PART = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,95}")
 _CLIENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 _HEX = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
+_REVISION = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,127}")
+_JOB_ID = re.compile(r"[0-9a-f]{12}")
+_PROXY_HEADERS = ("X-Forwarded-For", "X-Forwarded-Host", "X-Forwarded-Proto", "Forwarded")
+_ADMIN_GET = ("/admin/cache", "/admin/prefetch")
 LOCAL_OWNER = "local"  # repositories local/<name>: the portal's own model files in models/local/<name>/
 _LOCAL_API = re.compile(r"/api/models/local/[^/]+(/.*)?")
 MANIFEST = ".manifest.json"  # written by the portal (portal/app/localmodels/store.py)
@@ -108,11 +132,59 @@ def _etag(value: str | None) -> str | None:
     return value.strip('"') or None
 
 
+TOKEN_PREFIX = "nsm1"
+SCOPED_TOKEN_MAX = 16384  # a payload with a few repositories is far below; a longer header is refused before any work
+
+
+def _b64url_decode(text: str) -> bytes:
+    import base64
+
+    if not re.fullmatch(r"[A-Za-z0-9_-]*", text):
+        raise ValueError("not base64url")
+    return base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
+
+
+def scoped_token_repos(secret: str, token: str) -> frozenset[str] | None:
+    """The repositories a scoped token `nsm1.<payload>.<sig>` opens, or None when it is not one signed with `secret`."""
+    scoped = scoped_token(secret, token)
+    return None if scoped is None else scoped[1]
+
+
+def scoped_token(secret: str, token: str) -> tuple[str, frozenset[str]] | None:
+    """(client, repositories) of a scoped token signed with `secret`, else None. The client is a node name or "*"."""
+    if not secret or len(token) > SCOPED_TOKEN_MAX:
+        return None
+    parts = token.split(".")
+    if len(parts) != 3 or parts[0] != TOKEN_PREFIX:
+        return None
+    want = hmac.new(secret.encode(), f"{TOKEN_PREFIX}.{parts[1]}".encode(), hashlib.sha256).digest()
+    try:
+        got = _b64url_decode(parts[2])
+        payload = json.loads(_b64url_decode(parts[1]))
+    except (ValueError, UnicodeDecodeError):
+        return None
+    if not hmac.compare_digest(got, want):
+        return None
+    if not isinstance(payload, dict) or not isinstance(payload.get("c"), str) or not isinstance(payload.get("r"), list):
+        return None
+    # optional expiry "e" (unix seconds): a token the portal minted with one stops working on its own
+    exp = payload.get("e")
+    if exp is not None and (isinstance(exp, bool) or not isinstance(exp, int) or time.time() >= exp):
+        return None
+    return payload["c"], frozenset(r for r in payload["r"] if isinstance(r, str))
+
+
 def check_repo(repo: str) -> str:
     parts = repo.split("/")
     if len(parts) != 2 or not all(_REPO_PART.fullmatch(p) and ".." not in p for p in parts):
         raise HttpError(400, f"invalid repository: {repo}")
     return repo
+
+
+def check_revision(revision: str) -> str:
+    if not _REVISION.fullmatch(revision) or ".." in revision:
+        raise HttpError(400, f"invalid revision: {revision}")
+    return revision
 
 
 def check_path(path: str) -> str:
@@ -188,6 +260,8 @@ def _file_meta(meta: dict[str, str], status: int) -> dict:
 MSG_FULL = "Кэш зеркала заполнен: увеличьте HF_MIRROR_MAX_GIB или освободите том зеркала"
 MSG_TOO_BIG = "Файл больше лимита кэша зеркала HF_MIRROR_MAX_GIB: увеличьте лимит"
 MSG_NO_SPACE = "На томе зеркала кончилось место: освободите том или уменьшите HF_MIRROR_MAX_GIB"
+MSG_CANCELLED = "Скачивание отменено"
+MSG_BUSY = "Файл сейчас отдаётся нодам или скачивается: попробуйте позже"
 
 
 class Download(threading.Thread):
@@ -212,6 +286,8 @@ class Download(threading.Thread):
         self.progress_at = time.monotonic()  # last change of `written` (readers give up after STALL_S without it)
         self.ready = False  # headers known and the first bytes on disk (or the file complete)
         self.done = False
+        self.cancelled = False  # a prefetch cancelled while nobody else waits for this file (the part stays, resumable)
+        self.nodes = 0  # node requests that wait for this download or follow it (counted under Mirror.lock)
         self.error: HttpError | None = None
 
     @property
@@ -245,6 +321,11 @@ class Download(threading.Thread):
     def _fail(self, error: HttpError) -> None:
         with self.cond:
             self.error = error
+            self.cond.notify_all()
+
+    def cancel(self) -> None:
+        with self.cond:
+            self.cancelled = True
             self.cond.notify_all()
 
     def _set_ready(self) -> None:
@@ -289,6 +370,8 @@ class Download(threading.Thread):
             self.etag, self.commit = info["etag"], info["commit"]
             with self.cond:
                 self.size, self.written = info["size"], offset
+            if self.cancelled:
+                raise HttpError(499, MSG_CANCELLED)
             if self.size is not None:
                 room = self.mirror.make_room(self.size - offset, self)
                 if room != "ok":
@@ -302,6 +385,8 @@ class Download(threading.Thread):
                 out.truncate()
                 log(f"downloading {self.repo}/{self.path} ({self.size} bytes, from {offset})")
                 while True:
+                    if self.cancelled:
+                        raise HttpError(499, MSG_CANCELLED)
                     # read1: a connection that breaks early ends the loop with the bytes received so far kept
                     chunk = resp.read1(CHUNK)
                     if not chunk:
@@ -423,7 +508,7 @@ class Transfers:
 
 class Mirror:
     def __init__(self, root, upstream: str, upstream_token: str = "", mirror_token: str = "",
-                 max_bytes: int = 500 << 30, revalidate_s: float = 3600, prefix: str = "/hf"):
+                 max_bytes: int = 500 << 30, revalidate_s: float = 3600, prefix: str = "/hf", admin_token: str = ""):
         self.root = Path(root)
         # models/ belongs to the portal (task 2-14): the mirror only serves models/local/ and never evicts there
         self.local_dir = self.root / "models" / LOCAL_OWNER
@@ -437,6 +522,7 @@ class Mirror:
         self.upstream = Upstream(upstream, upstream_token)
         self.upstream_base = self.upstream.base
         self.mirror_token = mirror_token
+        self.admin_token = admin_token or mirror_token
         self.max_bytes = max_bytes
         self.revalidate_s = revalidate_s
         self.prefix = "/" + prefix.strip("/") if prefix.strip("/") else ""
@@ -444,6 +530,12 @@ class Mirror:
         self.downloads: dict[tuple[str, str], Download] = {}
         self.readers: dict[Path, int] = {}
         self.transfers = Transfers()
+        self.prefetch = Prefetcher(self)
+        self.prefetch.start()  # the jobs a restart interrupted continue
+
+    def stop(self) -> None:
+        """Stops the background work (prefetch); the jobs stay in the list and continue at the next start."""
+        self.prefetch.stop()
 
     # ---- paths and state ----------------------------------------------------------
 
@@ -619,10 +711,44 @@ class Mirror:
                 job.start()
             return job
 
+    def join(self, job: Download, delta: int) -> None:
+        """A node request starts (+1) or stops (-1) waiting for `job`: a prefetch does not cancel a download somebody awaits."""
+        with self.lock:
+            job.nodes += delta
+
     def download_finished(self, job: Download) -> None:
         with self.lock:
             if self.downloads.get((job.repo, job.path)) is job:
                 del self.downloads[(job.repo, job.path)]
+
+    def should_check(self, state: dict, revision: str) -> bool:
+        """Time to compare with Hugging Face: once per revalidate_s, and at once for a request pinned to a commit
+        other than the one the file came from, or from an unknown one (the cache is keyed by path, not by revision)."""
+        if _COMMIT.fullmatch(revision) and state.get("commit") != revision:
+            return True
+        return time.time() - float(state.get("checked") or 0) >= self.revalidate_s
+
+    def revalidate(self, repo: str, revision: str, path: str, state: dict) -> dict:
+        """Compares the cached file with Hugging Face; marks it stale when its etag changed. Without an answer the file
+        is kept and the next check waits revalidate_s again (no HEAD per request while Hugging Face is down)."""
+        quoted = urllib.parse.quote(revision, safe="")
+        try:
+            resp, status, meta = self.upstream.open("HEAD", f"/{repo}/resolve/{quoted}/{urllib.parse.quote(path)}")
+            resp.close()
+        except UpstreamUnavailable:
+            status, meta = 0, {}
+        if status != 200:
+            self.touch(repo, path, checked=time.time())
+            return state
+        info = _file_meta(meta, status)
+        if info["etag"] and state.get("etag") and info["etag"] != state["etag"]:
+            log(f"{repo}/{path} changed upstream ({state['etag']} -> {info['etag']}), downloading again")
+            return {**state, "stale": True}
+        changes = {"checked": time.time()}
+        if _COMMIT.fullmatch(revision):
+            changes["commit"] = info["commit"] or revision  # the same content at this commit: no check next time
+        self.touch(repo, path, **changes)
+        return {**state, **changes}
 
     def report(self) -> dict:
         with self.lock:
@@ -630,6 +756,118 @@ class Mirror:
                 {"repo": j.repo, "path": j.path, "written": j.written, "size": j.size} for j in self.downloads.values()
             ]
         return {"clients": self.transfers.report(), "downloads": downloads, "limit_bytes": self.max_bytes}
+
+    # ---- the admin view of cache/ (task 2-29) --------------------------------------------
+
+    def _abandoned_parts(self) -> list[tuple[str, str, Path, dict]]:
+        """(repo, path, .part, saved meta) of the parts no download works on right now."""
+        busy = {j.part.stem for j in self.downloads.values() if j.active}
+        out = []
+        for meta in sorted(self.parts_dir.glob("*.json")):
+            saved = _read_json(meta) or {}
+            part = meta.with_suffix(".part")
+            if meta.stem in busy or not part.exists() or not saved.get("repo") or not saved.get("path"):
+                continue
+            out.append((saved["repo"], saved["path"], part, saved))
+        return out
+
+    def cache_listing(self) -> dict:
+        """Every file of cache/ with its state, the downloads in progress and the parts left by dead ones, and the
+        totals of the size limit and of the volume."""
+        with self.lock:
+            used = self._entries()[0]
+            active = {(j.repo, j.path): j for j in self.downloads.values() if j.active}
+            files: dict[tuple[str, str], dict] = {}
+            for dirpath, _, names in os.walk(self.cache_dir):
+                for name in names:
+                    f = Path(dirpath) / name
+                    rel = f.relative_to(self.cache_dir).as_posix().split("/", 2)
+                    if len(rel) < 3:
+                        continue
+                    repo, path = "/".join(rel[:2]), rel[2]
+                    try:
+                        st = f.stat()
+                    except OSError:
+                        continue
+                    state = self.read_state(repo, path) or {}
+                    files[(repo, path)] = {
+                        "repo": repo, "path": path, "revision": state.get("commit"), "size": st.st_size,
+                        "total": st.st_size, "mtime": st.st_mtime,
+                        "last_served": float(state.get("accessed") or st.st_mtime),
+                        "downloading": (repo, path) in active, "partial": False, "busy": f in self.readers,
+                    }
+            for (repo, path), job in active.items():
+                entry = files.get((repo, path))
+                if entry is not None:  # a changed file downloaded again: the old copy is still served
+                    entry["written"] = job.written
+                    continue
+                files[(repo, path)] = {
+                    "repo": repo, "path": path, "revision": job.commit, "size": job.written, "total": job.size,
+                    "mtime": None, "last_served": None, "downloading": True, "partial": True,
+                    "busy": job.final in self.readers, "written": job.written,
+                }
+            for repo, path, part, saved in self._abandoned_parts():
+                if (repo, path) in files:
+                    continue
+                try:
+                    st = part.stat()
+                except OSError:
+                    continue
+                files[(repo, path)] = {
+                    "repo": repo, "path": path, "revision": saved.get("commit"), "size": st.st_size,
+                    "total": saved.get("size"), "mtime": st.st_mtime, "last_served": None, "downloading": False,
+                    "partial": True, "busy": False,
+                }
+        disk = shutil.disk_usage(self.root)
+        return {
+            "files": [files[k] for k in sorted(files)],
+            "used_bytes": used,
+            "limit_bytes": self.max_bytes,
+            "disk_total_bytes": disk.total,
+            "disk_free_bytes": disk.free,
+            "disk_reserve_bytes": disk_reserve(disk.total),
+        }
+
+    def delete_cache(self, repo: str, path: str | None = None) -> dict:
+        """Deletes one file of cache/ (with its state and a part left for it) or the whole repository. Nothing is deleted
+        while one of the files is served or downloaded (409); a missing one is 404."""
+        check_repo(repo)
+        if path is not None:
+            check_path(path)
+        with self.lock:
+            targets: dict[str, int] = {}  # path -> bytes freed
+            base = self.cache_dir / repo
+            if path is None:
+                for dirpath, _, names in os.walk(base):
+                    for name in names:
+                        f = Path(dirpath) / name
+                        targets[f.relative_to(base).as_posix()] = f.stat().st_size
+            elif (base / path).is_file():
+                targets[path] = (base / path).stat().st_size
+            parts = [(p, part) for r, p, part, _ in self._abandoned_parts() if r == repo and (path is None or p == path)]
+            for p, part in parts:
+                targets[p] = targets.get(p, 0) + part.stat().st_size
+            downloading = {p for (r, p), j in self.downloads.items() if r == repo and j.active and (path is None or p == path)}
+            for p in sorted(downloading | {p for p in targets if base / p in self.readers}):
+                raise HttpError(409, f"{MSG_BUSY}: {repo}/{p}")
+            if not targets:
+                raise HttpError(404, "В кэше нет такого файла" if path else "В кэше нет такого репозитория")
+            for p in targets:
+                for f in (base / p, self._state_path(repo, p)):
+                    f.unlink(missing_ok=True)
+            for _, part in parts:
+                part.unlink(missing_ok=True)
+                part.with_suffix(".json").unlink(missing_ok=True)
+            for root in (self.cache_dir, self.state_dir):  # directories nothing is left in
+                for dirpath, _, _ in os.walk(root / repo, topdown=False):
+                    if not os.listdir(dirpath):
+                        os.rmdir(dirpath)
+                owner = (root / repo).parent
+                if owner.is_dir() and not os.listdir(owner):
+                    owner.rmdir()
+        log(f"deleted {repo}{'/' + path if path else ''} from the cache ({len(targets)} files, {sum(targets.values())} bytes)")
+        return {"deleted": [{"repo": repo, "path": p, "size": n} for p, n in sorted(targets.items())],
+                "freed_bytes": sum(targets.values())}
 
     # ---- the metadata API cache ----------------------------------------------------
 
@@ -725,6 +963,265 @@ class Mirror:
         }
 
 
+# ---------------------------------------------------------------- prefetch (task 2-29)
+
+QUEUED, RUNNING, DONE, FAILED, CANCELLED = "queued", "running", "done", "failed", "cancelled"
+_FINISHED = (DONE, FAILED, CANCELLED)
+
+
+class PrefetchJob:
+    """One file to download into cache/ ahead of any node."""
+
+    PERSISTED = ("id", "repo", "revision", "path", "state", "size", "written", "speed_bps", "error", "cached", "created",
+                 "started", "finished")
+
+    def __init__(self, repo: str, revision: str, path: str, **kw):
+        self.id = kw.get("id") or uuid.uuid4().hex[:12]
+        self.repo, self.revision, self.path = repo, revision, path
+        self.state = kw.get("state") or QUEUED
+        self.size: int | None = kw.get("size")
+        self.written: int = kw.get("written") or 0
+        self.speed_bps: float = kw.get("speed_bps") or 0.0
+        self.error: str | None = kw.get("error")
+        self.cached: bool = bool(kw.get("cached"))  # already in the cache (or put by hand): nothing was downloaded
+        self.created: float = kw.get("created") or time.time()
+        self.started: float | None = kw.get("started")
+        self.finished: float | None = kw.get("finished")
+        self.cancel_requested = threading.Event()
+        self.settled = threading.Event()  # set once the job left running
+        self.download: Download | None = None
+        if self.state in _FINISHED:
+            self.settled.set()
+
+    def view(self) -> dict:
+        return {k: getattr(self, k) for k in self.PERSISTED}
+
+
+class Prefetcher:
+    """Downloads files into cache/ in the background through Mirror.download, the path a node's request takes, so the
+    file lands as a node's request would leave it (state, LRU, one download per file shared with the nodes). At most
+    `concurrency` run at once. The list is kept in .mirror/prefetch.json: queued and running jobs continue after a restart
+    (the part of a running one is resumed with Range)."""
+
+    def __init__(self, mirror: Mirror, concurrency: int = PREFETCH_CONCURRENCY):
+        self.mirror = mirror
+        self.concurrency = max(1, concurrency)
+        self.file = mirror.root / ".mirror" / "prefetch.json"
+        self.lock = threading.RLock()
+        self.jobs: list[PrefetchJob] = []
+        self.workers: list[threading.Thread] = []
+        self.stopping = False
+        self._load()
+
+    # ---- persistence --------------------------------------------------------------------
+
+    def _load(self) -> None:
+        data = _read_json(self.file) or {}
+        for raw in data.get("jobs") or []:
+            try:
+                fields = {k: raw[k] for k in PrefetchJob.PERSISTED if k in raw and k not in ("repo", "revision", "path")}
+                job = PrefetchJob(check_repo(raw["repo"]), check_revision(raw["revision"]), check_path(raw["path"]), **fields)
+            except (KeyError, TypeError, HttpError):
+                continue
+            if job.state == RUNNING:  # the mirror died under it: starts again, from the part
+                job.state, job.started = QUEUED, None
+            if job.state in (QUEUED, *_FINISHED):
+                self.jobs.append(job)
+
+    def _save(self) -> None:
+        try:
+            _write_json(self.file, {"jobs": [j.view() for j in self.jobs]})
+        except OSError as e:
+            log(f"prefetch list not saved: {e!r}")
+
+    # ---- the API ------------------------------------------------------------------------
+
+    def start(self) -> None:
+        with self.lock:
+            self._spawn()
+
+    def add(self, repo: str, revision: str, files: list[str]) -> list[PrefetchJob]:
+        """Queues `files` of `repo`; a file that is queued or running already gives its job back."""
+        check_repo(repo)
+        if is_local(repo):
+            raise HttpError(400, "Свои модели (local/…) лежат на главном и в кэш не качаются")
+        check_revision(revision)
+        paths = [check_path(p) for p in files]
+        with self.lock:
+            out = []
+            for path in dict.fromkeys(paths):
+                job = next((j for j in self.jobs if j.repo == repo and j.path == path and j.state in (QUEUED, RUNNING)), None)
+                if job is None:
+                    self.jobs = [j for j in self.jobs if not (j.repo == repo and j.path == path)]  # an old result
+                    job = PrefetchJob(repo, revision, path)
+                    self.jobs.append(job)
+                out.append(job)
+            self._trim()
+            self._save()
+            self._spawn()
+            return out
+
+    def listing(self) -> dict:
+        with self.lock:
+            return {"jobs": [j.view() for j in self.jobs], "concurrency": self.concurrency}
+
+    def cancel(self, job_id: str) -> PrefetchJob:
+        """Stops a queued or running job (the part of a running one stays, resumable); removes a finished one."""
+        with self.lock:
+            job = next((j for j in self.jobs if j.id == job_id), None)
+            if job is None:
+                raise HttpError(404, "Нет такого задания")
+            if job.state in _FINISHED:
+                self.jobs.remove(job)
+                self._save()
+                return job
+            if job.state == QUEUED:
+                self._settle(job, CANCELLED, MSG_CANCELLED)
+                return job
+            job.cancel_requested.set()
+            download = job.download
+        if download is not None:
+            with download.cond:
+                download.cond.notify_all()
+        job.settled.wait(10)
+        return job
+
+    def clear(self) -> int:
+        """Removes the finished jobs from the list."""
+        with self.lock:
+            kept = [j for j in self.jobs if j.state not in _FINISHED]
+            removed = len(self.jobs) - len(kept)
+            self.jobs = kept
+            self._save()
+            return removed
+
+    def stop(self) -> None:
+        with self.lock:
+            self.stopping = True
+            running = [j.download for j in self.jobs if j.state == RUNNING and j.download is not None]
+            workers = list(self.workers)
+        for download in running:
+            with download.cond:
+                download.cond.notify_all()
+        for t in workers:
+            t.join(10)
+
+    # ---- workers ------------------------------------------------------------------------
+
+    def _trim(self) -> None:
+        finished = sorted((j for j in self.jobs if j.state in _FINISHED), key=lambda j: j.finished or 0)
+        for job in finished[: max(0, len(finished) - PREFETCH_HISTORY)]:
+            self.jobs.remove(job)
+
+    def _spawn(self) -> None:
+        self.workers = [t for t in self.workers if t.is_alive()]
+        queued = sum(1 for j in self.jobs if j.state == QUEUED)
+        while not self.stopping and len(self.workers) < min(self.concurrency, queued):
+            t = threading.Thread(target=self._work, name="prefetch", daemon=True)
+            self.workers.append(t)
+            t.start()
+
+    def _next(self) -> PrefetchJob | None:
+        with self.lock:
+            job = next((j for j in self.jobs if j.state == QUEUED), None)
+            if job is None or self.stopping:
+                self.workers = [t for t in self.workers if t is not threading.current_thread()]
+                return None
+            job.state, job.started, job.error = RUNNING, time.time(), None
+            job.written, job.speed_bps = 0, 0.0
+            job.cancel_requested.clear()
+            job.settled.clear()
+            self._save()
+            return job
+
+    def _work(self) -> None:
+        while (job := self._next()) is not None:
+            try:
+                self._run(job)
+            except Exception as e:  # noqa: BLE001 - one bad job must not stop the worker
+                log(f"prefetch of {job.repo}/{job.path} failed: {e!r}")
+                self._settle(job, FAILED, f"ошибка зеркала: {e}")
+
+    def _settle(self, job: PrefetchJob, state: str, error: str | None = None) -> None:
+        with self.lock:
+            if job.state in _FINISHED:
+                return
+            job.state, job.error, job.finished = state, error, time.time()
+            if state == DONE and not job.cached and job.started and job.size:
+                job.speed_bps = job.size / max(job.finished - job.started, 1e-3)
+            else:
+                job.speed_bps = 0.0
+            self._trim()
+            self._save()
+        job.settled.set()
+
+    def _requeue(self, job: PrefetchJob) -> None:
+        """The mirror is stopping: the job waits for the next start."""
+        with self.lock:
+            job.state, job.started = QUEUED, None
+            self._save()
+        job.settled.set()
+
+    def _run(self, job: PrefetchJob) -> None:
+        mirror = self.mirror
+        found = mirror.find(job.repo, job.path)
+        if found is not None:  # already here: put by hand, or downloaded earlier (and still the same upstream)
+            f, by_hand = found
+            state = None if by_hand else mirror.read_state(job.repo, job.path)
+            if state is not None and mirror.should_check(state, job.revision):
+                state = mirror.revalidate(job.repo, job.revision, job.path, state)
+            if state is None or not state.get("stale"):
+                try:
+                    size = f.stat().st_size
+                except OSError:  # deleted by the admin just now: download it again
+                    size = None
+                if size is not None:
+                    if state is not None:
+                        mirror.touch(job.repo, job.path, accessed=time.time())  # asked for: keep it longer
+                    job.size = job.written = size
+                    job.cached = True
+                    return self._settle(job, DONE)
+        download = mirror.download(job.repo, job.path, job.revision)
+        job.download = download
+        # the cache is keyed by path: a download that was already running for another revision (a pin against main) is not
+        # this job's file; wait for it to end and look again, the check against the pinned commit then downloads what is needed
+        foreign = download.revision != job.revision and (_COMMIT.fullmatch(job.revision) or _COMMIT.fullmatch(download.revision))
+        last_at, last_bytes = time.monotonic(), download.written
+        while True:
+            with download.cond:
+                if not (download.done or download.error is not None or job.cancel_requested.is_set() or self.stopping):
+                    download.cond.wait(timeout=0.25)  # a chunk, a cancel or the mirror stopping wakes it earlier
+                written, size, done, error = download.written, download.size, download.done, download.error
+            job.size, job.written = size, written
+            now = time.monotonic()
+            if now - last_at >= 0.5:
+                rate = (written - last_bytes) / (now - last_at)
+                job.speed_bps = rate if job.speed_bps == 0 else 0.6 * job.speed_bps + 0.4 * rate
+                last_at, last_bytes = now, written
+            if done and foreign:
+                job.download = None
+                return self._run(job)
+            if done:
+                job.size = job.written = size or written
+                return self._settle(job, DONE)
+            if error is not None and foreign and not job.cancel_requested.is_set():
+                job.download = None
+                return self._run(job)
+            if error is not None:
+                return self._settle(job, CANCELLED if job.cancel_requested.is_set() else FAILED, error.message)
+            if job.cancel_requested.is_set() or self.stopping:
+                self._detach(download)
+                if job.cancel_requested.is_set():
+                    return self._settle(job, CANCELLED, MSG_CANCELLED)
+                return self._requeue(job)
+
+    def _detach(self, download: Download) -> None:
+        """Stops the download unless a node reads it (then it goes on for the node and only this job lets go)."""
+        with self.mirror.lock:
+            if self.mirror.readers.get(download.final, 0) == 0 and download.nodes == 0:
+                download.cancel()
+
+
 # ---------------------------------------------------------------- HTTP front end
 
 
@@ -746,10 +1243,17 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         self._dispatch(head=False)
 
+    def do_POST(self):
+        self._dispatch(head=False)
+
+    def do_DELETE(self):
+        self._dispatch(head=False)
+
     # ---- plumbing ------------------------------------------------------------------
 
     def _dispatch(self, head: bool) -> None:
         self.responded = False
+        self.body_read = False
         try:
             self._route(head)
         except (BrokenPipeError, ConnectionResetError, socket.timeout):
@@ -766,6 +1270,25 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(status, {"error": message}, head)
             except OSError:
                 self.close_connection = True
+        finally:
+            self._drain_body()
+
+    def _drain_body(self) -> None:
+        """Reads the body of a refused request: unread bytes would be taken for the next request, and closing a socket
+        with unread input resets it, which can cost the client the answer."""
+        if self.body_read:
+            return
+        length = self.headers.get("Content-Length") or "0"
+        if self.headers.get("Transfer-Encoding") or not length.isdigit() or int(length) > ADMIN_BODY_MAX:
+            self.close_connection = True
+            return
+        try:
+            self.connection.settimeout(10)
+            self.rfile.read(int(length))
+            self.connection.settimeout(None)
+            self.body_read = True
+        except OSError:
+            self.close_connection = True
 
     def _send_json(self, status: int, obj, head: bool, extra: dict | None = None) -> None:
         body = json.dumps(obj).encode()
@@ -778,12 +1301,31 @@ class Handler(BaseHTTPRequestHandler):
         if not head:
             self.wfile.write(body)
 
-    def _authorized(self) -> bool:
-        token = self.mirror.mirror_token
-        if not token:
-            return True
+    def _authorize(self) -> None:
+        """Sets self.scope: None for the admin key (or a mirror without keys), else the repositories of a scoped token
+        signed with HF_MIRROR_TOKEN; 401 for anything else."""
+        self.scope = None
+        admin, signing = self.mirror.admin_token, self.mirror.mirror_token
+        if not admin and not signing:
+            return
         got = self.headers.get("Authorization", "")
-        return hmac.compare_digest(got.encode(), f"Bearer {token}".encode())
+        if admin and hmac.compare_digest(got.encode(), f"Bearer {admin}".encode()):
+            return
+        scoped = scoped_token(signing, got[7:]) if got.startswith("Bearer ") else None
+        if scoped is None:
+            raise HttpError(401, "Invalid credentials in Authorization header")
+        client, self.scope = scoped
+        # a token minted for one node (standalone heartbeat) works only under that node's /c/<name> prefix
+        if client != "*" and self.client_prefix != f"/c/{client}":
+            raise HttpError(403, f"Токен зеркала выдан ноде {client}: запрос должен идти от её имени (/c/{client}/...)")
+
+    def _need_repo(self, repo: str) -> None:
+        if self.scope is not None and repo not in self.scope:
+            raise HttpError(403, f"Токен зеркала не открывает репозиторий {repo}: его выдаёт портал для моделей развёртываний ноды")
+
+    def _need_full(self) -> None:
+        if self.scope is not None:
+            raise HttpError(403, "Нужен ключ портала к зеркалу (HF_MIRROR_ADMIN_TOKEN), а не токен ноды")
 
     def _route(self, head: bool) -> None:
         split = urllib.parse.urlsplit(self.path)
@@ -798,19 +1340,80 @@ class Handler(BaseHTTPRequestHandler):
         self.client_prefix = f"/c/{client}" if client else ""
         if raw == "/_mirror/health":
             return self._send_json(200, {"status": "ok"}, head)
-        if not self._authorized():
-            raise HttpError(401, "Invalid credentials in Authorization header")
+        self._authorize()
         if raw == "/_mirror/transfers":
+            self._need_full()
             return self._send_json(200, self.mirror.report(), head)
+        if re.fullmatch(r"/admin/(cache|prefetch)(/.*)?", raw) and (self.command in ("POST", "DELETE") or raw in _ADMIN_GET):
+            self._need_full()
+            return self._admin(raw, head)
+        if self.command not in ("GET", "HEAD"):
+            raise HttpError(405, "method not allowed")
         if raw.startswith("/api/"):
+            m_api = re.match(r"/api/models/([^/]+)/([^/]+)", raw)
+            if self.scope is not None:
+                if not m_api:
+                    raise HttpError(403, "Токен ноды открывает только метаданные своих репозиториев")
+                self._need_repo(check_repo(urllib.parse.unquote(m_api.group(1)) + "/" + urllib.parse.unquote(m_api.group(2))))
             return self._api(raw, split.query, head)
         segments = raw.split("/")
         # ['', owner, repo, 'resolve', revision, path...]
         if len(segments) >= 6 and segments[3] == "resolve":
             repo = check_repo(urllib.parse.unquote(segments[1]) + "/" + urllib.parse.unquote(segments[2]))
+            self._need_repo(repo)
             revision = urllib.parse.unquote(segments[4])
             path = check_path(urllib.parse.unquote("/".join(segments[5:])))
             return self._file(repo, revision, path, head)
+        raise HttpError(404, "not found")
+
+    # ---- admin API of the portal (task 2-29) ----------------------------------------------
+
+    def _json_body(self) -> dict:
+        length = self.headers.get("Content-Length") or ""
+        if not length.isdigit():
+            raise HttpError(411, "Content-Length is required")
+        if int(length) > ADMIN_BODY_MAX:
+            raise HttpError(413, "request body too large")
+        data = self.rfile.read(int(length))
+        self.body_read = True
+        try:
+            body = json.loads(data)
+        except ValueError as e:
+            raise HttpError(400, "the body is not JSON") from e
+        if not isinstance(body, dict):
+            raise HttpError(400, "the body is not a JSON object")
+        return body
+
+    def _admin(self, raw: str, head: bool) -> None:
+        # the portal on main connects to 127.0.0.1; whatever came through Caddy (the nodes have the mirror key too)
+        # carries X-Forwarded-* and is refused
+        if self.client_prefix or any(self.headers.get(h) for h in _PROXY_HEADERS):
+            raise HttpError(403, "Админский API зеркала доступен только изнутри главного, не через Caddy")
+        mirror, method = self.mirror, self.command
+        parts = [urllib.parse.unquote(p) for p in raw.split("/")[2:]]
+        if parts[0] == "cache":
+            if method in ("GET", "HEAD") and len(parts) == 1:
+                return self._send_json(200, mirror.cache_listing(), head)
+            if method == "DELETE" and len(parts) >= 3:
+                repo = check_repo(parts[1] + "/" + parts[2])
+                return self._send_json(200, mirror.delete_cache(repo, "/".join(parts[3:]) or None), head)
+        elif method in ("GET", "HEAD") and len(parts) == 1:
+            return self._send_json(200, mirror.prefetch.listing(), head)
+        elif method == "POST" and len(parts) == 1:
+            body = self._json_body()
+            repo, revision, files = body.get("repo"), body.get("revision") or "main", body.get("files")
+            if not isinstance(repo, str) or not isinstance(revision, str):
+                raise HttpError(400, "repo and revision are strings")
+            if not isinstance(files, list) or not files or not all(isinstance(f, str) for f in files):
+                raise HttpError(400, "files is a non-empty list of paths")
+            if len(files) > PREFETCH_MAX_FILES:
+                raise HttpError(400, f"at most {PREFETCH_MAX_FILES} files in one request")
+            jobs = mirror.prefetch.add(repo, revision, files)
+            return self._send_json(202, {"jobs": [j.view() for j in jobs]}, head)
+        elif method == "DELETE" and len(parts) == 1:
+            return self._send_json(200, {"removed": mirror.prefetch.clear()}, head)
+        elif method == "DELETE" and len(parts) == 2 and _JOB_ID.fullmatch(parts[1]):
+            return self._send_json(200, mirror.prefetch.cancel(parts[1]).view(), head)
         raise HttpError(404, "not found")
 
     # ---- metadata API --------------------------------------------------------------
@@ -896,8 +1499,8 @@ class Handler(BaseHTTPRequestHandler):
         if found is not None:
             f, by_hand = found
             state = None if by_hand else mirror.read_state(repo, path)
-            if state is not None and self._should_check(state, revision):
-                state = self._revalidate(repo, revision, path, state)
+            if state is not None and mirror.should_check(state, revision):
+                state = mirror.revalidate(repo, revision, path, state)
             if state is not None and state.get("stale"):
                 job = mirror.download(repo, path, revision)
             else:
@@ -912,37 +1515,12 @@ class Handler(BaseHTTPRequestHandler):
             return self._range_upstream(repo, revision, path)
         if job is None:
             job = mirror.download(repo, path, revision)
-        job.wait_ready()
-        self._serve_download(job)
-
-    def _should_check(self, state: dict, revision: str) -> bool:
-        """Time to compare with Hugging Face: once per revalidate_s, and at once for a request pinned to a commit
-        other than the one the file came from, or from an unknown one (the cache is keyed by path, not by revision)."""
-        if _COMMIT.fullmatch(revision) and state.get("commit") != revision:
-            return True
-        return time.time() - float(state.get("checked") or 0) >= self.mirror.revalidate_s
-
-    def _revalidate(self, repo: str, revision: str, path: str, state: dict) -> dict:
-        """Compares the cached file with Hugging Face; marks it stale when its etag changed. Without an answer the file
-        is kept and the next check waits revalidate_s again (no HEAD per request while Hugging Face is down)."""
-        quoted = urllib.parse.quote(revision, safe="")
+        mirror.join(job, 1)
         try:
-            resp, status, meta = self.mirror.upstream.open("HEAD", f"/{repo}/resolve/{quoted}/{urllib.parse.quote(path)}")
-            resp.close()
-        except UpstreamUnavailable:
-            status, meta = 0, {}
-        if status != 200:
-            self.mirror.touch(repo, path, checked=time.time())
-            return state
-        info = _file_meta(meta, status)
-        if info["etag"] and state.get("etag") and info["etag"] != state["etag"]:
-            log(f"{repo}/{path} changed upstream ({state['etag']} -> {info['etag']}), downloading again")
-            return {**state, "stale": True}
-        changes = {"checked": time.time()}
-        if _COMMIT.fullmatch(revision):
-            changes["commit"] = info["commit"] or revision  # the same content at this commit: no check next time
-        self.mirror.touch(repo, path, **changes)
-        return {**state, **changes}
+            job.wait_ready()
+            self._serve_download(job)
+        finally:
+            mirror.join(job, -1)
 
     def _range_upstream(self, repo: str, revision: str, path: str) -> None:
         """The file (or the requested range of it) straight from Hugging Face, not cached."""
@@ -1127,10 +1705,16 @@ def make_server(mirror: Mirror, host: str, port: int) -> ThreadingHTTPServer:
     return server
 
 
+def max_gib_setting(env) -> float:
+    """The cache limit in GiB: HF_MIRROR_MAX_GIB_OVERRIDE (the value from the portal panel, from a ConfigMap; empty or
+    absent when none was set) wins over HF_MIRROR_MAX_GIB of the .env."""
+    return float(env.get("HF_MIRROR_MAX_GIB_OVERRIDE") or env.get("HF_MIRROR_MAX_GIB", "500"))
+
+
 def main() -> int:
     env = os.environ
     try:
-        max_gib = float(env.get("HF_MIRROR_MAX_GIB", "500"))
+        max_gib = max_gib_setting(env)
         port = int(env.get("HF_MIRROR_PORT", "8090"))
         revalidate_s = float(env.get("HF_MIRROR_REVALIDATE_S", "3600"))
     except ValueError as e:
@@ -1141,6 +1725,7 @@ def main() -> int:
         upstream=env.get("HF_MIRROR_UPSTREAM", "https://huggingface.co"),
         upstream_token=env.get("HF_TOKEN", ""),
         mirror_token=env.get("HF_MIRROR_TOKEN", ""),
+        admin_token=env.get("HF_MIRROR_ADMIN_TOKEN", ""),
         max_bytes=int(max_gib * (1 << 30)),
         revalidate_s=revalidate_s,
         prefix=env.get("HF_MIRROR_PREFIX", "/hf"),

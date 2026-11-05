@@ -9,10 +9,11 @@
 #   без параметров  проверяет хост, спрашивает недостающее, показывает сводку и после подтверждения пишет .env,
 #                   открывает порты в брандмауэре, готовит образ, запускает run-main.sh и ждёт /readyz
 #   --yes           без вопросов: значения из --answers, сохранённых ответов, .env и значений по умолчанию
-#   --answers FILE  файл ответов KEY=VALUE: PUBLIC_HOSTNAME, MAIN_ADVERTISE_IP, OIDC_CLIENT_SECRET, ADMIN_EMAILS,
+#   --answers FILE  файл ответов KEY=VALUE: PUBLIC_HOSTNAME, MAIN_ADVERTISE_IP, OIDC_ISSUER, OIDC_CLIENT_ID, OIDC_CLIENT_SECRET, ADMIN_EMAILS,
 #                   TRUSTED_PROXIES (адреса фронт-прокси через запятую, можно пусто), CERT_MODE=internal|own,
-#                   CERTS_DIR, AIRGAP=yes|no, FIREWALL=yes|no, IMAGE_SOURCE=pull|build|load|keep,
-#                   IMAGE_TAR, GHCR_OWNER, IMAGE_REF, NODE_IMAGE_SOURCE, GHCR_TOKEN_FILE, INSTALL_DOCKER=yes|no;
+#                   CERTS_DIR, AIRGAP=yes|no, FIREWALL=yes|no, HAIRPIN_RULE=yes|no, IMAGE_SOURCE=pull|build|load|keep,
+#                   IMAGE_TAR, NODE_IMAGE_TAR_CPU, NODE_IMAGE_TAR_GPU, GHCR_OWNER, IMAGE_REF, NODE_IMAGE_SOURCE, GHCR_TOKEN_FILE,
+#                   INSTALL_DOCKER=yes|no;
 #                   остальные KEY=VALUE записываются в .env как есть
 #   --env-file      переменные главного для контейнера, по умолчанию .env в корне репозитория (права 600)
 #   --config        ответы установщика для повторного запуска, по умолчанию install-main.env рядом с --env-file
@@ -26,7 +27,17 @@
 # IMAGE_SOURCE=pull: образ главного берётся с ghcr.io (публичный, без токена): ghcr.io/$GHCR_OWNER/nsu-llm-main:<версия этого
 # чекаута> (другой адрес: IMAGE_REF), а образы нод nsu-llm-node:<версия>-cpu и -gpu (адрес: NODE_IMAGE_SOURCE, по умолчанию
 # ghcr.io/$GHCR_OWNER/nsu-llm-node) кладутся в реестр главного. Токен нужен только для закрытого зеркала: GHCR_TOKEN_FILE
-# (права 0600). GHCR_OWNER берётся из ответов или из переменной окружения. Без доступа к ghcr.io: IMAGE_SOURCE=load.
+# (права 0600). GHCR_OWNER: из ответов или переменной окружения, по умолчанию denmurzik (ghcr.io/denmurzik/nsu-llm-main). Без доступа к ghcr.io: IMAGE_SOURCE=load.
+# IMAGE_SOURCE=load: образы нод кладутся в реестр главного из архивов NODE_IMAGE_TAR_CPU и NODE_IMAGE_TAR_GPU (docker save, можно
+# .tar.gz; по умолчанию nsu-llm-node-<версия>-cpu.tar.gz и -gpu.tar.gz рядом с IMAGE_TAR, если они есть).
+# Код выхода 3: главный запущен, но контейнер не достаёт до MAIN_ADVERTISE_IP:6443 (нет hairpin: логи и exec подов на других
+# машинах не работают); итог и команда исправления напечатаны в конце. При активном ufw или firewalld и FIREWALL=no правило для
+# подсети Docker на 6443/tcp добавляется само (HAIRPIN_RULE=no отключает).
+#
+# Вход пользователей идёт через OIDC-провайдера, которого выбирает оператор: значений по умолчанию для PUBLIC_HOSTNAME, OIDC_ISSUER,
+# OIDC_CLIENT_ID и OIDC_CLIENT_SECRET нет. С --yes без любого из них установщик останавливается и называет недостающие ключи; мастер
+# спрашивает их и показывает redirect URI (https://<PUBLIC_HOSTNAME>/auth/callback или OIDC_REDIRECT_URI), который нужно
+# зарегистрировать у провайдера. NSU ID (OIDC_ISSUER=https://sso-ng.nsu.ru/auth/realms/NSU) один из примеров, не умолчание.
 #
 # Откуда берутся значения (по возрастанию приоритета): значения по умолчанию, переменная окружения OIDC_CLIENT_SECRET (только
 # если секрета нет ни в .env, ни в файле ответов), .env, сохранённые ответы установщика, --answers FILE, --image-tar.
@@ -40,7 +51,7 @@ umask 077
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/.." && pwd)"
 RUN_MAIN="$HERE/run-main.sh"
-IMAGE="nsu-llm-main:0.1.0"
+IMAGE="nsu-llm-main:0.2.0"
 CONTAINER="llm-main"
 PORTS=(80 443 6443)
 MIN_RAM_GIB=4
@@ -50,13 +61,16 @@ POLL_S=5
 # Только для тестов: корень, от которого читаются /etc/os-release, /proc/meminfo и пишется /etc/apt.
 SYSROOT="${NSU_LLM_SYSROOT:-}"
 ENV_SECRET="${OIDC_CLIENT_SECRET:-}"
-INSTALLER_KEYS=" CERT_MODE CERTS_DIR AIRGAP FIREWALL IMAGE_SOURCE IMAGE_TAR GHCR_OWNER IMAGE_REF NODE_IMAGE_SOURCE GHCR_TOKEN_FILE PENDING_IMAGE_VERSION INSTALL_DOCKER "
+INSTALLER_KEYS=" CERT_MODE CERTS_DIR AIRGAP FIREWALL IMAGE_SOURCE IMAGE_TAR NODE_IMAGE_TAR_CPU NODE_IMAGE_TAR_GPU GHCR_OWNER IMAGE_REF NODE_IMAGE_SOURCE GHCR_TOKEN_FILE PENDING_IMAGE_VERSION INSTALL_DOCKER HAIRPIN_RULE HAIRPIN_SUBNET "
 ENV_OWNER="${GHCR_OWNER:-}"
 GHCR=ghcr.io
 DEFAULT_REGISTRY_PORT=5000
-ASKED_ENV_KEYS=(PUBLIC_HOSTNAME MAIN_ADVERTISE_IP OIDC_CLIENT_SECRET ADMIN_EMAILS TRUSTED_PROXIES)
+ASKED_ENV_KEYS=(PUBLIC_HOSTNAME MAIN_ADVERTISE_IP OIDC_ISSUER OIDC_CLIENT_ID LOGIN_PROVIDER_NAME OIDC_CLIENT_SECRET ADMIN_EMAILS ADMIN_REQUIRE_EMAIL_VERIFIED TRUSTED_PROXIES)
+DEFAULT_GHCR_OWNER=denmurzik
+# ключи без значения по умолчанию: оператор называет их сам (с --yes их проверяет require_yes_keys)
+REQUIRED_YES_KEYS=(PUBLIC_HOSTNAME OIDC_ISSUER OIDC_CLIENT_ID OIDC_CLIENT_SECRET ADMIN_EMAILS)
 # можно оставить пустыми; без .env спрашиваются, с .env (повторный запуск) отсутствие ключа значит «пусто»
-OPTIONAL_KEYS=" TRUSTED_PROXIES "
+OPTIONAL_KEYS=" TRUSTED_PROXIES NODE_IMAGE_TAR_CPU NODE_IMAGE_TAR_GPU "
 
 YES=0
 DRY=0
@@ -84,7 +98,7 @@ say() { printf '%s\n' "$*"; }
 ok() { say "  [ок] $*"; }
 warn() { say "  [!]  $*"; }
 die() { printf 'Ошибка: %s\n' "$*" >&2; exit 1; }
-usage() { sed -n '2,35p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,46p' "$0" | sed 's/^# \{0,1\}//'; }
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -190,15 +204,20 @@ normalize() { # normalize KEY VALUE
   local v="$2"
   case "$1" in
     ADMIN_EMAILS|TRUSTED_PROXIES) v="${v//[[:space:]]/}" ;;
-    AIRGAP|FIREWALL|INSTALL_DOCKER)
+    AIRGAP|FIREWALL|INSTALL_DOCKER|HAIRPIN_RULE)
       case "$v" in
         y|Y|yes|Yes|YES|д|Д|да|Да|ДА|true|1) v=yes ;;
         n|N|no|No|NO|н|Н|нет|Нет|НЕТ|false|0) v=no ;;
       esac ;;
+    ADMIN_REQUIRE_EMAIL_VERIFIED)
+      case "$v" in
+        y|Y|yes|Yes|YES|д|Д|да|Да|ДА|true|True|TRUE|1) v=true ;;
+        n|N|no|No|NO|н|Н|нет|Нет|НЕТ|false|False|FALSE|0) v=false ;;
+      esac ;;
     CERT_MODE) case "$v" in 1) v=internal ;; 2) v=own ;; esac ;;
     IMAGE_SOURCE) case "$v" in 1) v=pull ;; 2) v=build ;; 3) v=load ;; 4) v=keep ;; esac ;;
     CERTS_DIR) if [ -d "$v" ]; then v="$(cd "$v" && pwd)"; fi ;;
-    IMAGE_TAR|GHCR_TOKEN_FILE) if [ -f "$v" ]; then v="$(cd "$(dirname "$v")" && pwd)/$(basename "$v")"; fi ;;
+    IMAGE_TAR|NODE_IMAGE_TAR_CPU|NODE_IMAGE_TAR_GPU|GHCR_TOKEN_FILE) if [ -f "$v" ]; then v="$(cd "$(dirname "$v")" && pwd)/$(basename "$v")"; fi ;;
   esac
   printf '%s' "$v"
 }
@@ -217,8 +236,18 @@ validate() { # validate KEY VALUE: печатает причину и возвр
       else
         echo "нужен адрес IPv4 вида 10.0.0.5, получено: ${v:-пусто}"; return 1
       fi ;;
+    OIDC_ISSUER)
+      [[ "$v" == https://?* && "$v" != *[[:space:]\"\']* ]] \
+        || { echo "нужен адрес провайдера вида https://sso.example.org/realms/main (только https), получено: ${v:-пусто}"; return 1; } ;;
+    OIDC_CLIENT_ID)
+      [[ -n "$v" && "$v" != *[[:space:]\"\']* ]] \
+        || { echo "client id не может быть пустым и содержать пробелы и кавычки: его выдаёт провайдер при регистрации клиента"; return 1; } ;;
+    LOGIN_PROVIDER_NAME)
+      [[ -n "$v" && ${#v} -le 40 && "$v" != *[[:cntrl:]\"\']* ]] \
+        || { echo "название провайдера для кнопки входа: от 1 до 40 символов без кавычек (например SSO или NSU ID), получено: ${v:-пусто}"; return 1; } ;;
+    ADMIN_REQUIRE_EMAIL_VERIFIED) [[ "$v" =~ ^(true|false)$ ]] || { echo "ответьте «да» или «нет»"; return 1; } ;;
     OIDC_CLIENT_SECRET)
-      [ -n "$v" ] || { echo "секрет не может быть пустым: его выдаёт владелец клиента в Keycloak sso-ng.nsu.ru (Clients -> Credentials)"; return 1; }
+      [ -n "$v" ] || { echo "секрет не может быть пустым: его показывает провайдер при регистрации клиента (confidential client; в Keycloak: Clients -> Credentials)"; return 1; }
       [[ ! "$v" =~ [[:space:]\"\'] ]] || { echo "секрет не должен содержать пробелов и кавычек"; return 1; } ;;
     ADMIN_EMAILS)
       [ -n "$v" ] || { echo "нужен хотя бы один e-mail администратора"; return 1; }
@@ -249,7 +278,8 @@ validate() { # validate KEY VALUE: печатает причину и возвр
     CERTS_DIR)
       [ -d "$v" ] || { echo "каталог ${v:-(пусто)} не найден"; return 1; }
       for e in tls.crt tls.key; do [ -f "$v/$e" ] || { echo "в каталоге $v нет файла $e"; return 1; }; done ;;
-    AIRGAP|FIREWALL|INSTALL_DOCKER) [[ "$v" =~ ^(yes|no)$ ]] || { echo "ответьте «да» или «нет»"; return 1; } ;;
+    AIRGAP|FIREWALL|INSTALL_DOCKER|HAIRPIN_RULE) [[ "$v" =~ ^(yes|no)$ ]] || { echo "ответьте «да» или «нет»"; return 1; } ;;
+    HAIRPIN_SUBNET) [[ "$v" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}/[0-9]{1,2}$ ]] || { echo "нужна подсеть IPv4 вида 172.17.0.0/16, получено: ${v:-пусто}"; return 1; } ;;
     IMAGE_SOURCE) [[ "$v" =~ ^(pull|build|load|keep)$ ]] || { echo "ответьте pull (1), build (2), load (3) или keep (4)"; return 1; } ;;
     GHCR_OWNER) [[ "$v" =~ ^[a-z0-9]([a-z0-9-]{0,37}[a-z0-9])?$ ]] \
       || { echo "владелец образов на GitHub (имя пользователя или организации): строчные латинские буквы, цифры и дефис, получено: ${v:-пусто}"; return 1; } ;;
@@ -260,6 +290,7 @@ validate() { # validate KEY VALUE: печатает причину и возвр
       local perm; perm="$(stat -c %a "$v" 2>/dev/null || stat -f %Lp "$v" 2>/dev/null || echo 600)"
       [ "$perm" = 600 ] || [ "$perm" = 400 ] || { echo "права $v: $perm, токен должен читаться только владельцем: chmod 600 $v"; return 1; } ;;
     IMAGE_TAR) [ -f "$v" ] || { echo "файл ${v:-(пусто)} не найден"; return 1; } ;;
+    NODE_IMAGE_TAR_CPU|NODE_IMAGE_TAR_GPU) [ -z "$v" ] || [ -f "$v" ] || { echo "файл $v не найден"; return 1; } ;;
   esac
 }
 
@@ -267,7 +298,9 @@ need() { # need KEY ВОПРОС ПО_УМОЛЧАНИЮ [-s]: значение 
   local key="$1" prompt="$2" def="$3" secret="${4:-}" v err ans
   v="${ANS[$key]:-}"
   if [ -z "$v" ] && [[ "$OPTIONAL_KEYS" == *" $key "* ]] && { [ -n "${ANS[$key]+x}" ] || [ -f "$ENV_FILE" ] || [ "$YES" = 1 ]; }; then
-    ANS[$key]=""; SRC[$key]="${SRC[$key]:-по умолчанию}"; return
+    SRC[$key]="${SRC[$key]:-по умолчанию}"
+    if [ -z "$def" ] || [ -n "${ANS[$key]+x}" ]; then ANS[$key]=""; return; fi   # ключ с пустым значением в ответах: «не нужно»
+    v="$def"   # ключа нет, а умолчание есть: берётся оно (дальше проверяется как обычный ответ)
   fi
   if [ -n "$v" ]; then
     v="$(normalize "$key" "$v")"
@@ -289,6 +322,26 @@ need() { # need KEY ВОПРОС ПО_УМОЛЧАНИЮ [-s]: значение 
     if err="$(validate "$key" "$ans")"; then ANS[$key]="$ans"; SRC[$key]="ответ"; return; fi
     say "  $err"
   done
+}
+
+# С --yes недостающие ключи без умолчаний называются все сразу, до проверок хоста и до любых действий.
+require_yes_keys() {
+  local k missing=()
+  [ "$YES" = 1 ] || return 0
+  for k in "${REQUIRED_YES_KEYS[@]}"; do [ -n "${ANS[$k]:-}" ] || missing+=("$k"); done
+  [ "${#missing[@]}" = 0 ] && return 0
+  die "без вопросов (--yes) не заданы обязательные значения: $(IFS=,; echo "${missing[*]}" | sed "s/,/, /g"). Добавьте строки KEY=значение в файл ответов (--answers FILE) или в $ENV_FILE. Значений по умолчанию нет: установщик не подставляет ни домен, ни провайдера входа. Пример для NSU ID: OIDC_ISSUER=https://sso-ng.nsu.ru/auth/realms/NSU (README, «Без вопросов»)"
+}
+
+# redirect URI, который оператор регистрирует у провайдера (портал: /auth/callback на публичном имени, либо OIDC_REDIRECT_URI)
+redirect_uri() { printf '%s' "${ANS[OIDC_REDIRECT_URI]:-https://${ANS[PUBLIC_HOSTNAME]}/auth/callback}"; }
+logout_uri() { printf '%s' "${ANS[OIDC_POST_LOGOUT_REDIRECT_URI]:-https://${ANS[PUBLIC_HOSTNAME]}/}"; }
+show_redirect_uri() {
+  say ""
+  say "  Зарегистрируйте у OIDC-провайдера клиент (confidential, Authorization Code + PKCE S256) с адресами:"
+  say "    Valid redirect URI:           $(redirect_uri)"
+  say "    Valid post logout redirect:   $(logout_uri)"
+  say "  Client ID и секрет клиента нужны на следующих шагах (README, «OIDC-провайдер»)."
 }
 
 # ------------------------------------------------------------------ ОС
@@ -554,6 +607,64 @@ fw_apply() { # fw_apply open|close
   esac
 }
 
+# Подсеть bridge Docker, из которой контейнер главного ходит к хосту (run-main.sh не задаёт --network, значит, это сеть bridge);
+# если Docker её не назвал, вся область адресов Docker 172.16.0.0/12.
+docker_bridge_subnet() {
+  local s
+  s="$(docker network inspect bridge --format '{{range .IPAM.Config}}{{.Subnet}} {{end}}' 2>/dev/null </dev/null | tr ' ' '\n' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$' | head -n1 || true)"
+  printf '%s' "${s:-172.16.0.0/12}"
+}
+# Контейнер главного проверяет, достаёт ли он MAIN_ADVERTISE_IP:6443 (hairpin, main/api-advertise-ip.py). Этот адрес принадлежит хосту, поэтому
+# пакет идёт через цепочку INPUT, где ufw и firewalld закрывают всё, что не разрешено: без FIREWALL=yes (порт 6443 открыт всем) проверка не
+# проходит, API объявляется по адресу контейнера, и логи с exec подов на других машинах (туннели k3s) не работают. Узкое правило: подсеть Docker -> 6443/tcp.
+hairpin_rule_text() { # hairpin_rule_text TOOL SUBNET: команда правила как её набрать вручную
+  case "$1" in
+    ufw) printf "sudo ufw allow from %s to any port 6443 proto tcp comment 'NSU LLM main hairpin'" "$2" ;;
+    firewalld) printf "sudo firewall-cmd --permanent --add-rich-rule='rule family=\"ipv4\" source address=\"%s\" port port=\"6443\" protocol=\"tcp\" accept' && sudo firewall-cmd --reload" "$2" ;;
+  esac
+}
+hairpin_apply() { # hairpin_apply TOOL open|close SUBNET
+  local rule
+  case "$1" in
+    ufw)
+      if [ "$2" = open ]; then run ufw allow from "$3" to any port 6443 proto tcp comment "NSU LLM main hairpin"
+      else run ufw delete allow from "$3" to any port 6443 proto tcp || true; fi ;;
+    firewalld)
+      rule="rule family=\"ipv4\" source address=\"$3\" port port=\"6443\" protocol=\"tcp\" accept"
+      if [ "$2" = open ]; then run firewall-cmd --permanent "--add-rich-rule=$rule"; else run firewall-cmd --permanent "--remove-rich-rule=$rule" || true; fi
+      run firewall-cmd --reload ;;
+  esac
+}
+# Нужно ли правило: брандмауэр активен, порты в нём установщик не открывает (иначе 6443 и так открыт всем) и правило не отключено
+want_hairpin_rule() { [ -n "$FW_TOOL" ] && [ "${ANS[FIREWALL]:-no}" != yes ] && [ "${ANS[HAIRPIN_RULE]:-yes}" = yes ]; }
+
+# После запуска: если главный не достал свой LAN-адрес, он напечатал «нет hairpin». Установка тогда неполная: портал и ноды работают, логи и exec
+# подов на других машинах нет. Это громко сказано в конце, с точной командой, а код выхода 3 (при --yes и без него: автоматизация не должна
+# принимать такую установку за успешную; контейнер остаётся запущенным, откатывать нечего, после исправления установщик возвращает 0).
+DEGRADED=0
+check_hairpin() {
+  local line net ip="${ANS[MAIN_ADVERTISE_IP]}"
+  line="$(docker logs "$CONTAINER" 2>&1 </dev/null | grep 'нет hairpin' | head -n1 || true)"
+  [ -n "$line" ] || return 0
+  DEGRADED=1
+  net="${ANS[HAIRPIN_SUBNET]:-$(docker_bridge_subnet)}"
+  say ""
+  warn "главный запущен, но установка неполная: контейнер не достаёт до $ip:6443 (нет hairpin). Ноды присоединяются, а логи и exec подов на других машинах, в том числе логи в портале, работать не будут (502)."
+  say "       $line"
+  if [ -n "$FW_TOOL" ] && ! want_hairpin_rule && [ "${ANS[FIREWALL]:-no}" != yes ]; then
+    say "  Брандмауэр $FW_TOOL закрывает обращение контейнера к адресу самого хоста. Исправление (правило только для подсети Docker, только 6443/tcp):"
+    say "    $(hairpin_rule_text "$FW_TOOL" "$net")"
+  elif [ -n "$FW_TOOL" ]; then
+    say "  Правило для подсети Docker ($net) на 6443/tcp в $FW_TOOL уже есть или порт 6443 открыт всем, значит дело не в нём. Проверьте, что $ip принадлежит этому хосту (ip -4 addr),"
+    say "  что VPN или прокси не перехватывает адрес, и что на 6443 нет сторонних правил в iptables (iptables -S INPUT)."
+  else
+    say "  ufw и firewalld не активны: проверьте, что $ip принадлежит этому хосту (ip -4 addr), правила iptables для INPUT и что VPN или прокси не перехватывает адрес."
+  fi
+  say "  Адрес API выбирается при старте контейнера, поэтому после исправления перезапустите главный и проверьте журнал:"
+  say "    docker restart $CONTAINER && sleep 15 && docker logs $CONTAINER 2>&1 | grep hairpin      # строки «нет hairpin» быть не должно"
+  say "  Код выхода установщика: 3 (главный работает; после исправления повторный запуск установщика вернёт 0)."
+}
+
 write_env() { # write_env TARGET: .env (или шаблон .env.example) с подставленными ответами, права 600
   local target="$1" src=/dev/null kv k
   if [ -f "$ENV_FILE" ]; then src="$ENV_FILE"; elif [ -f "$REPO/.env.example" ]; then src="$REPO/.env.example"; fi
@@ -585,7 +696,13 @@ write_config() {
       v="${ANS[$k]:-}"
       if [ "$k" = IMAGE_SOURCE ] && [ "$PENDING_USED" = 1 ]; then v="$ORIG_IMAGE_SOURCE"; fi
       if [ "$k" = PENDING_IMAGE_VERSION ] && [ "$PENDING_DONE" = 1 ]; then v=""; fi
-      [ -z "$v" ] || printf '%s=%s\n' "$k" "$v"
+      if [ -n "$v" ]; then printf '%s=%s\n' "$k" "$v"
+      else
+        # «этот образ не класть», сказанное при архиве рядом с IMAGE_TAR: пустой ключ сохраняется, иначе повторный запуск возьмёт умолчание
+        case "$k" in NODE_IMAGE_TAR_CPU|NODE_IMAGE_TAR_GPU)
+          [ -z "${ANS[$k]+x}" ] || [ -z "$(node_tar_default "$(printf '%s' "${k##*_}" | tr A-Z a-z)")" ] || printf '%s=\n' "$k" ;;
+        esac
+      fi
     done
   } >"$CONFIG.tmp"
   chmod 600 "$CONFIG.tmp"
@@ -712,15 +829,28 @@ main_ref() { # main_ref VERSION
 node_repo() { printf '%s' "${ANS[NODE_IMAGE_SOURCE]:-$GHCR/${ANS[GHCR_OWNER]}/nsu-llm-node}"; }
 registry_port() { printf '%s' "${ANS[REGISTRY_PORT]:-$DEFAULT_REGISTRY_PORT}"; }
 
+# by_digest REF DIGEST: REF без тега, с @DIGEST (тянется ровно этот манифест: Docker и containerd сверяют содержимое)
+by_digest() { local r="$1"; r="${r%@*}"; case "${r##*/}" in *:*) r="${r%:*}" ;; esac; printf '%s@%s' "$r" "$2"; }
+
 pull_main_image() { # pull_main_image VERSION: образ главного с ghcr.io под именем nsu-llm-main:VERSION
-  local ver="$1" ref
+  local ver="$1" ref want got src
   ref="$(main_ref "$ver")"
   check_ghcr
   ghcr_login
-  say "Загрузка образа главного $ref (около 190 МБ)"
-  ghcr_docker pull "$ref" \
-    || die "docker pull $ref не удался: образа нет (версия $ver не выпущена? GHCR_OWNER=${ANS[GHCR_OWNER]} указан неверно? пакет закрытый: нужен GHCR_TOKEN_FILE) или сеть до ghcr.io. Без сети: IMAGE_SOURCE=load"
-  run docker tag "$ref" "nsu-llm-main:$ver"
+  # release/<версия>.json (release.sh) называет digest каждого образа: тег в ghcr.io можно перезаписать, digest нет (SEC-2 M3)
+  want="$(release_digest "$ver" main)"
+  src="$ref"
+  if [ -n "$want" ]; then src="$(by_digest "$ref" "$want")"; fi
+  say "Загрузка образа главного $src (около 190 МБ)"
+  ghcr_docker pull "$src" \
+    || die "docker pull $src не удался: образа нет (версия $ver не выпущена? GHCR_OWNER=${ANS[GHCR_OWNER]} указан неверно? пакет закрытый: нужен GHCR_TOKEN_FILE) или сеть до ghcr.io. Без сети: IMAGE_SOURCE=load"
+  if [ -n "$want" ]; then
+    ok "образ главного совпал с release/$ver.json: $want"
+  elif [ "$DRY" = 0 ]; then
+    got="$(docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$ref" 2>/dev/null | tr -d '\r' | sed -n 's/^.*@\(sha256:[0-9a-f]\{64\}\)$/\1/p' | head -n1 || true)"
+    warn "нет release/$ver.json: digest образа главного не с чем сверить (получен ${got:-неизвестный digest}); сверьте его с выпуском на GitHub"
+  fi
+  run docker tag "$src" "nsu-llm-main:$ver"
 }
 
 ctr() { run docker exec "$CONTAINER" k3s ctr -n k8s.io "$@"; }
@@ -732,20 +862,43 @@ registry_digest() {
     "http://127.0.0.1:$(registry_port)/v2/nsu-llm-node/manifests/$1" </dev/null 2>/dev/null \
     | tr -d '\r' | sed -n 's/^[Dd]ocker-[Cc]ontent-[Dd]igest: *//p' | head -n1 || true
 }
-# release_digest VERSION VARIANT: digest образа ноды из release/<версия>.json (его пишет release.sh), пусто если файла нет
+# release_digest VERSION KEY: digest образа из release/<версия>.json (его пишет release.sh): KEY main, cpu или gpu (образ ноды);
+# пусто, если файла нет
 release_digest() {
-  sed -n "s/.*\"node-$2\": {[^}]*\"digest\": \"\\(sha256:[0-9a-f]*\\)\".*/\\1/p" "${NSU_LLM_RELEASE_DIR:-$REPO/release}/$1.json" 2>/dev/null | head -n1 || true
+  local key="node-$2"; [ "$2" != main ] || key=main
+  sed -n "s/.*\"$key\": {[^}]*\"digest\": \"\\(sha256:[0-9a-f]*\\)\".*/\\1/p" "${NSU_LLM_RELEASE_DIR:-$REPO/release}/$1.json" 2>/dev/null | head -n1 || true
 }
+
+# node_tar_default VARIANT: nsu-llm-node-<версия чекаута>-<cpu|gpu>.tar.gz (или .tar) рядом с архивом образа главного; пусто, если файла нет
+node_tar_default() {
+  local d f
+  d="$(dirname "${ANS[IMAGE_TAR]:-.}")"
+  for f in "$d/nsu-llm-node-$CHECKOUT_VERSION-$1.tar.gz" "$d/nsu-llm-node-$CHECKOUT_VERSION-$1.tar"; do
+    if [ -f "$f" ]; then printf '%s' "$f"; return; fi
+  done
+}
+# tar_stream FILE: архив образа в stdout (.gz распаковывается)
+tar_stream() { case "$1" in *.gz|*.tgz) gunzip -c "$1" ;; *) cat "$1" ;; esac; }
 
 # Реестр главного (под registry в k3s, том llm-main-registry). Образы нод попадают в него с 127.0.0.1:<порт> этого же контейнера:
 # писать в реестр может только главный, класс читает через Caddy. Публичные образы пуллятся прямо в k3s главного (ctr, digest
 # сохраняется). Закрытое зеркало (GHCR_TOKEN_FILE): образ скачивает docker хоста (вход в отдельный docker config, токен через stdin) и
 # передаётся в k3s потоком docker save | ctr images import: токен не попадает ни в одну командную строку, ни внутрь контейнера.
 # Версия, которая уже есть в реестре (и не расходится с release/<версия>.json), пропускается: повторный запуск ничего не качает.
-seed_registry() { # seed_registry VERSION
-  local ver="$1" repo port variant src dst attempts i have want todo=0
-  repo="$(node_repo)"; port="$(registry_port)"
-  say "Образы нод в реестр главного (127.0.0.1:$port внутри контейнера $CONTAINER; класс берёт их по https://${ANS[MAIN_ADVERTISE_IP]}/v2/):"
+# IMAGE_SOURCE=load (seed_registry VERSION load): ghcr.io недоступен, образы нод берутся из архивов docker save (NODE_IMAGE_TAR_CPU и
+# NODE_IMAGE_TAR_GPU) и передаются в k3s главного потоком gunzip | ctr images import, дальше всё как с ghcr.io. Образ в архиве называется
+# nsu-llm-node:<версия>-<cpu|gpu> (docker save nsu-llm-node:<версия>-<cpu|gpu>); в containerd он появляется как docker.io/library/nsu-llm-node:<тег>.
+seed_registry() { # seed_registry VERSION [load]
+  local ver="$1" from_tar=0 repo port variant src dst archive key attempts i have want tags
+  local seeded=()
+  [ "${2:-}" != load ] || from_tar=1
+  port="$(registry_port)"
+  [ "$from_tar" = 1 ] || repo="$(node_repo)"   # у load нет ghcr.io, а с ним и GHCR_OWNER
+  if [ "$from_tar" = 1 ]; then
+    say "Образы нод из архивов в реестр главного (127.0.0.1:$port внутри контейнера $CONTAINER; класс берёт их по https://${ANS[MAIN_ADVERTISE_IP]}/v2/):"
+  else
+    say "Образы нод в реестр главного (127.0.0.1:$port внутри контейнера $CONTAINER; класс берёт их по https://${ANS[MAIN_ADVERTISE_IP]}/v2/):"
+  fi
   if [ "$DRY" = 0 ]; then
     [ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null || echo false)" = true ] \
       || die "контейнер $CONTAINER не запущен: реестру некуда принять образы. Запустите установщик без --update или docker start $CONTAINER"
@@ -757,46 +910,86 @@ seed_registry() { # seed_registry VERSION
     done
   fi
   for variant in cpu gpu; do
-    src="$repo:$ver-$variant"
     dst="127.0.0.1:$port/nsu-llm-node:$ver-$variant"
+    archive=""; key=""
+    if [ "$from_tar" = 1 ]; then
+      src="docker.io/library/nsu-llm-node:$ver-$variant"
+      key="NODE_IMAGE_TAR_$(printf '%s' "$variant" | tr a-z A-Z)"
+      archive="${ANS[$key]:-}"
+    else
+      src="$repo:$ver-$variant"
+      # с release/<версия>.json образ ноды тянется по digest оттуда (SEC-2 M3): перезаписанный тег в ghcr.io не доедет до класса
+      want="$(release_digest "$ver" "$variant")"
+      [ -z "$want" ] || src="$(by_digest "$src" "$want")"
+    fi
     if [ "$DRY" = 0 ]; then
       have="$(registry_digest "$ver-$variant")"
       want="$(release_digest "$ver" "$variant")"
       if [ -n "$have" ] && { [ -z "$want" ] || [ "$have" = "$want" ]; }; then
         ok "в реестре уже есть nsu-llm-node:$ver-$variant ($have): не скачивается заново"
+        seeded+=("$variant")
         continue
       fi
       [ -z "$have" ] || warn "nsu-llm-node:$ver-$variant в реестре ($have) расходится с release/$ver.json ($want): образ загружается заново"
     fi
-    todo=1
-    say "  $src -> $dst"
-    if [ -n "${ANS[GHCR_TOKEN_FILE]:-}" ]; then
-      ghcr_login
-      ghcr_docker pull "$src" || die "docker pull $src не удался: образа нет, закрытый пакет без права read:packages у токена или нет доступа к ${src%%/*}"
-      run docker tag "$src" "$dst"
-      if [ "$DRY" = 1 ]; then
-        say "  [dry-run] docker save $dst | docker exec -i $CONTAINER k3s ctr -n k8s.io images import --no-unpack -"
-      else
-        docker save "$dst" | docker exec -i "$CONTAINER" k3s ctr -n k8s.io images import --no-unpack - \
-          || die "передача образа $dst в k3s главного (docker save | ctr images import) не удалась"
-      fi
-      run docker rmi "$dst" >/dev/null || true
-    else
-      ctr images pull --platform linux/amd64 "$src" \
-        || die "не удалось скачать $src внутри $CONTAINER (k3s ctr): образа нет, нет доступа к ${src%%/*} из контейнера (прокси: HTTPS_PROXY в .env главного) или закончилось место. Повтор: docker exec $CONTAINER k3s ctr -n k8s.io images pull --platform linux/amd64 $src"
-      ctr images tag --force "$src" "$dst" || die "k3s ctr images tag $src $dst не удался"
+    if [ "$from_tar" = 1 ] && [ -z "$archive" ]; then
+      warn "nsu-llm-node:$ver-$variant в реестр не кладётся: нет архива ($key; по умолчанию nsu-llm-node-$ver-$variant.tar.gz рядом с архивом образа главного). Ноды возьмут этот образ из архива (install-node.ps1 -ImageTar) или после его добавления: повторный запуск установщика"
+      continue
     fi
-    ctr images push --plain-http --platform linux/amd64 "$dst" || die "k3s ctr images push $dst не удался: реестр не принимает запись (журнал: docker exec $CONTAINER k3s kubectl -n llm logs deploy/registry)"
-    if [ -n "${ANS[GHCR_TOKEN_FILE]:-}" ]; then ctr images rm --sync "$dst" >/dev/null || warn "не удалось убрать временный тег $dst из containerd главного"
+    if [ "$from_tar" = 1 ]; then
+      say "  $archive -> $dst"
+      if [ "$DRY" = 1 ]; then
+        say "  [dry-run] $(case "$archive" in *.gz|*.tgz) printf 'gunzip -c' ;; *) printf 'cat' ;; esac) $archive | docker exec -i $CONTAINER k3s ctr -n k8s.io images import --no-unpack -"
+      else
+        tar_stream "$archive" | docker exec -i "$CONTAINER" k3s ctr -n k8s.io images import --no-unpack - \
+          || die "загрузка образа из $archive в k3s главного (gunzip | ctr images import) не удалась: архив повреждён или это не docker save (сохраните: docker save --platform linux/amd64 nsu-llm-node:$ver-$variant | gzip > nsu-llm-node-$ver-$variant.tar.gz)"
+      fi
+      ctr images tag --force "$src" "$dst" \
+        || die "в архиве $archive нет образа nsu-llm-node:$ver-$variant (k3s ctr images tag $src $dst не удался): архив собран из образа с другим именем или версией"
+    else
+      say "  $src -> $dst"
+      if [ -n "${ANS[GHCR_TOKEN_FILE]:-}" ]; then
+        ghcr_login
+        ghcr_docker pull "$src" || die "docker pull $src не удался: образа нет, закрытый пакет без права read:packages у токена или нет доступа к ${src%%/*}"
+        run docker tag "$src" "$dst"
+        if [ "$DRY" = 1 ]; then
+          say "  [dry-run] docker save $dst | docker exec -i $CONTAINER k3s ctr -n k8s.io images import --no-unpack -"
+        else
+          docker save "$dst" | docker exec -i "$CONTAINER" k3s ctr -n k8s.io images import --no-unpack - \
+            || die "передача образа $dst в k3s главного (docker save | ctr images import) не удалась"
+        fi
+        run docker rmi "$dst" >/dev/null || true
+      else
+        ctr images pull --platform linux/amd64 "$src" \
+          || die "не удалось скачать $src внутри $CONTAINER (k3s ctr): образа нет, нет доступа к ${src%%/*} из контейнера (прокси: HTTPS_PROXY в .env главного) или закончилось место. Повтор: docker exec $CONTAINER k3s ctr -n k8s.io images pull --platform linux/amd64 $src"
+        ctr images tag --force "$src" "$dst" || die "k3s ctr images tag $src $dst не удался"
+      fi
+    fi
+    # реестр главного принимает запись только с паролем (SEC-2 M2): registry-push.sh внутри контейнера берёт его из secrets.env;
+    # главный до этой версии (без registry-push.sh, --update из старой установки) ещё пишет без пароля на 127.0.0.1:<порт>
+    if [ "$DRY" = 1 ] || docker exec "$CONTAINER" test -x /opt/llm/main/registry-push.sh </dev/null >/dev/null 2>&1; then
+      run docker exec "$CONTAINER" /opt/llm/main/registry-push.sh "$dst" \
+        || die "запись $dst в реестр главного не удалась (registry-push.sh): журнал реестра: docker exec $CONTAINER k3s kubectl -n llm logs deploy/registry"
+    else
+      ctr images push --plain-http --platform linux/amd64 "$dst" || die "k3s ctr images push $dst не удался: реестр не принимает запись (журнал: docker exec $CONTAINER k3s kubectl -n llm logs deploy/registry)"
+    fi
+    if [ "$from_tar" = 0 ] && [ -n "${ANS[GHCR_TOKEN_FILE]:-}" ]; then ctr images rm --sync "$dst" >/dev/null || warn "не удалось убрать временный тег $dst из containerd главного"
     else ctr images rm --sync "$src" "$dst" >/dev/null || warn "не удалось убрать временные теги $src и $dst из containerd главного (на работу реестра не влияет)"; fi
+    seeded+=("$variant")
   done
-  if [ "$DRY" = 0 ]; then
-    docker exec "$CONTAINER" curl -fsS -m 10 "http://127.0.0.1:$port/v2/nsu-llm-node/tags/list" </dev/null 2>/dev/null | grep -q "\"$ver-gpu\"" \
-      || die "после загрузки в реестре нет nsu-llm-node:$ver-gpu (docker exec $CONTAINER curl -s http://127.0.0.1:$port/v2/nsu-llm-node/tags/list)"
-    ok "реестр главного: nsu-llm-node:$ver-cpu и $ver-gpu"
+  if [ "$DRY" = 0 ] && [ "${#seeded[@]}" -gt 0 ]; then
+    tags="$(docker exec "$CONTAINER" curl -fsS -m 10 "http://127.0.0.1:$port/v2/nsu-llm-node/tags/list" </dev/null 2>/dev/null || true)"
+    for variant in "${seeded[@]}"; do
+      grep -q "\"$ver-$variant\"" <<<"$tags" \
+        || die "после загрузки в реестре нет nsu-llm-node:$ver-$variant (docker exec $CONTAINER curl -s http://127.0.0.1:$port/v2/nsu-llm-node/tags/list)"
+    done
+    if [ "${#seeded[@]}" = 2 ]; then ok "реестр главного: nsu-llm-node:$ver-cpu и $ver-gpu"; else ok "реестр главного: nsu-llm-node:$ver-${seeded[0]}"; fi
     SEEDED=1
   fi
 }
+
+# IMAGE_SOURCE=load и есть хотя бы один архив образа ноды: образы нод кладутся в реестр главного из архивов
+load_seeds_registry() { [ "${ANS[IMAGE_SOURCE]:-}" = load ] && { [ -n "${ANS[NODE_IMAGE_TAR_CPU]:-}" ] || [ -n "${ANS[NODE_IMAGE_TAR_GPU]:-}" ]; }; }
 
 # --update VERSION: образ главного и образы нод новой версии; контейнер не перезапускается
 do_update() {
@@ -805,7 +998,7 @@ do_update() {
   ok "ОС: ${OS[PRETTY_NAME]:-${OS[ID]:-неизвестна}}"
   check_docker
   [ "$EXISTING" = 1 ] || die "главный не установлен (контейнера $CONTAINER нет): --update обновляет существующую установку. Для новой запустите установщик без --update."
-  need GHCR_OWNER "Владелец образов на GitHub (GHCR_OWNER; образы лежат в ghcr.io/<владелец>/nsu-llm-main)" ""
+  need GHCR_OWNER "Владелец образов на GitHub (GHCR_OWNER; образы лежат в ghcr.io/<владелец>/nsu-llm-main)" "$DEFAULT_GHCR_OWNER"
   for k in IMAGE_REF NODE_IMAGE_SOURCE GHCR_TOKEN_FILE; do [ -z "${ANS[$k]:-}" ] || need "$k" "$k" ""; done
   ANS[MAIN_ADVERTISE_IP]="${ANS[MAIN_ADVERTISE_IP]:-<MAIN_ADVERTISE_IP>}"
   ref="$(main_ref "$ver")"
@@ -836,6 +1029,11 @@ do_uninstall() {
   detect_fw
   say "Будут удалены безвозвратно: контейнер $CONTAINER и тома llm-main-k3s, llm-main-kubelet, llm-main-data, llm-main-hf, llm-main-registry"
   say "(база портала и LiteLLM, ключи пользователей, секреты, CA главного, кэш зеркала Hugging Face, свои модели и реестр образов нод)."
+  local hp_tool="" hp_net="${ANS[HAIRPIN_SUBNET]:-}"
+  if [ -n "$hp_net" ] && [ -n "$FW_TOOL" ]; then
+    hp_tool="$FW_TOOL"
+    say "Правило $hp_tool для подсети Docker $hp_net на 6443/tcp (hairpin), добавленное установщиком, будет удалено."
+  fi
   if [ "${ANS[FIREWALL]:-no}" = yes ] && [ -n "$FW_TOOL" ]; then
     say "Правила $FW_TOOL для портов 80, 443, 6443/tcp будут удалены."
   else
@@ -848,7 +1046,8 @@ do_uninstall() {
   [ "$DRY" = 0 ] || args+=(--dry-run)
   "$BASH" "$RUN_MAIN" "${args[@]}" </dev/null || die "run-main.sh --uninstall завершился ошибкой (см. вывод выше)"
   fw_apply close
-  say "Файлы $ENV_FILE и $CONFIG оставлены (в .env секрет NSU ID): удалите их, если установка больше не нужна."
+  if [ -n "$hp_tool" ]; then hairpin_apply "$hp_tool" close "$hp_net"; fi
+  say "Файлы $ENV_FILE и $CONFIG оставлены (в .env секрет клиента OIDC): удалите их, если установка больше не нужна."
 }
 
 # ------------------------------------------------------------------ основной сценарий
@@ -858,6 +1057,7 @@ main() {
   if [ "$UNINSTALL" = 1 ]; then do_uninstall; return; fi
   load_answers
   if [ -n "$UPDATE_VERSION" ]; then do_update; return; fi
+  require_yes_keys
   if [ -n "${ANS[PENDING_IMAGE_VERSION]:-}" ]; then
     if [ "${ANS[PENDING_IMAGE_VERSION]}" = "$CHECKOUT_VERSION" ]; then
       ORIG_IMAGE_SOURCE="${ANS[IMAGE_SOURCE]:-}"
@@ -887,11 +1087,18 @@ main() {
   detect_fw
 
   say ""
-  need PUBLIC_HOSTNAME "Имя хоста портала (PUBLIC_HOSTNAME; на него NSU ID возвращает пользователя)" double.fresh.nsuts.ru
+  need PUBLIC_HOSTNAME "Имя хоста портала (PUBLIC_HOSTNAME; по нему пользователи открывают портал и на него провайдер возвращает их после входа, например llm.example.org)" ""
   need MAIN_ADVERTISE_IP "LAN-адрес главного для нод (MAIN_ADVERTISE_IP)" "$DETECTED_IP"
-  need OIDC_CLIENT_SECRET "Секрет клиента NSU ID (OIDC_CLIENT_SECRET, ввод скрыт)" "" -s
+  [ "$YES" = 1 ] || show_redirect_uri
+  need OIDC_ISSUER "Адрес OIDC-провайдера (OIDC_ISSUER, только https; Keycloak: https://<хост>/realms/<realm>; пример NSU ID: https://sso-ng.nsu.ru/auth/realms/NSU)" ""
+  need OIDC_CLIENT_ID "Client ID клиента, зарегистрированного у провайдера (OIDC_CLIENT_ID)" ""
+  local provider_def=SSO
+  [[ "${ANS[OIDC_ISSUER]}" != *sso-ng.nsu.ru* ]] || provider_def="NSU ID"
+  need LOGIN_PROVIDER_NAME "Как назвать провайдера на кнопке входа (LOGIN_PROVIDER_NAME: «Войти через ...»)" "$provider_def"
+  need OIDC_CLIENT_SECRET "Секрет клиента (OIDC_CLIENT_SECRET, ввод скрыт)" "" -s
   need ADMIN_EMAILS "Администраторы (e-mail через запятую, ADMIN_EMAILS)" ""
-  need TRUSTED_PROXIES "Фронт-прокси перед главным, адреса через запятую (TRUSTED_PROXIES; например 10.4.0.105 — nginx на tsga; Enter — нет)" ""
+  need ADMIN_REQUIRE_EMAIL_VERIFIED "Требовать подтверждённый e-mail для роли администратора (ADMIN_REQUIRE_EMAIL_VERIFIED; для NSU ID ответьте «нет»: он присылает email_verified=false) (да/нет)" да
+  need TRUSTED_PROXIES "Фронт-прокси перед главным, адреса через запятую (TRUSTED_PROXIES; например 10.0.0.10 — nginx перед главным; Enter — нет)" ""
   need CERT_MODE "Сертификат HTTPS: 1 — внутренний CA главного (internal), 2 — свой из каталога с tls.crt и tls.key (own)" internal
   if [ "${ANS[CERT_MODE]}" = own ]; then
     need CERTS_DIR "Каталог с tls.crt и tls.key (и необязательно ca.crt)" ""
@@ -899,6 +1106,9 @@ main() {
   need AIRGAP "Режим без интернета: заранее положить системные образы k3s, Postgres, Redis и LiteLLM (airgap)? (да/нет)" нет
   if [ -n "$FW_TOOL" ]; then
     need FIREWALL "Открыть порты 80, 443, 6443/tcp в $FW_TOOL? (да/нет)" да
+    if [ "${ANS[FIREWALL]}" != yes ]; then
+      need HAIRPIN_RULE "Разрешить в $FW_TOOL подсети Docker доступ к 6443/tcp хоста (hairpin)? Без этого контейнер главного не достанет до ${ANS[MAIN_ADVERTISE_IP]}:6443 и логи подов на других машинах не заработают (да/нет)" да
+    fi
   fi
   local img_def=keep img_prompt
   if [ -f "$HERE/Dockerfile" ]; then img_def=build; fi
@@ -907,7 +1117,7 @@ main() {
   if [ -z "${ANS[IMAGE_SOURCE]:-}" ]; then
     if ghcr_reachable; then
       img_prompt="Образ главного: 1 — скачать с ghcr.io (pull), 2 — собрать из исходников (build), 3 — загрузить архив docker save (load), 4 — взять имеющийся (keep)"
-      [ -z "${ANS[GHCR_OWNER]:-}" ] || img_def=pull
+      img_def=pull
     else
       img_prompt="$img_prompt (скачивание с ghcr.io недоступно: ghcr.io с этого хоста не отвечает)"
     fi
@@ -915,9 +1125,14 @@ main() {
   need IMAGE_SOURCE "$img_prompt" "$img_def"
   if [ "${ANS[IMAGE_SOURCE]}" = load ]; then
     need IMAGE_TAR "Путь к архиву образа (docker save)" ""
+    local variant
+    for variant in cpu gpu; do
+      need "NODE_IMAGE_TAR_$(printf '%s' "$variant" | tr a-z A-Z)" \
+        "Архив образа ноды $variant для реестра главного (docker save, nsu-llm-node-<версия>-$variant.tar.gz; Enter — не класть)" "$(node_tar_default "$variant")"
+    done
   fi
   if [ "${ANS[IMAGE_SOURCE]}" = pull ]; then
-    need GHCR_OWNER "Владелец образов на GitHub (GHCR_OWNER; образы лежат в ghcr.io/<владелец>/nsu-llm-main)" ""
+    need GHCR_OWNER "Владелец образов на GitHub (GHCR_OWNER; образы лежат в ghcr.io/<владелец>/nsu-llm-main)" "$DEFAULT_GHCR_OWNER"
     local k
     for k in IMAGE_REF NODE_IMAGE_SOURCE GHCR_TOKEN_FILE; do [ -z "${ANS[$k]:-}" ] || need "$k" "$k" ""; done
   fi
@@ -934,6 +1149,13 @@ main() {
   say "Будет выполнено:"
   say "  портал:             https://$host/  (адрес для нод $ip)"
   say "  администраторы:     ${ANS[ADMIN_EMAILS]}"
+  say "  вход:               ${ANS[OIDC_ISSUER]} (client id ${ANS[OIDC_CLIENT_ID]}, кнопка «Войти через ${ANS[LOGIN_PROVIDER_NAME]}»)"
+  say "  redirect URI:       $(redirect_uri)  (его нужно зарегистрировать у провайдера)"
+  local arev="${ANS[ADMIN_REQUIRE_EMAIL_VERIFIED]:-}"
+  [ -n "$arev" ] || arev="$(sed -n 's/^ADMIN_REQUIRE_EMAIL_VERIFIED=//p' "$REPO/.env.example" 2>/dev/null | tail -n1)"
+  if [ "$arev" = false ]; then
+    warn "ADMIN_REQUIRE_EMAIL_VERIFIED=false: роль администратора определяет только ADMIN_EMAILS, подтверждение e-mail не проверяется (так нужно для NSU ID). Если ваш провайдер подтверждает почту, поставьте true в $ENV_FILE и повторите установку."
+  fi
   [ -z "${ANS[TRUSTED_PROXIES]}" ] || say "  фронт-прокси:       ${ANS[TRUSTED_PROXIES]} (им главный верит X-Forwarded-For)"
   say "  клиентский секрет:  задан (${SRC[OIDC_CLIENT_SECRET]:-ответ})"
   if [ "${ANS[CERT_MODE]}" = internal ]; then say "  сертификат:         внутренний CA главного"; else say "  сертификат:         свой из ${ANS[CERTS_DIR]}"; fi
@@ -946,6 +1168,10 @@ main() {
     say "  $((step++)). брандмауэр $FW_TOOL: открыть 80, 443, 6443/tcp"
   else
     say "  $((step++)). брандмауэр $FW_TOOL: не трогать (откройте 80, 443, 6443/tcp сами)"
+    if want_hairpin_rule; then
+      HP_SUBNET="$(docker_bridge_subnet)"
+      say "  $((step++)). брандмауэр $FW_TOOL: добавить одно узкое правило, подсеть Docker $HP_SUBNET -> 6443/tcp: без него контейнер главного не достаёт до $ip:6443 (hairpin), API объявляется по адресу контейнера, и логи и exec подов на других машинах не работают"
+    fi
   fi
   case "${ANS[IMAGE_SOURCE]}" in
     pull) say "  $((step++)). скачать образ главного $(main_ref "$CHECKOUT_VERSION") с ghcr.io (docker pull, доступность проверяется заранее) и пометить его $IMAGE" ;;
@@ -957,6 +1183,11 @@ main() {
   say "  $((step++)). дождаться https://$ip/readyz (до $TIMEOUT с)"
   if [ "${ANS[IMAGE_SOURCE]}" = pull ]; then
     say "  $((step++)). скачать образы нод $(node_repo):$CHECKOUT_VERSION-cpu и -gpu внутри $CONTAINER и положить в реестр главного (https://$ip/v2/ для класса)"
+  fi
+  if load_seeds_registry; then
+    say "  $((step++)). положить образы нод из архивов (${ANS[NODE_IMAGE_TAR_CPU]:-нет} и ${ANS[NODE_IMAGE_TAR_GPU]:-нет}) в реестр главного (https://$ip/v2/ для класса)"
+  elif [ "${ANS[IMAGE_SOURCE]}" = load ]; then
+    say "  образы нод в реестр главного не кладутся: архивов NODE_IMAGE_TAR_CPU и NODE_IMAGE_TAR_GPU нет (ноды берут образ из архива: install-node.ps1 -ImageTar)"
   fi
   if [ "$YES" = 0 ] && [ "$DRY" = 0 ]; then
     yesno "Продолжить?" y || die "отменено, ничего не изменено"
@@ -981,18 +1212,27 @@ main() {
   [ "$DRY" = 1 ] || { write_config; ok "записаны $ENV_FILE и $CONFIG"; }
 
   if [ -n "$FW_TOOL" ] && [ "${ANS[FIREWALL]}" = yes ]; then fw_apply open; fi
+  if want_hairpin_rule; then
+    HP_SUBNET="${HP_SUBNET:-$(docker_bridge_subnet)}"
+    hairpin_apply "$FW_TOOL" open "$HP_SUBNET"
+    if [ "$DRY" = 0 ]; then ANS[HAIRPIN_SUBNET]="$HP_SUBNET"; write_config; fi
+  fi
   prepare_image
   if [ "$DRY" = 1 ]; then
     say "  [dry-run] main/run-main.sh ${rm_args[*]} --dry-run:"
     "$BASH" "$RUN_MAIN" "${rm_args[@]}" --dry-run </dev/null
     if [ "${ANS[IMAGE_SOURCE]}" = pull ]; then seed_registry "$CHECKOUT_VERSION"; fi
+    if load_seeds_registry; then seed_registry "$CHECKOUT_VERSION" load; fi
     return
   fi
   "$BASH" "$RUN_MAIN" "${rm_args[@]}" </dev/null || die "run-main.sh завершился с ошибкой (см. вывод выше); повторите установщик после исправления"
   wait_ready
   if [ "${ANS[IMAGE_SOURCE]}" = pull ]; then seed_registry "$CHECKOUT_VERSION"; fi
+  if load_seeds_registry; then seed_registry "$CHECKOUT_VERSION" load; fi
   if [ "$PENDING_USED" = 1 ]; then SEEDED=1; PENDING_DONE=1; write_config; fi   # образы нод --update уже положил в реестр
   print_result
+  check_hairpin
+  [ "$DEGRADED" = 0 ] || return 3
 }
 
 main

@@ -1,0 +1,38 @@
+{
+  "items": [
+    {
+      "id": 4,
+      "at": "2026-11-02T10:05:12Z",
+      "actor_id": "0b8d2f64-93a7-4c1e-8f21-6d5e7a9c4b02",
+      "actor_email": "d.muruev@g.nsu.ru",
+      "action": "deployment.create",
+      "target_type": "deployment",
+      "target": "gemma-4-e4b",
+      "details": { "engine": "llamacpp", "repo": "unsloth/gemma-4-E4B-it-GGUF", "file": "gemma-4-E4B-it-Q4_K_M.gguf", "mode": "replicas" },
+      "ip": "192.168.3.15"
+    },
+    {
+      "id": 3,
+      "at": "2026-11-02T09:41:03Z",
+      "actor_id": "0b8d2f64-93a7-4c1e-8f21-6d5e7a9c4b02",
+      "actor_email": "d.muruev@g.nsu.ru",
+      "action": "deployment.delete",
+      "target_type": "deployment",
+      "target": "qwen3-4b",
+      "details": null,
+      "ip": "192.168.3.15"
+    },
+    {
+      "id": 2,
+      "at": "2026-11-01T18:20:44Z",
+      "actor_id": null,
+      "actor_email": null,
+      "action": "node.wake",
+      "target_type": "node",
+      "target": "win-07",
+      "details": null,
+      "ip": null
+    }
+  ],
+  "total": 3
+}

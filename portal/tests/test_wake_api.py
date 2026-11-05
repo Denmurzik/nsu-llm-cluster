@@ -7,7 +7,7 @@ import pytest
 import pytest_asyncio
 from sqlalchemy import delete, select
 
-from app.models import ControllerTimer, ModelDeployment, NodeAssignment, NodeWake, PortalFlag, StandaloneNode
+from app.models import AuditLog, ControllerTimer, ModelDeployment, NodeAssignment, NodeWake, PortalFlag, StandaloneNode
 from app.nodes import wake
 from tests.fakes.k8s import FakeK8s
 from tests.fakes.litellm import FakeLiteLLM
@@ -16,7 +16,7 @@ from tests.helpers.auth import csrf_headers, login
 pytestmark = pytest.mark.docker
 
 AUTH = {"Authorization": "Bearer agent-test"}
-ADMIN = {"sub": "adm", "email": "admin@g.nsu.ru", "name": "Админ"}
+ADMIN = {"sub": "adm", "email": "admin@g.nsu.ru", "email_verified": True, "name": "Админ"}
 USER = {"sub": "usr", "email": "ivan@g.nsu.ru", "name": "Иван Иванов"}
 NIC = {"mac": "00-1A-2B-3C-4D-5E", "ip": "192.168.0.193", "prefix": 24}
 REG = {"name": "win-07", "url": "http://192.168.3.77:18080", "accel": "cpu", "ram_mib": 16384, "version": "0.1.0"}
@@ -171,6 +171,11 @@ async def test_wake_button_sends_the_packet_now(client, app, sent, settings):
     # the override of its subnet, then the address the cluster knows now (DHCP may have moved it)
     assert r.json() == {"node": "pc01", "targets": ["192.168.0.7", "192.168.0.200"], "relay": None}
     assert sent == [("00:1a:2b:3c:4d:5e", ["192.168.0.7", "192.168.0.200"])]
+    async with app.state.sessionmaker() as db:
+        (row,) = (await db.scalars(select(AuditLog).where(AuditLog.action == "node.wake"))).all()
+    assert (row.actor_email, row.target, row.details) == (
+        "admin@g.nsu.ru", "pc01", {"targets": ["192.168.0.7", "192.168.0.200"], "relay": None},
+    )
 
 
 async def test_wake_button_without_a_reported_nic(client, app, sent):

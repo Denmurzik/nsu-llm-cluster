@@ -48,8 +48,8 @@ chmod +x "$BIN"/*
 new_repo() {
   R="$TMP/$1"; RW="$R"; command -v cygpath >/dev/null 2>&1 && RW="$(cygpath -m "$R")"; W="$R.w"; mkdir -p "$W/state" "$W/home" "$R/release" "$R/main" "$R/node"
   cp "$RELEASE_DIR/release.sh" "$R/release/release.sh"
-  printf '#!/usr/bin/env bash\nIMAGE="nsu-llm-main:0.1.0"\n' >"$R/main/install-main.sh"
-  printf '#!/usr/bin/env bash\nVERSION="0.1.0"\n' >"$R/node/run-node.sh"
+  printf '#!/usr/bin/env bash\nIMAGE="nsu-llm-main:0.2.0"\n' >"$R/main/install-main.sh"
+  printf '0.1.0\n' >"$R/node/IMAGE_VERSION"
   printf 'ARG K3S_VERSION=v1.36.5+k3s1\n' >"$R/main/Dockerfile"
   printf 'ARG LLAMA_TAG=b12033\nARG K3S_VERSION=v1.36.5+k3s1\n' >"$R/node/Dockerfile"
   ( cd "$R" && git init -q && git config user.email t@t && git config user.name t && git config core.autocrlf false \
@@ -76,13 +76,13 @@ out="$(rel --dry-run 0.1.0)"; rc=$?
 [ "$rc" = 0 ]; check "dry-run exits 0" $? "rc=$rc
 $out"
 [ ! -s "$FAKE_LOG" ]; check "dry-run calls docker never (no build, no login, no push, no rmi)" $? "$(cat "$FAKE_LOG")"
-grep -q 'nice -n 15 docker build --provenance=false -f .*main/Dockerfile -t ghcr.io/nsu/nsu-llm-main:0.1.0' <<<"$out" \
-  && grep -q 'nice -n 15 docker build --provenance=false -f .*node/Dockerfile --target cpu --build-arg JOBS=8 -t ghcr.io/nsu/nsu-llm-node:0.1.0-cpu' <<<"$out" \
-  && grep -q 'nice -n 15 docker build --provenance=false -f .*node/Dockerfile --target gpu --build-arg JOBS=8 -t ghcr.io/nsu/nsu-llm-node:0.1.0-gpu' <<<"$out"
+grep -q 'nice -n 15 docker build --provenance=false -f .*main/Dockerfile -t ghcr.io/nsu/nsu-llm-main:0.2.0' <<<"$out" \
+  && grep -q 'nice -n 15 docker build --provenance=false -f .*node/Dockerfile --target cpu --build-arg JOBS=8 -t ghcr.io/nsu/nsu-llm-node:0.2.0-cpu' <<<"$out" \
+  && grep -q 'nice -n 15 docker build --provenance=false -f .*node/Dockerfile --target gpu --build-arg JOBS=8 -t ghcr.io/nsu/nsu-llm-node:0.2.0-gpu' <<<"$out"
 check "dry-run prints the three builds: nice -n 15, JOBS=8, own ghcr.io tags" $? "$out"
 grep -q 'docker login ghcr.io -u nsu --password-stdin' <<<"$out" && grep -q 'docker logout ghcr.io' <<<"$out" \
-  && grep -q 'docker push ghcr.io/nsu/nsu-llm-main:0.1.0$' <<<"$out" && grep -q 'docker push ghcr.io/nsu/nsu-llm-node:0.1.0-cpu$' <<<"$out" \
-  && grep -q 'docker push ghcr.io/nsu/nsu-llm-node:0.1.0-gpu$' <<<"$out" && grep -q 'git .* tag v0.1.0' <<<"$out" \
+  && grep -q 'docker push ghcr.io/nsu/nsu-llm-main:0.2.0$' <<<"$out" && grep -q 'docker push ghcr.io/nsu/nsu-llm-node:0.2.0-cpu$' <<<"$out" \
+  && grep -q 'docker push ghcr.io/nsu/nsu-llm-node:0.2.0-gpu$' <<<"$out" && grep -q 'git .* tag v0.1.0' <<<"$out" \
   && grep -q 'release/0.1.0.json\|0.1.0.json' <<<"$out"
 check "dry-run prints login (stdin), pushes, json, git tag and logout" $? "$out"
 ! grep -q ':main\|:latest' <<<"$out" && ! grep -q "$TOKEN" <<<"$out"
@@ -90,12 +90,12 @@ check "dry-run without --latest has no moving tags and never shows the token" $?
 [ ! -e "$R/release/0.1.0.json" ] && [ -z "$(git -C "$RW" tag)" ]
 check "dry-run writes no json and creates no tag" $? "$(ls "$R/release")"
 out="$(rel --dry-run --latest 0.1.0)"
-grep -q 'docker tag ghcr.io/nsu/nsu-llm-main:0.1.0 ghcr.io/nsu/nsu-llm-main:main' <<<"$out" \
-  && grep -q 'docker tag ghcr.io/nsu/nsu-llm-node:0.1.0-cpu ghcr.io/nsu/nsu-llm-node:cpu' <<<"$out" \
+grep -q 'docker tag ghcr.io/nsu/nsu-llm-main:0.2.0 ghcr.io/nsu/nsu-llm-main:main' <<<"$out" \
+  && grep -q 'docker tag ghcr.io/nsu/nsu-llm-node:0.2.0-cpu ghcr.io/nsu/nsu-llm-node:cpu' <<<"$out" \
   && grep -q 'docker push ghcr.io/nsu/nsu-llm-node:gpu$' <<<"$out"
 check "--latest adds the moving tags main, cpu, gpu" $? "$out"
 out="$(rel --dry-run --skip-build 0.1.0)"
-! grep -q 'docker build' <<<"$out" && grep -q 'docker push ghcr.io/nsu/nsu-llm-main:0.1.0$' <<<"$out" && ! grep -q 'docker rmi' <<<"$out"
+! grep -q 'docker build' <<<"$out" && grep -q 'docker push ghcr.io/nsu/nsu-llm-main:0.2.0$' <<<"$out" && ! grep -q 'docker rmi' <<<"$out"
 check "--skip-build: no build, pushes the existing tags, removes nothing afterwards" $? "$out"
 
 # ------------------------------------------------------------------ 2. refusals
@@ -170,8 +170,8 @@ $(cat "$FAKE_LOG")"
   [ "$(grep -c '^docker push' "$FAKE_LOG")" = 6 ]; check "six pushes: three versions and three moving tags (--latest)" $? "$(grep push "$FAKE_LOG")"
   J="$R/release/0.1.0.json"
   [ -f "$J" ] && grep -q '"version": "0.1.0"' "$J" && grep -q '"llama_cpp": "b12033"' "$J" && grep -q '"k3s": "v1.36.5+k3s1"' "$J" \
-    && grep -q "\"ref\": \"ghcr.io/nsu/nsu-llm-main:0.1.0\", \"digest\": \"sha256:$DIGEST_HEX\", \"size_bytes\": 123456789" "$J" \
-    && grep -q "\"node-gpu\": {\"ref\": \"ghcr.io/nsu/nsu-llm-node:0.1.0-gpu\"" "$J" && grep -q "\"git_commit\": \"$(git -C "$RW" rev-parse HEAD)\"" "$J"
+    && grep -q "\"ref\": \"ghcr.io/nsu/nsu-llm-main:0.2.0\", \"digest\": \"sha256:$DIGEST_HEX\", \"size_bytes\": 123456789" "$J" \
+    && grep -q "\"node-gpu\": {\"ref\": \"ghcr.io/nsu/nsu-llm-node:0.2.0-gpu\"" "$J" && grep -q "\"git_commit\": \"$(git -C "$RW" rev-parse HEAD)\"" "$J"
   check "release/0.1.0.json has versions, digests, llama.cpp, k3s, sizes and the commit" $? "$(cat "$J" 2>&1)"
   if command -v python3 >/dev/null 2>&1; then python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$J"; check "release json is valid JSON" $? "$(cat "$J")"; fi
   [ "$(git -C "$RW" rev-parse v0.1.0)" = "$(git -C "$RW" rev-parse HEAD)" ] && [ "$(git -C "$RW" tag)" = v0.1.0 ]
@@ -179,10 +179,10 @@ $(cat "$FAKE_LOG")"
   ! grep -qE '^docker (rm |system|builder|container|image prune|volume)' "$FAKE_LOG" && ! grep -q 'prune' "$FAKE_LOG"
   check "nothing foreign is touched: no docker rm, prune, system, builder, volume" $? "$(cat "$FAKE_LOG")"
   rmi="$(grep '^docker rmi' "$FAKE_LOG" | sed 's/^docker rmi //' | sort | tr '\n' ' ')"
-  [ "$rmi" = "ghcr.io/nsu/nsu-llm-main:0.1.0 ghcr.io/nsu/nsu-llm-main:main ghcr.io/nsu/nsu-llm-node:0.1.0-cpu ghcr.io/nsu/nsu-llm-node:0.1.0-gpu ghcr.io/nsu/nsu-llm-node:cpu ghcr.io/nsu/nsu-llm-node:gpu " ]
+  [ "$rmi" = "ghcr.io/nsu/nsu-llm-main:0.2.0 ghcr.io/nsu/nsu-llm-main:main ghcr.io/nsu/nsu-llm-node:0.2.0-cpu ghcr.io/nsu/nsu-llm-node:0.2.0-gpu ghcr.io/nsu/nsu-llm-node:cpu ghcr.io/nsu/nsu-llm-node:gpu " ]
   check "only the tags this release created are removed afterwards" $? "$rmi"
   [ -z "$(grep -E '^docker (build|rmi|tag|push)' "$FAKE_LOG" | grep -E ' (-t )?nsu-llm-(main|node)')" ]
-  check "the plain nsu-llm-main:0.1.0 / nsu-llm-node tags of other services are never used" $? "$(cat "$FAKE_LOG")"
+  check "the plain nsu-llm-main:0.2.0 / nsu-llm-node tags of other services are never used" $? "$(cat "$FAKE_LOG")"
 
   # --skip-build pushes existing local tags and removes none
   new_repo skip
@@ -208,6 +208,25 @@ $(cat "$FAKE_LOG")"
 else
   echo "skip - real-run scenarios (token file mode 0600 needs Linux); run on Linux"
 fi
+
+# ------------------------------------------------------------------ check-versions.sh: every place that names the image version
+# (node/IMAGE_VERSION is the one source; install-main.sh, run-main.*, entrypoint.sh, render_manifests.py, config.py, .env.example follow it)
+REPO_ROOT="$(cd "$RELEASE_DIR/.." && pwd)"
+out="$(bash "$RELEASE_DIR/check-versions.sh" "$REPO_ROOT" 2>&1)"; rc=$?
+check "check-versions: the real checkout names one version everywhere" "$rc" "$out"
+CV="$TMP/cv"; mkdir -p "$CV"; ( cd "$REPO_ROOT" && tar -cf - node/IMAGE_VERSION main/install-main.sh main/run-main.sh main/run-main.ps1 main/entrypoint.sh main/render_manifests.py portal/app/config.py .env.example ) | tar -xf - -C "$CV"
+out="$(bash "$RELEASE_DIR/check-versions.sh" "$CV" 2>&1)"; rc=$?
+check "check-versions: a copy of the files passes" "$rc" "$out"
+for f in main/install-main.sh main/run-main.sh main/run-main.ps1 main/entrypoint.sh main/render_manifests.py portal/app/config.py .env.example; do
+  cp "$CV/$f" "$CV/$f.orig"; sed -i 's/0\.1\.0/9.9.9/g' "$CV/$f"
+  out="$(bash "$RELEASE_DIR/check-versions.sh" "$CV" 2>&1)"; rc=$?
+  [ "$rc" != 0 ] && grep -q "^$f: " <<<"$out"
+  check "check-versions: $f with another version is named" $? "rc=$rc $out"
+  mv "$CV/$f.orig" "$CV/$f"
+done
+out="$(bash "$RELEASE_DIR/check-versions.sh" "$CV" 9.9.9 2>&1)"; rc=$?
+[ "$rc" != 0 ] && grep -q "версия выпуска 9.9.9" <<<"$out"
+check "check-versions: the release version must equal node/IMAGE_VERSION" $? "rc=$rc $out"
 
 echo
 if [ "$FAILED" = 0 ]; then echo "ALL PASSED"; else echo "SOME FAILED"; exit 1; fi

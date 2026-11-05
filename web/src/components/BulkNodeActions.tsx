@@ -1,9 +1,15 @@
 import { Check, CircleAlert } from "lucide-react";
 import { useRef, useState } from "react";
 import { api, ApiError } from "../api";
-import type { Deployment, NodeInfo } from "../types";
+import { waitsForApproval, type Deployment, type NodeInfo } from "../types";
 import { Confirm, Modal } from "./Modal";
+import { DeleteNote, deleteResultText, heldBy } from "./NodeDelete";
+import { heldText, PurgeNote, purgeResultText } from "./PurgeModels";
 import { Ic } from "./ui";
+
+/** what approving a node means, in the confirmation of «Подтвердить» */
+export const APPROVE_NOTE =
+  "Подтверждённая нода получит развёртывание, свой ключ бэкенда и попадёт в шлюз. Подтверждайте только машины, которые вы подключали сами: сверьте имя и адрес.";
 
 /** the text of the confirmation when a node of a split group leaves its work */
 export const SPLIT_WARNING =
@@ -12,7 +18,10 @@ export const SPLIT_WARNING =
 type Action =
   | { kind: "assign"; deployment: Deployment | null }
   | { kind: "maintenance"; on: boolean }
-  | { kind: "wake" };
+  | { kind: "wake" }
+  | { kind: "purge" }
+  | { kind: "approve" }
+  | { kind: "delete" };
 
 type Outcome = "waiting" | "running" | "ok" | "error";
 interface Item {
@@ -38,19 +47,44 @@ export function nodesWord(n: number): string {
 
 const NONE = "none";
 
+/** the deployments the nodes work for, each once, with its mode */
+function heldUnion(nodes: NodeInfo[], deployments: Deployment[]) {
+  const byName = new Map(nodes.flatMap((n) => heldBy(n, deployments, null)).map((d) => [d.name, d]));
+  return [...byName.values()];
+}
+
 function titleOf(a: Action): string {
   if (a.kind === "assign") return a.deployment ? `Назначить развёртывание ${a.deployment.name}` : "Снять назначение";
   if (a.kind === "maintenance") return a.on ? "Перевести на обслуживание" : "Вернуть в работу";
+  if (a.kind === "purge") return "Очистить модели";
+  if (a.kind === "approve") return "Подтвердить ноды";
+  if (a.kind === "delete") return "Удалить из кластера";
   return "Разбудить ноды";
 }
 
 const confirmLabelOf = (a: Action) =>
-  a.kind === "assign" ? (a.deployment ? "Назначить" : "Снять назначение") : a.kind === "wake" ? "Разбудить" : a.on ? "На обслуживание" : "Вернуть в работу";
+  a.kind === "assign"
+    ? a.deployment
+      ? "Назначить"
+      : "Снять назначение"
+    : a.kind === "wake"
+      ? "Разбудить"
+      : a.kind === "purge"
+        ? "Очистить"
+        : a.kind === "approve"
+          ? "Подтвердить"
+          : a.kind === "delete"
+          ? "Удалить"
+          : a.on
+          ? "На обслуживание"
+          : "Вернуть в работу";
 
 /** the nodes an action is meaningful for: already settled ones are left out */
 function targetsOf(a: Action, selected: NodeInfo[]): NodeInfo[] {
   if (a.kind === "maintenance") return selected.filter((n) => n.maintenance !== a.on);
   if (a.kind === "wake") return selected.filter((n) => !n.ready);
+  if (a.kind === "purge") return selected.filter((n) => n.ready); // a node that is down cannot clean itself
+  if (a.kind === "approve") return selected.filter(waitsForApproval);
   return selected;
 }
 
@@ -58,7 +92,8 @@ function errorText(e: unknown, fallback: string): string {
   return e instanceof ApiError ? e.detail : fallback;
 }
 
-async function perform(a: Action, node: string): Promise<string> {
+async function perform(a: Action, node: string, held: boolean): Promise<string> {
+  if (a.kind === "delete") return deleteResultText(await api.deleteNode(node, held));
   if (a.kind === "assign") {
     await api.assignNode(node, a.deployment ? a.deployment.id : null);
     return a.deployment ? "Назначено" : "Назначение снято";
@@ -66,6 +101,11 @@ async function perform(a: Action, node: string): Promise<string> {
   if (a.kind === "maintenance") {
     await api.setMaintenance(node, a.on);
     return a.on ? "На обслуживании" : "Возвращена в работу";
+  }
+  if (a.kind === "purge") return purgeResultText(await api.purgeNodeModels(node));
+  if (a.kind === "approve") {
+    await api.approveNode(node);
+    return "Подтверждена";
   }
   const r = await api.wakeNode(node);
   return r.relay ? `Пакет отправлен, в том числе через ноду ${r.relay}` : "Пакет отправлен";
@@ -96,7 +136,8 @@ export function BulkNodeActions({ selected, deployments, splitNames, onFinished 
   async function start(action: Action) {
     if (running.current) return;
     running.current = true;
-    const targets = targetsOf(action, selected).map((n) => n.name);
+    const picked = targetsOf(action, selected);
+    const targets = picked.map((n) => n.name);
     setConfirm(null);
     setRun({ action, items: targets.map((node) => ({ node, outcome: "waiting", text: "Ожидает" })), done: false });
     const patch = (node: string, outcome: Outcome, text: string) =>
@@ -105,7 +146,8 @@ export function BulkNodeActions({ selected, deployments, splitNames, onFinished 
     for (const node of targets) {
       patch(node, "running", "Выполняется");
       try {
-        patch(node, "ok", await perform(action, node));
+        // a node with a deployment is removed with `force`: the confirmation named the deployment
+        patch(node, "ok", await perform(action, node, !!picked.find((n) => n.name === node)?.deployment));
       } catch (e) {
         failed.push(node);
         patch(node, "error", errorText(e, "Не удалось выполнить действие"));
@@ -125,13 +167,16 @@ export function BulkNodeActions({ selected, deployments, splitNames, onFinished 
   const splitInvolved =
     !!confirm &&
     confirm.kind !== "wake" &&
+    confirm.kind !== "purge" &&
+    confirm.kind !== "approve" &&
+    confirm.kind !== "delete" && // «Удалить из кластера» says it per node (DeleteNote)
     !(confirm.kind === "maintenance" && !confirm.on) &&
     targets.some((n) => n.deployment && splitNames.has(n.deployment));
 
   return (
     <div className="bulkbar" role="toolbar" aria-label="Действия над выбранными нодами">
       {count === 0 ? (
-        <span className="muted small">Отметьте ноды, чтобы назначить развёртывание, перевести на обслуживание или разбудить</span>
+        <span className="muted small">Отметьте ноды, чтобы подтвердить, назначить развёртывание, перевести на обслуживание, разбудить, очистить модели или удалить из кластера</span>
       ) : (
         <>
           <span className="bulk-count">
@@ -180,6 +225,30 @@ export function BulkNodeActions({ selected, deployments, splitNames, onFinished 
           >
             Разбудить
           </button>
+          <button
+            type="button"
+            className="btn quiet sm"
+            disabled={noneApplicable({ kind: "purge" })}
+            onClick={() => setConfirm({ kind: "purge" })}
+          >
+            Очистить модели
+          </button>
+          <button
+            type="button"
+            className="btn quiet sm"
+            disabled={noneApplicable({ kind: "approve" })}
+            onClick={() => setConfirm({ kind: "approve" })}
+          >
+            Подтвердить
+          </button>
+          <button
+            type="button"
+            className="btn quiet sm"
+            disabled={noneApplicable({ kind: "delete" })}
+            onClick={() => setConfirm({ kind: "delete" })}
+          >
+            Удалить из кластера…
+          </button>
         </>
       )}
 
@@ -197,9 +266,15 @@ export function BulkNodeActions({ selected, deployments, splitNames, onFinished 
             {targets.map((n) => (
               <li key={n.name} className="mono">
                 {n.name}
+                {confirm.kind === "purge" && <span className="muted"> — {heldText(n)}</span>}
+                {confirm.kind === "delete" && n.deployment && <span className="muted"> — развёртывание {n.deployment}</span>}
+                {confirm.kind === "approve" && n.claim_ip && <span className="muted"> — с адреса {n.claim_ip}</span>}
               </li>
             ))}
           </ul>
+          {confirm.kind === "purge" && <PurgeNote nodes={targets} />}
+          {confirm.kind === "approve" && <p>{APPROVE_NOTE}</p>}
+          {confirm.kind === "delete" && <DeleteNote nodes={targets} held={heldUnion(targets, deployments)} />}
           {splitInvolved && <p>{SPLIT_WARNING}</p>}
         </Confirm>
       )}

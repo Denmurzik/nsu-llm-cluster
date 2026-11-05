@@ -1,0 +1,112 @@
+/* «Настройки»: one card per section, one row per setting */
+
+.settings-page {
+  max-width: 960px;
+}
+
+.settings-group h2 {
+  margin: 0;
+  font-size: 16px;
+  line-height: 24px;
+  font-weight: 500;
+}
+
+.setting {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 400px);
+  gap: var(--s4) var(--s8);
+  padding: var(--s4) 0;
+  border-top: 1px solid var(--line);
+}
+.settings-group h2 + .setting {
+  border-top: 0;
+  padding-top: 0;
+}
+
+.setting-info {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s1);
+  min-width: 0;
+}
+.setting-info .desc {
+  color: var(--text);
+}
+.setting-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--s2);
+}
+
+/* the row of the restart marker keeps the height of its tallest content (the button), so the swap text <-> tag + button
+   does not move what is below */
+.setting-meta.restart-line {
+  min-height: 32px;
+}
+.setting-info .restart-note {
+  margin-top: calc(var(--s1) * -1);
+}
+
+.setting-control {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s2);
+  min-width: 0;
+}
+.setting-control .input {
+  max-width: 200px;
+}
+.setting-buttons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--s2);
+}
+.setting-note {
+  min-height: 16px;
+  margin: 0;
+  color: var(--text-3);
+  font-size: 12px;
+  line-height: 16px;
+}
+
+.tag.warn {
+  color: var(--warn);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--warn) 45%, transparent);
+}
+.tag.set {
+  color: var(--accent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 45%, transparent);
+}
+
+.key-apply {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s2);
+  padding-top: var(--s4);
+  border-top: 1px solid var(--line);
+}
+.key-apply p {
+  margin: 0;
+}
+.key-apply .btn {
+  align-self: flex-start;
+}
+
+@media (max-width: 720px) {
+  /* a note of two lines at phone width: reserve both, so the answer of the job or of a restart does not push the page */
+  .key-apply-status,
+  .restart-note {
+    min-height: 32px;
+  }
+  /* the tag and the button no longer fit one line: keep both lines (20 + 8 + 32) */
+  .setting-meta.restart-line {
+    min-height: 60px;
+  }
+  .setting {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .setting-control .input {
+    max-width: none;
+  }
+}

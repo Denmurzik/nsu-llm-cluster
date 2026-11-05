@@ -86,11 +86,20 @@ spec:
         app.kubernetes.io/part-of: nsu-llm
       annotations:
         llm.nsu/config-hash: "$CONFIG_HASH"
+        llm.nsu/redis-password: "$REDIS_PASSWORD_FINGERPRINT"
     spec:
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
-      nodeSelector:
-        kubernetes.io/hostname: llm-main
+      # только llm-main: по имени объекта Node (его не присвоить себе чужой ноде), а не по метке kubernetes.io/hostname,
+      # которую kubelet ставит себе сам; taint главного (entrypoint.sh) терпят только его поды
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchFields:
+                  - {key: metadata.name, operator: In, values: [llm-main]}
+      tolerations:
+        - {key: node-role.kubernetes.io/control-plane, operator: Exists, effect: NoSchedule}
       initContainers:
         # LiteLLM не ждёт Postgres сам: на холодном старте он уходил бы в CrashLoopBackOff.
         - name: wait-postgres
@@ -104,7 +113,11 @@ spec:
           command:
             - sh
             - -c
-            - until redis-cli -h 127.0.0.1 -p 6379 ping; do sleep 2; done
+            - until redis-cli -h 127.0.0.1 -p 6379 ping | grep -qx PONG; do sleep 2; done
+          env:
+            - name: REDISCLI_AUTH
+              valueFrom:
+                secretKeyRef: {name: llm-secrets, key: REDIS_PASSWORD}
       containers:
         - name: litellm
           image: ghcr.io/berriai/litellm:v1.106.6
@@ -127,6 +140,11 @@ spec:
             - name: LITELLM_SALT_KEY
               valueFrom:
                 secretKeyRef: {name: llm-secrets, key: LITELLM_SALT_KEY}
+            # пароль Redis (requirepass): LiteLLM берёт REDIS_PASSWORD из окружения для каждого своего клиента Redis
+            # (router_settings, coordination_redis, кэш авторизации; v1.106.6 litellm/_redis.py _get_redis_client_logic)
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef: {name: llm-secrets, key: REDIS_PASSWORD}
             - {name: STORE_MODEL_IN_DB, value: "True"}
             - {name: DISABLE_ADMIN_UI, value: "True"}
             - {name: NO_DOCS, value: "True"}
@@ -141,7 +159,7 @@ spec:
             - {name: PROXY_DB_LOOKUP_DEADLINE_SECONDS, value: "30"}
             # Redis со счётчиками 429/5xx для «Состояния» портала (overload_hook.py): тот же адрес, что REDIS_URL портала
             # в entrypoint.sh и redis_host/redis_port в router_settings выше
-            - {name: GATEWAY_STATS_REDIS_URL, value: "redis://127.0.0.1:6379/0"}
+            - {name: GATEWAY_STATS_REDIS_URL, value: "redis://:$$(REDIS_PASSWORD)@127.0.0.1:6379/0"}
           ports:
             - name: http
               containerPort: 4000

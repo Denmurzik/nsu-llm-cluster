@@ -11,11 +11,13 @@ LiteLLM. Из него считается пул соединений каждо
 (127.0.0.1:<порт>, по умолчанию 8090), HF_ENDPOINT (откуда зеркало качает, по умолчанию https://huggingface.co) и
 прокси HTTPS_PROXY / HTTP_PROXY / NO_PROXY.
 
-NVIDIA device plugin (common-45): по умолчанию из GPU-образа ноды NODE_IMAGE_REPO:NODE_IMAGE_TAG-gpu (тот же, что у
-подов инференса; на ноде он уже есть, не скачивается); DEVICE_PLUGIN_IMAGE: образ из зеркала реестра.
+NVIDIA device plugin (common-45): по умолчанию из GPU-образа ноды NODE_IMAGE_REPO:NODE_IMAGE_TAG-gpu (тот же тег, что у
+подов инференса) с imagePullPolicy IfNotPresent: образ, который у ноды уже есть под этим тегом, берётся из каталога образов k3s,
+а нового тега (повышение NODE_IMAGE_TAG) нода скачивает с реестра главного; DEVICE_PLUGIN_IMAGE: образ из зеркала реестра.
 
-Реестр образов для класса (common-50-registry): REGISTRY_IMAGE (по умолчанию registry:2.8.3 с закреплённым digest) и
-REGISTRY_PORT (127.0.0.1:<порт>, по умолчанию 5000).
+Реестр образов для класса (common-50-registry): REGISTRY_IMAGE (по умолчанию registry:2.8.3 с закреплённым digest),
+REGISTRY_BACKEND_PORT (127.0.0.1:<порт> самого реестра, по умолчанию 5001; REGISTRY_PORT, по умолчанию 5000, это адрес Caddy
+только для чтения) и REGISTRY_HTPASSWD (строка htpasswd учётки записи: nsu-push:<bcrypt>, её пишет entrypoint.sh).
 
 `--ca FILE` вместо общих манифестов пишет common-15-ca.yaml: ConfigMap llm-ca с корневым сертификатом главного
 (ca.crt) и системным набором сертификатов вместе с ним (bundle.crt). Поды нод проверяют по нему https-адрес
@@ -45,6 +47,8 @@ VARIABLES = (
     "LITELLM_SALT_KEY",
     "BACKEND_API_KEY",
     "HF_MIRROR_TOKEN",
+    "REDIS_PASSWORD",
+    "HF_MIRROR_ADMIN_TOKEN",
 )
 # Необязательные секреты: пустое значение допустимо (тогда портал не ссылается на ключ из подов).
 OPTIONAL_VARIABLES = ("HF_TOKEN",)
@@ -104,6 +108,11 @@ def _int_setting(env: Mapping[str, str], name: str, default: int, low: int, high
     return int(raw)
 
 
+def _fingerprint(value: str) -> str:
+    """12 hex of the sha256 of a secret: a pod annotation that changes with it (the pod reads the secret only at start)."""
+    return hashlib.sha256(value.encode()).hexdigest()[:12] if value else ""
+
+
 def _mirror_values(env: Mapping[str, str]) -> dict[str, str]:
     upstream = (env.get("HF_ENDPOINT") or "https://huggingface.co").rstrip("/")
     if not re.fullmatch(r"https?://[A-Za-z0-9.-]+(:[0-9]+)?(/[A-Za-z0-9._~/-]*)?", upstream):
@@ -121,19 +130,30 @@ def _mirror_values(env: Mapping[str, str]) -> dict[str, str]:
         "HF_MIRROR_PORT": str(_int_setting(env, "HF_MIRROR_PORT", DEFAULT_HF_MIRROR_PORT, 1024, 65535)),
         "HF_MIRROR_UPSTREAM": upstream,
         "HF_TOKEN_FINGERPRINT": hashlib.sha256(env["HF_TOKEN"].encode()).hexdigest()[:12] if env.get("HF_TOKEN") else "",
+        "HF_MIRROR_TOKEN_FINGERPRINT": _fingerprint(env.get("HF_MIRROR_TOKEN", "") + ":" + env.get("HF_MIRROR_ADMIN_TOKEN", "")),
         "HF_MIRROR_PROXY_ENV": "\n".join(proxy_lines),
         "HF_MIRROR_PY": _indented(HF_MIRROR.read_text(encoding="utf-8")),
     }
 
 
 DEFAULT_NODE_IMAGE_REPO = "nsu-llm-node"
-DEFAULT_NODE_IMAGE_TAG = "0.1.0"
+DEFAULT_NODE_IMAGE_TAG = "0.2.0"
 # registry[:port]/path[:tag][@sha256:digest]: nothing that would leave the quoted YAML value
 _IMAGE = re.compile(r"[a-z0-9]([a-z0-9._/:-]*[a-z0-9])?(@sha256:[0-9a-f]{64})?")
 
 
 def _device_plugin_values(env: Mapping[str, str]) -> dict[str, str]:
-    """Image of the NVIDIA device plugin: the GPU node image (already on every GPU node, never pulled) or a mirror."""
+    """Image of the NVIDIA device plugin: the GPU node image by its tag, or a mirror.
+
+    The policy is IfNotPresent, not Never (task 2-30). Never meant «the node has this tag in its k3s images dir»: it held
+    only while NODE_IMAGE_TAG equalled the tag of the image the node container was started with. After a tag bump (or a
+    restart of a node whose container still ran the old image) every GPU pod of the plugin got ErrImageNeverPull, no node
+    advertised nvidia.com/gpu and no GPU pod could be scheduled. With IfNotPresent the same tag is still taken from the
+    k3s images dir without any traffic, and a tag the node does not have is pulled from the registry of main through the
+    mirror every node writes at start (node/rootfs/opt/llm/bin/entrypoint.sh, registries.yaml): the class LAN, and the
+    layers are those the inference pods (pinned by the digest of that very tag) need anyway. The plugin is not pinned by
+    digest like the pods: this file is rendered when main starts, before its registry answers, and the plugin needs no
+    fresher image than the one its tag names."""
     mirror = env.get("DEVICE_PLUGIN_IMAGE", "").strip()
     if mirror:
         if not _IMAGE.fullmatch(mirror):
@@ -144,21 +164,34 @@ def _device_plugin_values(env: Mapping[str, str]) -> dict[str, str]:
     image = f"{repo}:{tag}-gpu"
     if not _IMAGE.fullmatch(image):
         raise ValueError(f"NODE_IMAGE_REPO / NODE_IMAGE_TAG: недопустимый образ {image!r}")
-    return {"DEVICE_PLUGIN_IMAGE": image, "DEVICE_PLUGIN_PULL_POLICY": "Never"}
+    return {"DEVICE_PLUGIN_IMAGE": image, "DEVICE_PLUGIN_PULL_POLICY": "IfNotPresent"}
 
 
 # Реестр образов для класса: образ закреплён версией и digest индекса (проверено docker buildx imagetools inspect registry:2.8.3).
 DEFAULT_REGISTRY_IMAGE = "registry:2.8.3@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373"
 DEFAULT_REGISTRY_PORT = 5000
+DEFAULT_REGISTRY_BACKEND_PORT = 5001
+REGISTRY_USER = "nsu-push"
+# htpasswd line of the write account: user and a bcrypt hash (caddy hash-password); nothing that leaves the quoted YAML value
+_HTPASSWD = re.compile(re.escape(REGISTRY_USER) + r":\$2[aby]\$[0-9]{2}\$[./A-Za-z0-9]{53}")
 
 
 def _registry_values(env: Mapping[str, str]) -> dict[str, str]:
     image = (env.get("REGISTRY_IMAGE") or DEFAULT_REGISTRY_IMAGE).strip()
     if not _IMAGE.fullmatch(image):
         raise ValueError(f"REGISTRY_IMAGE: нужен образ вида реестр/путь:тег[@sha256:...], получено {image!r}")
+    port = _int_setting(env, "REGISTRY_PORT", DEFAULT_REGISTRY_PORT, 1024, 65535)
+    backend = _int_setting(env, "REGISTRY_BACKEND_PORT", DEFAULT_REGISTRY_BACKEND_PORT, 1024, 65535)
+    if backend == port:
+        raise ValueError(f"REGISTRY_BACKEND_PORT и REGISTRY_PORT должны различаться, обе {port}")
+    htpasswd = env.get("REGISTRY_HTPASSWD", "")
+    if not _HTPASSWD.fullmatch(htpasswd):
+        raise ValueError(f"REGISTRY_HTPASSWD: нужна строка {REGISTRY_USER}:<bcrypt-хеш> (её пишет entrypoint.sh)")
     return {
         "REGISTRY_IMAGE": image,
-        "REGISTRY_PORT": str(_int_setting(env, "REGISTRY_PORT", DEFAULT_REGISTRY_PORT, 1024, 65535)),
+        "REGISTRY_PORT": str(port),
+        "REGISTRY_BACKEND_PORT": str(backend),
+        "REGISTRY_HTPASSWD": htpasswd,
     }
 
 
@@ -203,6 +236,7 @@ def render(env: Mapping[str, str], out_dir: Path) -> list[Path]:
         **_mirror_values(env),
         **_device_plugin_values(env),
         **_registry_values(env),
+        "REDIS_PASSWORD_FINGERPRINT": _fingerprint(env["REDIS_PASSWORD"]),
         "BACKUP_SH": _indented(BACKUP_SCRIPT.read_text(encoding="utf-8")),
         "BACKUP_KEEP": backup_keep,
         "BACKUP_SCHEDULE": backup_schedule,

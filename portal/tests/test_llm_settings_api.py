@@ -19,7 +19,7 @@ REPO = "org/model-GGUF"
 FILE = "model-Q4_K_M.gguf"
 DRAFT_REPO = "org/draft-GGUF"
 SHA = "c" * 40
-ADMIN = {"sub": "adm", "email": "admin@g.nsu.ru"}
+ADMIN = {"sub": "adm", "email": "admin@g.nsu.ru", "email_verified": True}
 META = GgufMeta("llama", 32, 32, 8, 128, 4096, 32768)
 NEW_FIELDS = (
     "reasoning", "kv_cache_type", "sampling", "draft_repo", "draft_file", "draft_revision", "mmproj_file",

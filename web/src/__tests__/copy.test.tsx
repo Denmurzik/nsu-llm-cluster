@@ -15,7 +15,10 @@ const pages: { path: string; role: "user" | "admin" | null; ready: () => Promise
   { path: "/admin/deployments/1", role: "admin", ready: () => screen.findByRole("table", { name: "Поды развёртывания" }) },
   { path: "/admin/nodes", role: "admin", ready: () => screen.findByTestId("join-linux") },
   { path: "/admin/status", role: "admin", ready: () => screen.findByRole("table", { name: "Состояние нод" }) },
+  { path: "/admin/monitoring", role: "admin", ready: () => screen.findByRole("figure", { name: "CPU, загрузка" }) },
   { path: "/admin/users", role: "admin", ready: () => screen.findByRole("row", { name: /a\.petrova/ }) },
+  { path: "/admin/settings", role: "admin", ready: () => screen.findByRole("group", { name: "key_rpm_limit" }) },
+  { path: "/admin/audit", role: "admin", ready: () => screen.findByRole("row", { name: /Развёртывание создано/ }) },
   { path: "/admin/nodes", role: "user", ready: () => screen.findByText("Недостаточно прав") },
 ];
 

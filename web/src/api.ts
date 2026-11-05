@@ -1,7 +1,11 @@
 import type {
   AdminStatus,
-  AdminUser,
+  AdminUsage,
+  AdminUserFull,
+  AuditPage,
   ApiKey,
+  BackupsData,
+  CacheDeleted,
   CatalogModel,
   CommandPreview,
   CreatedKey,
@@ -12,15 +16,28 @@ import type {
   HfFile,
   HfVllmInfo,
   JoinInfo,
+  KeyLimitsJob,
   KvCacheType,
   LocalCatalog,
   Me,
+  MetricsHistory,
+  MetricsLive,
+  MetricsNames,
   MmprojFile,
+  ModelCache,
   ModelUpload,
+  NodeDeleteResult,
   NodesResponse,
   PodLogs,
+  PrefetchJob,
+  PrefetchList,
   PublicStatus,
+  PurgeResult,
+  SystemSetting,
   Usage,
+  UsageGroup,
+  UserPatch,
+  UsersPage,
   WakeResult,
 } from "./types";
 import { validationDetail } from "./lib/validation";
@@ -28,10 +45,13 @@ import { validationDetail } from "./lib/validation";
 export class ApiError extends Error {
   status: number;
   detail: string;
-  constructor(status: number, detail: string) {
+  /** the rest of a JSON error body next to `detail` (a refused node removal lists the deployments it would hurt) */
+  data: Record<string, unknown>;
+  constructor(status: number, detail: string, data: Record<string, unknown> = {}) {
     super(detail);
     this.status = status;
     this.detail = detail;
+    this.data = data;
   }
 }
 
@@ -66,17 +86,19 @@ function headersFor(method: string, hasBody: boolean): Record<string, string> {
 
 async function errorFrom(res: Response): Promise<ApiError> {
   let detail = "";
+  let extra: Record<string, unknown> = {};
   try {
     const data = await res.json();
     if (typeof data?.detail === "string") detail = data.detail;
     else if (Array.isArray(data?.detail)) detail = validationDetail(data.detail);
+    if (data && typeof data === "object" && !Array.isArray(data)) extra = data;
   } catch {
     /* body is not JSON */
   }
   if (!detail) {
     detail = res.status === 503 ? GATEWAY_DOWN : `Ошибка ${res.status}`;
   }
-  return new ApiError(res.status, detail);
+  return new ApiError(res.status, detail, extra);
 }
 
 const isCsrfRejection = (res: Response, err: ApiError) => res.status === 403 && err.detail === "CSRF";
@@ -132,6 +154,10 @@ const put = async <T>(path: string, body: unknown) => (await send<T>("PUT", path
 const del = async (path: string) => {
   await send<void>("DELETE", path);
 };
+/** GET and DELETE with the same handling, for the same reason (lib/nodeVersions.ts) */
+export const getJson = get;
+export const deleteJson = del;
+const delJson = async <T>(path: string) => (await send<T>("DELETE", path)).data;
 
 function qs(params: Record<string, string | number | boolean | null | undefined>): string {
   const p = new URLSearchParams();
@@ -139,6 +165,15 @@ function qs(params: Record<string, string | number | boolean | null | undefined>
   const s = p.toString();
   return s ? `?${s}` : "";
 }
+
+/** Filters of the audit log (`since` and `until` are ISO times) */
+export type AuditQuery = {
+  action?: string;
+  actor?: string;
+  target?: string;
+  since?: string;
+  until?: string;
+};
 
 export interface EstimateParams {
   repo: string;
@@ -217,9 +252,57 @@ export const api = {
   setMaintenance: (name: string, maintenance: boolean) =>
     put<unknown>(`/api/admin/nodes/${encodeURIComponent(name)}/maintenance`, { maintenance }),
   wakeNode: (name: string) => post<WakeResult>(`/api/admin/nodes/${encodeURIComponent(name)}/wake`),
+  /** removes the model files and the tensor cache the node's deployment does not need; waits for the node */
+  purgeNodeModels: (name: string) => post<PurgeResult>(`/api/admin/nodes/${encodeURIComponent(name)}/purge-models`),
+  /** removes the node from the cluster and everything the portal keeps for it; 409 for a node with a deployment unless `force` */
+  deleteNode: (name: string, force = false) =>
+    delJson<NodeDeleteResult>(`/api/admin/nodes/${encodeURIComponent(name)}${qs({ force: force ? 1 : null })}`),
+  /** «Подтвердить»: a new node may serve (audit node.approve) */
+  approveNode: (name: string, claimId?: number) =>
+    post<{ approved: string[] }>(
+      `/api/admin/nodes/${encodeURIComponent(name)}/approve`,
+      claimId === undefined ? {} : { claim_id: claimId },
+    ),
+  /** «Отклонить»: one claim on the name, or all of them */
+  rejectClaims: (name: string, claimId?: number) =>
+    delJson<{ node: string; rejected: number }>(
+      `/api/admin/nodes/${encodeURIComponent(name)}/claims${qs({ claim_id: claimId ?? null })}`,
+    ),
+  /** «Сбросить ключ ноды»: the key and the approval go, the node registers again and waits for approval */
+  resetNodeKey: (name: string) =>
+    post<{ node: string; approved: boolean }>(`/api/admin/nodes/${encodeURIComponent(name)}/reset-key`),
   join: () => get<JoinInfo>("/api/admin/join"),
   adminStatus: () => get<AdminStatus>("/api/admin/status"),
-  users: () => get<AdminUser[]>("/api/admin/users"),
+  backups: () => get<BackupsData>("/api/admin/backups"),
+  runBackup: () => post<{ job: string }>("/api/admin/backups"),
+  deleteBackup: (name: string) => del(`/api/admin/backups/${encodeURIComponent(name)}`),
+  adminUsage: (p: { from: string; to: string; group: UsageGroup }) => get<AdminUsage>(`/api/admin/usage${qs(p)}`),
+  metricsLive: () => get<MetricsLive>("/api/admin/metrics/live"),
+  metricsNames: () => get<MetricsNames>("/api/admin/metrics/names"),
+  metricsHistory: (kind: "node" | "model", name: string, from: Date, to: Date) =>
+    get<MetricsHistory>(
+      `/api/admin/metrics/history?kind=${kind}&name=${encodeURIComponent(name)}&from=${encodeURIComponent(from.toISOString())}&to=${encodeURIComponent(to.toISOString())}`,
+    ),
+  settings: () => get<SystemSetting[]>("/api/admin/settings"),
+  putSetting: (key: string, value: number | boolean) =>
+    put<SystemSetting>(`/api/admin/settings/${encodeURIComponent(key)}`, { value }),
+  /** back to the value of the .env */
+  resetSetting: (key: string) => delJson<SystemSetting>(`/api/admin/settings/${encodeURIComponent(key)}`),
+  applyKeyLimits: () => post<KeyLimitsJob>("/api/admin/key-limits/apply"),
+  keyLimitsJob: () => get<KeyLimitsJob>("/api/admin/key-limits/job"),
+  restartMirror: () => post<SystemSetting>("/api/admin/hf-mirror/restart"),
+  users: (q: { q?: string; role?: string; blocked?: boolean; limit: number; offset: number }) =>
+    get<UsersPage>(`/api/admin/users${qs(q)}`),
+  patchUser: (id: string, body: UserPatch) => patch<AdminUserFull>(`/api/admin/users/${id}`, body),
+  /** the keys of one user as the user sees them (masked); `usageUnavailable`: the gateway could not count the tokens */
+  async userKeys(id: string): Promise<{ keys: ApiKey[]; usageUnavailable: boolean }> {
+    const r = await send<ApiKey[]>("GET", `/api/admin/users/${id}/keys`);
+    return { keys: r.data, usageUnavailable: r.headers.get("X-Usage-Unavailable") === "1" };
+  },
+  revokeUserKey: (userId: string, keyId: string) => del(`/api/admin/users/${userId}/keys/${keyId}`),
+  audit: (q: AuditQuery & { limit: number; offset: number }) => get<AuditPage>(`/api/admin/audit${qs(q)}`),
+  /** the address of the CSV of the filtered log: a plain link, the browser sends the session cookie */
+  auditExportUrl: (q: AuditQuery) => `/api/admin/audit/export${qs(q)}`,
   podLogs: (name: string, lines = 200) =>
     get<PodLogs>(`/api/admin/pods/${encodeURIComponent(name)}/logs?lines=${lines}`),
 
@@ -233,7 +316,23 @@ export const api = {
   finishUpload: (id: string) => post<ModelUpload>(`/api/admin/local-models/uploads/${id}/finish`),
   cancelUpload: (id: string) => del(`/api/admin/local-models/uploads/${id}`),
   putUploadPart: (id: string, offset: number, part: Blob, signal?: AbortSignal) => sendPart(id, offset, part, signal),
+
+  // the cache of the mirror and the downloads into it (task 2-29)
+  modelCache: () => get<ModelCache>("/api/admin/cache"),
+  /** a file of the cache (`path`), or the whole repository */
+  deleteCached: async (repo: string, path?: string) =>
+    (await send<CacheDeleted>("DELETE", `/api/admin/cache/${encodePath(path ? `${repo}/${path}` : repo)}`)).data,
+  prefetchJobs: () => get<PrefetchList>("/api/admin/prefetch"),
+  prefetch: (body: { repo: string; revision?: string | null; files: string[] }) =>
+    post<{ jobs: PrefetchJob[] }>("/api/admin/prefetch", body),
+  /** stops a queued or running download; a finished one leaves the list */
+  cancelPrefetch: (id: string) => del(`/api/admin/prefetch/${encodeURIComponent(id)}`),
+  clearPrefetch: () => del("/api/admin/prefetch"),
+  /** the weights of a deployment (model, projector, draft model) at its pinned commits */
+  prefetchDeployment: (id: number) => post<{ jobs: PrefetchJob[] }>(`/api/admin/deployments/${id}/prefetch`),
 };
+
+const encodePath = (path: string) => path.split("/").map(encodeURIComponent).join("/");
 
 /** One part of an upload as raw bytes; a 409 carries the offset the server has in `Upload-Offset`. */
 export class OffsetMismatch extends ApiError {

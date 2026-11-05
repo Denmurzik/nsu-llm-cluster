@@ -5,7 +5,7 @@ export MSYS_NO_PATHCONV=1
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 NODE="$(cd "$HERE/.." && pwd)"
-IMAGE="${IMAGE:-nsu-llm-node:0.1.0-cpu}"
+IMAGE="${IMAGE:-nsu-llm-node:0.2.0-cpu}"
 CTR="it-t2-standalone"
 VOL="it-t2-models"
 MOCK_PORT="${MOCK_PORT:-$((29100 + RANDOM % 800))}"
@@ -77,9 +77,12 @@ docker run -d --name "$CTR" --hostname "$NAME" --add-host host.docker.internal:h
   "$IMAGE" >/dev/null || { echo "docker run failed"; exit 1; }
 
 wait_for "register call recorded" 60 calls_ok '[.[] | select(.path=="/api/nodes/register")] | length >= 1' || { docker logs "$CTR" 2>&1 | tail -20; exit 1; }
-calls_ok '[.[] | select(.path=="/api/nodes/register")][0].body | (.name=="it-t2-node" and .accel=="cpu" and .version=="0.1.0" and .vram_mib==null and (.ram_mib|type=="number") and (.url=="http://127.0.0.1:18080"))' \
+calls_ok '[.[] | select(.path=="/api/nodes/register")][0].body | (.name=="it-t2-node" and .accel=="cpu" and .version=="0.2.0" and .vram_mib==null and (.ram_mib|type=="number") and (.url=="http://127.0.0.1:18080"))' \
   && pass "register payload fields" || fail "register payload fields"
 calls_ok 'all(.[]; .auth=="Bearer test-token")' && pass "bearer token sent" || fail "bearer token sent"
+# the image the container runs goes to the portal after the registration (task 2-30): version and revision come from the image
+wait_for "image report recorded" 30 calls_ok '[.[] | select(.method=="POST" and .path=="/api/nodes/it-t2-node/image")] | length >= 1'
+calls_ok '[.[] | select(.path=="/api/nodes/it-t2-node/image")][0].body | (.version=="0.2.0" and (.revision|type=="string") and .digest=="" and .tag=="")'   && pass "image report payload (version from the image, no digest or name without run-node)" || fail "image report payload"
 
 # --- desired h1 ---
 wait_for "heartbeat reports h1" 300 hb_reported '"h1"' || { docker logs "$CTR" 2>&1 | tail -30; exit 1; }

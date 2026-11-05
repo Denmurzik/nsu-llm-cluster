@@ -1,0 +1,93 @@
+{
+  "kind": "model",
+  "name": "gemma-4-e4b",
+  "from": "2026-11-04T09:00:00+00:00",
+  "to": "2026-11-04T10:00:00+00:00",
+  "step": 60,
+  "points": [
+    {
+      "t": "2026-11-04T09:50:00+00:00",
+      "backends": 2,
+      "backends_up": 2,
+      "tok_s_gen": 38.0,
+      "tok_s_prompt": 500.0,
+      "slots_busy": 1.0,
+      "queue": 0,
+      "rpm": 2.0,
+      "e429": 0,
+      "e5xx": 0,
+      "ttft_p50_ms": 350.0,
+      "ttft_p95_ms": 800.0
+    },
+    {
+      "t": "2026-11-04T09:51:00+00:00",
+      "backends": 2,
+      "backends_up": 2,
+      "tok_s_gen": 41.0,
+      "tok_s_prompt": 520.0,
+      "slots_busy": 1.0,
+      "queue": 0,
+      "rpm": 6.0,
+      "e429": 0,
+      "e5xx": 0,
+      "ttft_p50_ms": 380.0,
+      "ttft_p95_ms": 910.0
+    },
+    {
+      "t": "2026-11-04T09:52:00+00:00",
+      "backends": 2,
+      "backends_up": 2,
+      "tok_s_gen": 39.5,
+      "tok_s_prompt": 540.0,
+      "slots_busy": 1.0,
+      "queue": 2,
+      "rpm": 14.0,
+      "e429": 1,
+      "e5xx": 0,
+      "ttft_p50_ms": 520.0,
+      "ttft_p95_ms": 1500.0
+    },
+    {
+      "t": "2026-11-04T09:53:00+00:00",
+      "backends": 2,
+      "backends_up": 2,
+      "tok_s_gen": 40.2,
+      "tok_s_prompt": 560.0,
+      "slots_busy": 1.0,
+      "queue": 1,
+      "rpm": 9.0,
+      "e429": 0,
+      "e5xx": 1,
+      "ttft_p50_ms": 400.0,
+      "ttft_p95_ms": 1100.0
+    },
+    {
+      "t": "2026-11-04T09:54:00+00:00",
+      "backends": 2,
+      "backends_up": 2,
+      "tok_s_gen": 42.0,
+      "tok_s_prompt": 580.0,
+      "slots_busy": 1.0,
+      "queue": 0,
+      "rpm": 4.0,
+      "e429": 0,
+      "e5xx": 0,
+      "ttft_p50_ms": 340.0,
+      "ttft_p95_ms": 760.0
+    },
+    {
+      "t": "2026-11-04T09:55:00+00:00",
+      "backends": 2,
+      "backends_up": 2,
+      "tok_s_gen": null,
+      "tok_s_prompt": 600.0,
+      "slots_busy": 1.0,
+      "queue": 0,
+      "rpm": 1.0,
+      "e429": 0,
+      "e5xx": 0,
+      "ttft_p50_ms": null,
+      "ttft_p95_ms": null
+    }
+  ]
+}

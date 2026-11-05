@@ -9,8 +9,10 @@ from app.k8s import (
     A_SPEC_HASH,
     L_ACCEL,
     L_DEPLOYMENT,
+    L_NODE_DEPLOYMENT,
     L_VRAM,
     Endpoint,
+    JobInfo,
     K8sUnavailable,
     NodeInfo,
     OwnedWorkload,
@@ -40,7 +42,12 @@ class FakeK8s:
         self.deleted_nodes: list[str] = []
         self.tainted_nodes: list[str] = []  # every add_class_taint() call that changed a node
         self.deleted_pods: list[str] = []
-        self.jobs: list[dict] = []  # every create_job() call (Wake-on-LAN relays)
+        self.jobs: list[dict] = []  # every create_job() call (Wake-on-LAN relays, models cleanups)
+        self.job_names: list[str] = []  # the name each of `jobs` got
+        # job name -> (active, succeeded, failed) as read_job() reports it; a Job not listed here is running
+        self.job_states: dict[str, tuple[int, int, int]] = {}
+        self.job_conditions: dict[str, tuple[str, str]] = {}  # job name -> (condition, reason) as read_job() reports it
+        self.job_logs: dict[str, str] = {}  # job name -> its pod's log
         self.agent_token: str | None = None  # content of k3s server/agent-token
         self.heartbeats: dict[str, datetime] = {}  # node name -> last kubelet lease renewal
         self.heartbeats_unavailable = False  # only the lease listing fails, the node list still works
@@ -50,6 +57,8 @@ class FakeK8s:
         self.rpc_templates: dict[tuple[str, str], str] = {}
         self.config_maps: dict[str, dict[str, str]] = {}
         self.config_map_writes: list[str] = []  # every put_config_map() call, in order
+        self.restarted: list[str] = []  # every restart_deployment() call, in order
+        self.missing_deployments: set[str] = set()  # restart_deployment() answers False for these
 
     def _check(self):
         if self.unavailable:
@@ -129,8 +138,8 @@ class FakeK8s:
         changes = {}
         if L_ACCEL in labels:
             changes["accel"] = labels[L_ACCEL]
-        if L_DEPLOYMENT in labels:
-            changes["deployment"] = labels[L_DEPLOYMENT]
+        if L_NODE_DEPLOYMENT in labels:  # the node's deployment (k8s.L_NODE_DEPLOYMENT); the old llm.nsu/deployment is ignored
+            changes["deployment"] = labels[L_NODE_DEPLOYMENT]
         if L_VRAM in labels:
             changes["vram_mib"] = int(labels[L_VRAM]) if labels[L_VRAM] is not None else None
         self.nodes[name] = replace(node, **changes)
@@ -214,11 +223,37 @@ class FakeK8s:
             )
         return owned
 
-    async def create_job(self, manifest: dict) -> None:
+    async def create_job(self, manifest: dict) -> str:
         self._check()
         if manifest["kind"] != "Job":
             raise ValueError(f"not a Job: {manifest['kind']}")
         self.jobs.append(manifest)
+        name = f"{manifest['metadata'].get('generateName', 'job-')}{len(self.jobs):05d}"
+        self.job_names.append(name)
+        return name
+
+    def finish_job(self, name: str, ok: bool = True, log: str = "") -> None:
+        """Test helper: the Job ended (succeeded or failed) with this pod log."""
+        self.job_states[name] = (0, 1, 0) if ok else (0, 0, 1)
+        self.job_logs[name] = log
+
+    def kill_job(self, name: str, reason: str = "DeadlineExceeded") -> None:
+        """Test helper: the Job hit its deadline: Failed condition, no pod counted as failed, no log."""
+        self.job_states[name] = (0, 0, 0)
+        self.job_conditions[name] = ("Failed", reason)
+        self.job_logs[name] = ""
+
+    async def read_job(self, name: str) -> JobInfo | None:
+        self._check()
+        if name not in self.job_names:
+            return None
+        active, succeeded, failed = self.job_states.get(name, (1, 0, 0))
+        condition, reason = self.job_conditions.get(name, ("", ""))
+        return JobInfo(name, active, succeeded, failed, condition, reason)
+
+    async def job_log(self, name: str, lines: int = 50) -> str:
+        self._check()
+        return "\n".join(self.job_logs.get(name, "").splitlines()[-lines:])
 
     async def apply(self, manifest: dict) -> None:
         self._check()
@@ -235,6 +270,11 @@ class FakeK8s:
         if kind == "Deployment":
             for pod in [p for p, fp in self.pods.items() if fp.info.workload == name or p.startswith(f"{name}-")]:
                 self._remove_pod(pod, force=False)
+
+    async def restart_deployment(self, name: str) -> bool:
+        self._check()
+        self.restarted.append(name)
+        return name not in self.missing_deployments
 
     async def put_config_map(self, name: str, data: dict[str, str]) -> None:
         self._check()

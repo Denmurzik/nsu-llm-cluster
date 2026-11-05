@@ -235,9 +235,9 @@ async def test_nobody_is_signed_in_means_the_body_is_not_read(client, app, env, 
     read = []
     original = playground._read_chat_request
 
-    async def spy(request):
+    async def spy(*args, **kwargs):
         read.append(1)
-        return await original(request)
+        return await original(*args, **kwargs)
 
     monkeypatch.setattr(playground, "_read_chat_request", spy)
     body = b'{"model": "text-m", "messages": [{"role": "user", "content": "' + b"a" * 2_000_000 + b'"}]}'

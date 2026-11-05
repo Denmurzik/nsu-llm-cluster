@@ -65,8 +65,18 @@ def _portal_env_for(tmp_path, **env):
 
 
 def test_portal_gets_the_server_token_only_while_legacy_nodes_are_allowed(tmp_path):
-    assert "CLUSTER_TOKEN=server-secret" in _portal_env_for(tmp_path)
     assert "CLUSTER_TOKEN=server-secret" in _portal_env_for(tmp_path, NODE_LEGACY_TOKEN="true")
+    # not set in .env: the default of this install (entrypoint.sh legacy_default, SEC-2 L3)
+    out = _portal_env_for(tmp_path, legacy_default="true")
+    assert "CLUSTER_TOKEN=server-secret" in out and "NODE_LEGACY_TOKEN=true" in out
+
+
+def test_a_fresh_install_does_not_take_the_server_token_from_nodes(tmp_path):
+    """SEC-2 L3: without NODE_LEGACY_TOKEN in .env a new install refuses the k3s server token from nodes."""
+    for env in ({}, {"legacy_default": "false"}):
+        out = _portal_env_for(tmp_path, **env)
+        assert "CLUSTER_TOKEN" not in out and "server-secret" not in out, env
+        assert "NODE_LEGACY_TOKEN=false" in out, env
 
 
 def test_an_own_certificate_tells_the_portal_to_send_nodes_to_the_name(tmp_path):

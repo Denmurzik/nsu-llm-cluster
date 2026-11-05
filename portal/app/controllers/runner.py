@@ -6,6 +6,8 @@ from fastapi import FastAPI
 
 from app.controllers.backends import BackendController
 from app.controllers.local_models import LocalModelsController
+from app.controllers.metrics import MetricsController
+from app.controllers.user_limits import UserLimitsController
 from app.controllers.workloads import WorkloadController
 
 log = logging.getLogger(__name__)
@@ -45,6 +47,8 @@ def start(app: FastAPI) -> None:
         ("workloads", WorkloadController(app.state)),
         ("backends", BackendController(app.state)),
         ("local-models", LocalModelsController(app.state)),
+        ("metrics", MetricsController(app.state)),
+        ("user-limits", UserLimitsController(app.state)),
     ]
     app.state.controller_tasks = [
         asyncio.create_task(_loop(name, ctl, interval), name=f"controller-{name}") for name, ctl in controllers

@@ -1,5 +1,5 @@
 {
-  "leader": "LLAMA_API_KEY=*** HF_ENDPOINT=https://llm.example/hf/c/<нода> HF_TOKEN=*** llama-server --host 0.0.0.0 --port 18080 --jinja --cache-ram 512 -fa auto --ctx-size 16384 --parallel 2 --no-kv-unified -ngl 0 -t $THREADS --alias gemma-4-e4b --reasoning off --cache-type-k q8_0 --cache-type-v q8_0 -m /var/lib/llm-models/unsloth__gemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q4_K_M.gguf --no-mmproj",
+  "leader": "LLAMA_API_KEY=*** HF_ENDPOINT=https://llm.example/hf/c/<нода> HF_TOKEN=*** llama-server --host 0.0.0.0 --port 18080 --jinja --metrics --cache-ram 512 -fa auto --ctx-size 16384 --parallel 2 --no-kv-unified -ngl 0 -t $THREADS --alias gemma-4-e4b --reasoning off --cache-type-k q8_0 --cache-type-v q8_0 -m /var/lib/llm-models/unsloth__gemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q4_K_M.gguf --no-mmproj",
   "rpc": null,
   "notes": [
     "Показана команда для CPU-ноды; на ноде с видеокартой -ngl 99.",

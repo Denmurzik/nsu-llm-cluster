@@ -6,9 +6,24 @@ metadata:
     app.kubernetes.io/part-of: nsu-llm
 ---
 # Реестр образов для класса (CNCF distribution, registry:2): ноды берут образы ноды с главного по LAN, а не с ghcr.io.
-# Слушает только 127.0.0.1 контейнера главного: класс ходит через Caddy (https://<главный>/v2/, только чтение и только из
-# REGISTRY_ALLOW_FROM), записывает в него только главный сам (install-main.sh кладёт образы через ctr на 127.0.0.1).
-# Образы лежат в /var/lib/llm-registry главного контейнера (том llm-main-registry).
+# Слушает только 127.0.0.1:REGISTRY_BACKEND_PORT контейнера главного и принимает только запросы с паролем (htpasswd, учётка
+# nsu-push, SEC-2 M2): поды главного работают в одном сетевом пространстве (hostNetwork), и без пароля в реестр писал бы любой
+# процесс с доступом к 127.0.0.1. Читают через Caddy, который подставляет пароль только для GET и HEAD: класс по
+# https://<главный>/v2/ (только из REGISTRY_ALLOW_FROM), портал и install-main.sh по http://127.0.0.1:REGISTRY_PORT.
+# Записывает только registry-push.sh главного (пароль из secrets.env). Образы лежат в /var/lib/llm-registry главного
+# контейнера (том llm-main-registry).
+apiVersion: v1
+kind: Secret
+metadata:
+  name: llm-registry-auth
+  namespace: llm
+  labels:
+    app.kubernetes.io/part-of: nsu-llm
+type: Opaque
+stringData:
+  # только bcrypt-хеш пароля REGISTRY_PASSWORD (entrypoint.sh): сам пароль у Caddy и registry-push.sh
+  htpasswd: "$REGISTRY_HTPASSWD"
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -34,34 +49,53 @@ spec:
     spec:
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
-      nodeSelector:
-        kubernetes.io/hostname: llm-main
+      # только llm-main: по имени объекта Node (его не присвоить себе чужой ноде), а не по метке kubernetes.io/hostname,
+      # которую kubelet ставит себе сам; taint главного (entrypoint.sh) терпят только его поды
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchFields:
+                  - {key: metadata.name, operator: In, values: [llm-main]}
+      tolerations:
+        - {key: node-role.kubernetes.io/control-plane, operator: Exists, effect: NoSchedule}
       containers:
         - name: registry
           image: $REGISTRY_IMAGE
           imagePullPolicy: IfNotPresent
           env:
-            - {name: REGISTRY_HTTP_ADDR, value: "127.0.0.1:$REGISTRY_PORT"}
+            - {name: REGISTRY_HTTP_ADDR, value: "127.0.0.1:$REGISTRY_BACKEND_PORT"}
+            - {name: REGISTRY_AUTH, value: htpasswd}
+            - {name: REGISTRY_AUTH_HTPASSWD_REALM, value: nsu-llm-registry}
+            - {name: REGISTRY_AUTH_HTPASSWD_PATH, value: /auth/htpasswd}
             - {name: REGISTRY_STORAGE_FILESYSTEM_ROOTDIRECTORY, value: /var/lib/registry}
             # удаление нужно, чтобы убрать старую версию образа и освободить диск (registry garbage-collect)
             - {name: REGISTRY_STORAGE_DELETE_ENABLED, value: "true"}
             - {name: REGISTRY_LOG_LEVEL, value: info}
           ports:
             - name: http
-              containerPort: $REGISTRY_PORT
+              containerPort: $REGISTRY_BACKEND_PORT
+          # /v2/ без пароля отвечает 401: проверяется, что порт принимает соединения
           readinessProbe:
-            httpGet: {host: 127.0.0.1, port: $REGISTRY_PORT, path: /v2/}
+            tcpSocket: {host: 127.0.0.1, port: $REGISTRY_BACKEND_PORT}
             periodSeconds: 10
           livenessProbe:
-            httpGet: {host: 127.0.0.1, port: $REGISTRY_PORT, path: /v2/}
+            tcpSocket: {host: 127.0.0.1, port: $REGISTRY_BACKEND_PORT}
             periodSeconds: 20
             timeoutSeconds: 10
             failureThreshold: 6
           volumeMounts:
             - name: data
               mountPath: /var/lib/registry
+            - name: auth
+              mountPath: /auth
+              readOnly: true
       volumes:
         - name: data
           hostPath:
             path: /var/lib/llm-registry
             type: DirectoryOrCreate
+        - name: auth
+          secret:
+            secretName: llm-registry-auth
+            defaultMode: 0400

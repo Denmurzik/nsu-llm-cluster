@@ -21,7 +21,7 @@ from tests.test_local_store import gguf_bytes, later_shard_bytes, put
 
 pytestmark = pytest.mark.docker
 
-ADMIN = {"sub": "adm", "email": "admin@g.nsu.ru"}
+ADMIN = {"sub": "adm", "email": "admin@g.nsu.ru", "email_verified": True}
 USER = {"sub": "usr", "email": "ivan@g.nsu.ru"}
 API = "/api/admin/local-models"
 

@@ -252,3 +252,50 @@ table.data .pick input {
 .attach-tray::-webkit-scrollbar {
   display: none;
 }
+
+/* a version tag that says the node runs another image than main offers (NodeVersions.tsx) */
+.tag.warn {
+  color: var(--warn);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--warn) 45%, transparent);
+}
+
+/* the actions of a node row: the buttons side by side, under them one reserved line for the answer of «Очистить модели»
+   (the line is there before the answer, so the rows below do not move; a long answer is cut, the full text is in title) */
+.node-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: var(--s2);
+}
+.node-actions-note {
+  /* as wide as the buttons above it and no wider: a long answer must not widen the column (the table would shift) */
+  flex-basis: 100%;
+  width: 0;
+  min-width: 100%;
+  min-height: 1.4em;
+  margin-left: auto;
+  text-align: right;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.node-actions-note > * {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* the «⋯» column of the nodes table: as wide as the button, the menu itself is a layer over the page */
+table.data th.menu-cell,
+table.data td.menu-cell {
+  width: 1%;
+  padding-left: 0;
+  text-align: right;
+  white-space: nowrap;
+}
+
+/* what «Удалить из кластера…» removes (NodeDelete.tsx) */
+.delete-list {
+  margin: var(--s1) 0 var(--s3);
+  padding-left: var(--s5);
+}

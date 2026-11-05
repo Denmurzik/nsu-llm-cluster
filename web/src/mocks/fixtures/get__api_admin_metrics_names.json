@@ -1,0 +1,10 @@
+{
+  "node": [
+    "aud-101-pc02",
+    "aud-204-gpu01"
+  ],
+  "model": [
+    "gemma-4-e4b",
+    "qwen3-30b-a3b"
+  ]
+}

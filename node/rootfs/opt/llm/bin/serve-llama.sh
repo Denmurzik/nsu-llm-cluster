@@ -172,7 +172,7 @@ fi
 
 cmd=(llama-server
   --host 0.0.0.0 --port "$INFER_PORT"
-  --jinja --cache-ram 512 -fa auto
+  --jinja --metrics --cache-ram 512 -fa auto
   --ctx-size "$CTX_SIZE" --parallel "$PARALLEL_SLOTS" --no-kv-unified
   -ngl "$NGL" -t "$THREADS" --alias "$PUBLIC_MODEL_NAME")
 if [ -n "$RPC_SERVERS" ]; then
@@ -181,12 +181,31 @@ if [ -n "$RPC_SERVERS" ]; then
   # whole layers per rpc device in --rpc order, inside a server in its -d order (computed by the portal)
   [ -n "${TENSOR_SPLIT:-}" ] && cmd+=(--tensor-split "$TENSOR_SPLIT")
 fi
-# Shared backend secret: every /v1 request needs it (llama-server leaves /health open for probes).
+# Backend key: every /v1 request needs it, and so does /metrics (--metrics, scraped by the portal's monitoring
+# controller, task 2-33); llama-server leaves only /health open for probes.
 # llama-server reads it from LLAMA_API_KEY (common/arg.cpp, `--api-key` .set_env), so it never appears in argv.
+# k3s pods get the node's own key as a file (LLAMA_API_KEY_FILE, the node container's $STATE_DIR/backend/key written by
+# registrar.sh, task SEC-1); a pod that starts before the node container wrote it waits for it, at most
+# BACKEND_KEY_WAIT_S seconds. Standalone mode: registrar.sh exports LLAMA_API_KEY itself.
 if [ -n "${BACKEND_API_KEY:-}" ]; then
   export LLAMA_API_KEY="$BACKEND_API_KEY"
 fi
 unset BACKEND_API_KEY
+if [ -n "${LLAMA_API_KEY_FILE:-}" ] && [ "$PRINT" != 1 ]; then
+  waited=0
+  until [ -s "$LLAMA_API_KEY_FILE" ] || [ "$waited" -ge "${BACKEND_KEY_WAIT_S:-300}" ]; do
+    [ "$waited" = 0 ] && echo "waiting for the backend key of this node in $LLAMA_API_KEY_FILE" >&2
+    sleep 1
+    waited=$((waited + 1))
+  done
+  if ! [ -s "$LLAMA_API_KEY_FILE" ]; then
+    echo "no backend key in $LLAMA_API_KEY_FILE: the node container has not registered with the portal (or waits for the admin's approval)" >&2
+    exit 1
+  fi
+  LLAMA_API_KEY="$(tr -d '\r\n' < "$LLAMA_API_KEY_FILE")"
+  export LLAMA_API_KEY
+fi
+unset LLAMA_API_KEY_FILE
 # Thinking models (Gemma 4) otherwise spend short max_tokens on reasoning_content and return empty content.
 # b12033 deprecates --chat-template-kwargs '{"enable_thinking":false}' in favour of --reasoning.
 cmd+=(--reasoning "$THINKING")
@@ -347,6 +366,18 @@ download() {
   done
 }
 
+# verified PART ETAG: when the ETag is a sha256 (64 hex: the LFS oid of Hugging Face, the sha256 the mirror reports for an
+# own model file), the downloaded bytes must have it (SEC-2 L5): a substituted or corrupted file is not loaded. Another
+# ETag (md5-like, size and mtime) names no content hash: nothing to check.
+verified() {
+  local part="$1" want="${2,,}" got
+  [[ "$want" =~ ^[0-9a-f]{64}$ ]] || return 0
+  got="$(sha256sum "$part" | cut -c1-64)"
+  [ "$got" = "$want" ] && return 0
+  echo "sha256 of $part is $got, the source reports $want: the file is deleted" >&2
+  return 1
+}
+
 # The ETag of every downloaded shard is kept in <shard>.etag: a file of the same name and size but another version (an
 # own model file uploaded again, a file changed on Hugging Face) is downloaded again, and a .part of another version is
 # not resumed. A shard without a recorded ETag (downloaded before) is kept while its size matches.
@@ -372,6 +403,17 @@ for i in "${!SHARD_URLS[@]}"; do
   if [ -n "$etag" ]; then printf '%s\n' "$etag" > "$path.part.etag"; else rm -f "$path.part.etag"; fi
   echo "downloading $url"
   download "$url" "$path.part" || exit $?
+  # a mismatch is downloaded once more from the start (a broken resume); twice in a row: the source serves other bytes
+  if ! verified "$path.part" "$etag"; then
+    rm -f "$path.part"
+    echo "downloading $url again"
+    download "$url" "$path.part" || exit $?
+    if ! verified "$path.part" "$etag"; then
+      rm -f "$path.part" "$path.part.etag"
+      echo "the file $url does not match its sha256 twice: not loaded" >&2
+      exit 1
+    fi
+  fi
   mv "$path.part" "$path"
   if [ -f "$path.part.etag" ]; then mv "$path.part.etag" "$path.etag"; else rm -f "$path.etag"; fi
 done

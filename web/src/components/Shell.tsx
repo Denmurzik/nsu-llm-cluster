@@ -2,13 +2,18 @@ import {
   Activity,
   Boxes,
   ChartColumn,
+  ChartLine,
   Cpu,
+  DatabaseBackup,
   HardDrive,
+  HardDriveDownload,
   KeyRound,
   Layers,
   LogOut,
   Menu,
   MessageSquare,
+  SlidersHorizontal,
+  ScrollText,
   SquareTerminal,
   Users,
   X,
@@ -30,9 +35,14 @@ const USER_LINKS = [
 const ADMIN_LINKS = [
   { to: "/admin/deployments", label: "Развёртывания", icon: Layers },
   { to: "/admin/local-models", label: "Мои модели", icon: HardDrive },
+  { to: "/admin/cache", label: "Кэш моделей", icon: HardDriveDownload },
   { to: "/admin/nodes", label: "Ноды", icon: Cpu },
   { to: "/admin/status", label: "Состояние", icon: Activity },
+  { to: "/admin/monitoring", label: "Мониторинг", icon: ChartLine },
   { to: "/admin/users", label: "Пользователи", icon: Users },
+  { to: "/admin/backups", label: "Резервные копии", icon: DatabaseBackup },
+  { to: "/admin/settings", label: "Настройки", icon: SlidersHorizontal },
+  { to: "/admin/audit", label: "Журнал", icon: ScrollText },
 ];
 
 export function Shell({ children }: { children: ReactNode }) {

@@ -4,7 +4,7 @@ import asyncio
 import logging
 import re
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -20,7 +20,11 @@ REQUEST_TIMEOUT = 15
 L_ACCEL = "llm.nsu/accel"
 L_VRAM = "llm.nsu/vram-mib"
 L_RAM = "llm.nsu/ram-mib"  # memory the node's host (WSL) gives it, set by the node at registration
-L_DEPLOYMENT = "llm.nsu/deployment"
+L_DEPLOYMENT = "llm.nsu/deployment"  # of the portal's objects and pods
+# The deployment of a node, set by the portal on the Node object. A kubelet may set any label on its own Node except under
+# node-restriction.kubernetes.io/ (NodeRestriction admission), so a node cannot label itself into a deployment's pods
+# (task SEC-1; it used to be llm.nsu/deployment, which the workload controller removes from the nodes).
+L_NODE_DEPLOYMENT = "node-restriction.kubernetes.io/llm-deployment"
 L_ROLE = "llm.nsu/role"
 L_NAME = "app.kubernetes.io/name"  # the workload object a pod belongs to
 A_PORT = "llm.nsu/port"
@@ -100,6 +104,18 @@ class PodInfo:
 
 
 @dataclass
+class JobInfo:
+    name: str
+    active: int  # pods running
+    succeeded: int
+    failed: int
+    # the final condition of the Job: "Complete", "Failed" or "" while it runs. A Job killed at its deadline ends
+    # Failed whatever `failed` says (the pods it deleted are not always counted there)
+    condition: str = ""
+    reason: str = ""  # why it ended (Failed: "DeadlineExceeded", "BackoffLimitExceeded", ...)
+
+
+@dataclass
 class OwnedWorkload:
     kind: str  # "DaemonSet" | "Deployment"
     name: str
@@ -154,7 +170,7 @@ def _node_info(node) -> NodeInfo:
         is_main=node.metadata.name == MAIN_NODE,
         vram_mib=_int(labels.get(L_VRAM)),
         mem_mib=_mib((status.capacity or {}).get("memory")),
-        deployment=labels.get(L_DEPLOYMENT),
+        deployment=labels.get(L_NODE_DEPLOYMENT),
         ram_mib=_int(labels.get(L_RAM)),
         class_taint=_has_class_taint(node),
     )
@@ -198,6 +214,10 @@ def _pod_info(pod) -> PodInfo:
 def _template_annotations(workload) -> dict[str, str]:
     template = workload.spec.template if workload.spec else None
     return (template.metadata.annotations if template and template.metadata else None) or {}
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(UTC).isoformat()
 
 
 _SUFFIX = {"DaemonSet": "daemon_set", "Deployment": "deployment"}
@@ -411,11 +431,50 @@ class K8sClient:
         body = {**manifest, "metadata": {**manifest["metadata"], "resourceVersion": current.metadata.resource_version}}
         await self._call(getattr(apps, f"replace_namespaced_{suffix}"), name, self.namespace, body=body)
 
-    async def create_job(self, manifest: dict) -> None:
-        """Creates a batch/v1 Job (the Wake-on-LAN relay, builders.wake_job: generateName, collected by its TTL)."""
+    async def create_job(self, manifest: dict) -> str:
+        """Creates a batch/v1 Job (the Wake-on-LAN relay, builders.wake_job, and the models cleanup, builders.purge_job:
+        generateName, collected by its TTL); returns its name."""
         await self._apis()
         batch = client.BatchV1Api(self._api_client)
-        await self._call(batch.create_namespaced_job, self.namespace, body=manifest)
+        created = await self._call(batch.create_namespaced_job, self.namespace, body=manifest)
+        return created.metadata.name
+
+    async def read_job(self, name: str) -> JobInfo | None:
+        """The state of a Job; None once it is gone (collected after its TTL)."""
+        await self._apis()
+        batch = client.BatchV1Api(self._api_client)
+        try:
+            job = await self._call(batch.read_namespaced_job_status, name, self.namespace)
+        except ApiException as exc:
+            if exc.status == 404:
+                return None
+            raise
+        status = job.status
+        condition, reason = "", ""
+        for c in (status.conditions or []) if status else []:
+            if c.status == "True" and c.type in ("Complete", "Failed"):
+                condition, reason = c.type, c.reason or ""
+                if c.type == "Failed":
+                    break  # Failed wins over a Complete next to it
+        return JobInfo(
+            name, (status.active or 0) if status else 0, (status.succeeded or 0) if status else 0,
+            (status.failed or 0) if status else 0, condition, reason,
+        )
+
+    async def job_log(self, name: str, lines: int = 50) -> str:
+        """Last log lines of the (first) pod of a Job; empty when it has none yet or the pod is gone."""
+        core, _ = await self._apis()
+        try:
+            pods = await self._call(core.list_namespaced_pod, self.namespace, label_selector=f"job-name={name}")
+            if not pods.items:
+                return ""
+            return await self._call(
+                core.read_namespaced_pod_log, pods.items[0].metadata.name, self.namespace, tail_lines=lines
+            )
+        except ApiException as exc:
+            if exc.status in (400, 404):
+                return ""
+            raise
 
     async def put_config_map(self, name: str, data: dict[str, str]) -> None:
         """Creates or replaces a ConfigMap of the namespace (read, then replace with the read resourceVersion)."""
@@ -435,6 +494,21 @@ class K8sClient:
             return
         body["metadata"]["resourceVersion"] = current.metadata.resource_version
         await self._call(core.replace_namespaced_config_map, name, self.namespace, body=body)
+
+    async def restart_deployment(self, name: str) -> bool:
+        """Rolls the pods of a Deployment (the same patch as `kubectl rollout restart`: a new `restartedAt` in the pod
+        template). False when there is no such Deployment."""
+        _, apps = await self._apis()
+        body = {
+            "spec": {"template": {"metadata": {"annotations": {"kubectl.kubernetes.io/restartedAt": _utc_now_iso()}}}}
+        }
+        try:
+            await self._call(apps.patch_namespaced_deployment, name, self.namespace, body=body)
+        except ApiException as exc:
+            if exc.status == 404:
+                return False
+            raise
+        return True
 
     async def delete(self, kind: str, name: str) -> None:
         _, apps = await self._apis()

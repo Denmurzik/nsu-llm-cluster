@@ -15,8 +15,16 @@
       "version": "v1.36.5+k3s1",
       "is_main": true,
       "maintenance": false,
+      "models_bytes": null,
       "wakeable": false,
-      "wake": null
+      "wake": null,
+      "approved": true,
+      "has_key": false,
+      "claim_ip": null,
+      "legacy": false,
+      "claims": [],
+      "known_addresses": [],
+      "claims_refused": 0
     },
     {
       "name": "aud-101-pc01",
@@ -32,8 +40,16 @@
       "version": "v1.36.5+k3s1",
       "is_main": false,
       "maintenance": false,
+      "models_bytes": 41200000000,
       "wakeable": false,
-      "wake": null
+      "wake": null,
+      "approved": true,
+      "has_key": true,
+      "claim_ip": "192.168.3.41",
+      "legacy": false,
+      "claims": [],
+      "known_addresses": [],
+      "claims_refused": 0
     },
     {
       "name": "aud-101-pc02",
@@ -49,8 +65,16 @@
       "version": "v1.36.5+k3s1",
       "is_main": false,
       "maintenance": true,
+      "models_bytes": null,
       "wakeable": false,
-      "wake": null
+      "wake": null,
+      "approved": true,
+      "has_key": true,
+      "claim_ip": "192.168.3.42",
+      "legacy": false,
+      "claims": [],
+      "known_addresses": [],
+      "claims_refused": 0
     },
     {
       "name": "aud-204-gpu01",
@@ -66,8 +90,16 @@
       "version": "v1.36.5+k3s1",
       "is_main": false,
       "maintenance": false,
+      "models_bytes": 18600000000,
       "wakeable": true,
-      "wake": null
+      "wake": null,
+      "approved": true,
+      "has_key": true,
+      "claim_ip": "192.168.3.64",
+      "legacy": false,
+      "claims": [],
+      "known_addresses": [],
+      "claims_refused": 0
     },
     {
       "name": "win-laptop-07",
@@ -83,8 +115,20 @@
       "version": "0.1.0",
       "is_main": false,
       "maintenance": false,
+      "models_bytes": 0,
       "wakeable": true,
-      "wake": { "tries": 2, "max_tries": 6, "since": "2026-11-03T11:58:00+00:00" }
+      "wake": {
+        "tries": 2,
+        "max_tries": 6,
+        "since": "2026-11-03T11:58:00+00:00"
+      },
+      "approved": true,
+      "has_key": true,
+      "claim_ip": "192.168.3.77",
+      "legacy": false,
+      "claims": [],
+      "known_addresses": [],
+      "claims_refused": 0
     }
   ],
   "backends": []

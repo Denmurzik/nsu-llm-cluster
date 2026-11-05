@@ -85,6 +85,19 @@ class Activity:
 
 
 @dataclass(frozen=True)
+class UsageRow:
+    """One day of one model used by one user (all keys of the user summed): the cube of the admin «Использование»."""
+
+    day: date
+    model: str  # the public model name (`model_group`), "" when LiteLLM did not name one
+    user_id: str  # the LiteLLM user (the portal user's id), "" for a deleted key whose owner LiteLLM cannot recover
+    user_email: str  # what LiteLLM knows about the owner, "" when nothing
+    prompt_tokens: int
+    completion_tokens: int
+    requests: int  # api_requests of LiteLLM: failed ones (denied, errors) count too, like in the user's own usage
+
+
+@dataclass(frozen=True)
 class ManagedModel:
     id: str
     model_name: str
@@ -189,20 +202,38 @@ class LiteLLMClient:
             return False
         return resp.status_code == 200
 
-    async def ensure_user(self, user_id: str, email: str) -> None:
-        resp = await self._send(
-            "POST",
-            "/user/new",
-            json={
-                "user_id": user_id,
-                "user_email": email,
-                "user_role": "internal_user",
-                "auto_create_key": False,
-            },
-        )
+    async def ensure_user(
+        self, user_id: str, email: str, rpm_limit: int | None = None, tpm_limit: int | None = None
+    ) -> None:
+        """Creates the LiteLLM user (an existing one is fine). With limits, the user gets them as its own `rpm_limit` /
+        `tpm_limit`: LiteLLM v1.106.6 counts them over all keys of the user together (parallel_request_limiter_v3,
+        descriptor `user`), so five keys and the Playground share one budget. An existing user gets them by update."""
+        body: dict[str, Any] = {
+            "user_id": user_id,
+            "user_email": email,
+            "user_role": "internal_user",
+            "auto_create_key": False,
+        }
+        if rpm_limit is not None:
+            body["rpm_limit"] = rpm_limit
+        if tpm_limit is not None:
+            body["tpm_limit"] = tpm_limit
+        resp = await self._send("POST", "/user/new", json=body)
         if not resp.is_success and _looks_like_already_exists(resp.text):
+            if rpm_limit is not None or tpm_limit is not None:
+                await self.update_user_limits(user_id, rpm_limit, tpm_limit)
             return
         self._check(resp)
+
+    async def update_user_limits(self, user_id: str, rpm_limit: int | None, tpm_limit: int | None) -> None:
+        """Sets the user-level request and token limits (shared by all the user's keys); a limit given as None stays.
+        v1.106.6 answers 200 for a user it does not know as well."""
+        body: dict[str, Any] = {"user_id": user_id}
+        if rpm_limit is not None:
+            body["rpm_limit"] = rpm_limit
+        if tpm_limit is not None:
+            body["tpm_limit"] = tpm_limit
+        await self._call("POST", "/user/update", json=body)
 
     async def generate_key(
         self,
@@ -246,6 +277,51 @@ class LiteLLMClient:
             if resp.status_code == 404:  # a key the owner deleted meanwhile
                 continue
             self._check(resp)
+
+    # -- admin: blocking and limits of a user's keys (task 2-32) -------------------
+
+    async def block_keys(self, tokens: list[str]) -> list[str]:
+        """Disables keys (`/key/block`): the key values stay and `unblock_keys` brings them back. Returns the tokens
+        that were blocked. When one call fails, the keys blocked so far are released again and the error is raised, so
+        a failed block never leaves a half-blocked user."""
+        done: list[str] = []
+        try:
+            for token in tokens:
+                resp = await self._send("POST", "/key/block", json={"key": token})
+                if resp.status_code == 404:  # deleted meanwhile
+                    continue
+                self._check(resp)
+                done.append(token)
+        except (LiteLLMError, LiteLLMUnavailable):
+            for token in done:
+                try:
+                    await self._send("POST", "/key/unblock", json={"key": token})
+                except Exception:  # best effort: the original error is the one to report
+                    pass
+            raise
+        return done
+
+    async def unblock_keys(self, tokens: list[str]) -> None:
+        """Enables keys that `block_keys` disabled; a key that is gone (deleted) is skipped."""
+        for token in tokens:
+            resp = await self._send("POST", "/key/unblock", json={"key": token})
+            if resp.status_code == 404:
+                continue
+            self._check(resp)
+
+    async def update_key_limits(self, token: str, rpm_limit: int | None, tpm_limit: int | None) -> bool:
+        """Sets the request and token limits of one existing key (by token hash); a limit given as None stays.
+        False for a key LiteLLM no longer has (the owner deleted it meanwhile)."""
+        body: dict[str, Any] = {"key": token}
+        if rpm_limit is not None:
+            body["rpm_limit"] = rpm_limit
+        if tpm_limit is not None:
+            body["tpm_limit"] = tpm_limit
+        resp = await self._send("POST", "/key/update", json=body)
+        if resp.status_code == 404:
+            return False
+        self._check(resp)
+        return True
 
     # -- usage ---------------------------------------------------------------
 
@@ -292,6 +368,50 @@ class LiteLLMClient:
             by_day=sorted(by_day, key=lambda d: d.day),
         )
 
+    async def global_usage(self, start: date, end: date) -> list[UsageRow]:
+        """Usage of every user, per day, model and user (admins; `GET /user/daily/activity` without `user_id`).
+
+        Verified against LiteLLM v1.106.6 (`tests/integration/test_litellm_real.py`): without `user_id` the master key
+        gets the global view; `results[]` is one entry per day, `breakdown.model_groups[<model name>]` holds the totals
+        of the model and `.api_key_breakdown[<key hash>]` the same per key with `metadata.user_id`/`user_email`
+        (`models` is keyed by the backend's `openai/<id>` name, so it is not used unless a day has no groups).
+        Paging counts database rows (user x key x model x day), not days: a day can be split between pages, so rows
+        are summed by (day, model, user) after the last page.
+        """
+        cube: dict[tuple[date, str, str], list[Any]] = {}
+        for page in range(1, _MAX_PAGES + 1):
+            data = await self._call(
+                "GET",
+                "/user/daily/activity",
+                params={
+                    "start_date": start.isoformat(),
+                    "end_date": end.isoformat(),
+                    "page": page,
+                    "page_size": _PAGE_SIZE,
+                },
+            )
+            for row in (data or {}).get("results", []):
+                day = date.fromisoformat(str(row["date"])[:10])
+                breakdown = row.get("breakdown") or {}
+                groups = breakdown.get("model_groups") or breakdown.get("models") or {}
+                for model, entry in groups.items():
+                    for entry_key in (entry.get("api_key_breakdown") or {}).values():
+                        metrics = entry_key.get("metrics") or {}
+                        meta = entry_key.get("metadata") or {}
+                        slot = cube.setdefault(
+                            (day, str(model or ""), str(meta.get("user_id") or "")), [0, 0, 0, ""]
+                        )
+                        slot[0] += _int(metrics.get("prompt_tokens"))
+                        slot[1] += _int(metrics.get("completion_tokens"))
+                        slot[2] += _int(metrics.get("api_requests"))
+                        slot[3] = slot[3] or str(meta.get("user_email") or "")
+            if not ((data or {}).get("metadata") or {}).get("has_more"):
+                break
+        return [
+            UsageRow(day, model, user_id, v[3], v[0], v[1], v[2])
+            for (day, model, user_id), v in sorted(cube.items(), key=lambda kv: kv[0])
+        ]
+
     # -- managed models --------------------------------------------------------
 
     async def _model_info(self) -> list[dict[str, Any]]:
@@ -331,11 +451,14 @@ class LiteLLMClient:
         max_parallel_requests: int | None = None,
         experimental: bool = False,
         system_prompt: str | None = None,
+        api_key: str | None = None,
     ) -> None:
         """`max_parallel_requests` bounds the requests LiteLLM sends to this backend at once (per LiteLLM
         worker); over the bound LiteLLM tries another backend of the model, then answers 429.
         `experimental` puts the model into the access group of that name (keys of admins only), else into `public`;
-        `system_prompt` is what main/litellm/system_prompt_hook.py adds to chats that have no system message."""
+        `system_prompt` is what main/litellm/system_prompt_hook.py adds to chats that have no system message.
+        `api_key`: the backend's own key (the node's, app.nodes.identity); None: the shared key of before."""
+        key = self.backend_api_key if api_key is None else api_key
         info: dict[str, Any] = {
             "id": model_id,
             "portal_managed": True,
@@ -345,14 +468,14 @@ class LiteLLMClient:
         }
         if system_prompt:
             info["system_prompt"] = system_prompt
-        if self.backend_api_key:
-            info["backend_auth"] = key_fingerprint(self.backend_api_key)
+        if key:
+            info["backend_auth"] = key_fingerprint(key)
         if max_input_tokens is not None:
             info["max_input_tokens"] = max_input_tokens
         params: dict[str, Any] = {
             "model": f"openai/{model_name}",
             "api_base": api_base,
-            "api_key": self.backend_api_key or "none",
+            "api_key": key or "none",
         }
         if max_parallel_requests is not None:
             params["max_parallel_requests"] = max_parallel_requests
@@ -364,18 +487,20 @@ class LiteLLMClient:
             return  # the entry is there already (added earlier through another LiteLLM worker)
         self._check(resp)
 
-    async def update_model_key(self, model_id: str) -> None:
-        """Gives an existing entry the current backend key, keeping its id and the rest of its settings.
+    async def update_model_key(self, model_id: str, api_key: str | None = None) -> None:
+        """Gives an existing entry the backend's current key (`api_key`, the node's own; None: the shared key of
+        before), keeping its id and the rest of its settings.
 
         `PATCH /model/{id}/update` merges `litellm_params` and `model_info`, and the router reloads the entry, so
         requests keep flowing to the backend while the key changes (no delete, no gap).
         """
+        key = self.backend_api_key if api_key is None else api_key
         await self._call(
             "PATCH",
             f"/model/{model_id}/update",
             json={
-                "litellm_params": {"api_key": self.backend_api_key or "none"},
-                "model_info": {"backend_auth": key_fingerprint(self.backend_api_key)},
+                "litellm_params": {"api_key": key or "none"},
+                "model_info": {"backend_auth": key_fingerprint(key)},
             },
         )
 

@@ -27,8 +27,8 @@ K3S_FILE=k3s-airgap-images-amd64.tar.zst
 # ------------------------------------------------------------------ dry run: documented docker command
 out="$(bash "$RUN_MAIN" --dry-run --env-file "$RUN_ENV" --advertise-ip 192.168.3.21 --airgap-dir "$TMP/none" 2>&1)"
 for frag in '--name llm-main' '--hostname llm-main' '--privileged' '--restart unless-stopped' '--tmpfs /run' '--tmpfs /var/run' \
-  '-p 443:443' '-p 80:80' '-p 6443:6443' 'llm-main-k3s:/var/lib/rancher/k3s' 'llm-main-kubelet:/var/lib/kubelet' \
-  'llm-main-data:/var/lib/llm' 'llm-main-hf:/var/lib/llm-hf' 'llm-main-registry:/var/lib/llm-registry' '--env-file' 'MAIN_ADVERTISE_IP=192.168.3.21' 'nsu-llm-main:0.1.0' \
+  '-p 0.0.0.0:443:443' '-p 0.0.0.0:80:80' '-p 0.0.0.0:6443:6443' 'llm-main-k3s:/var/lib/rancher/k3s' 'llm-main-kubelet:/var/lib/kubelet' \
+  'llm-main-data:/var/lib/llm' 'llm-main-hf:/var/lib/llm-hf' 'llm-main-registry:/var/lib/llm-registry' '--env-file' 'MAIN_ADVERTISE_IP=192.168.3.21' 'nsu-llm-main:0.2.0' \
   '--ulimit nofile=1048576:1048576' '--log-driver json-file' '--log-opt max-size=50m' '--log-opt max-file=5'; do
   grep -qF -- "$frag" <<<"$out"
   check "run-main.sh --dry-run contains $frag" $? "$out"
@@ -97,6 +97,10 @@ case "$1" in
   inspect) exit 1 ;;
   info) [ "${2:-}" = "--format" ] && echo 17179869184; exit 0 ;;
   pull) exit "$FAKE_DOCKER_RC" ;;
+  image) case "$*" in
+    *RepoDigests*) [ -z "${FAKE_REPO_DIGEST:-}" ] || echo "$FAKE_REPO_DIGEST" ;;
+    *.Id*) [ -z "${FAKE_IMAGE_ID:-}" ] || echo "$FAKE_IMAGE_ID" ;;
+  esac; exit 0 ;;
   exec) [ -n "${FAKE_AGENT_TOKEN:-}" ] || { echo "Токен агента ещё не записан: k3s запускается." >&2; exit 1; }; echo "$FAKE_AGENT_TOKEN" ;;
   *) exit 0 ;;
 esac
@@ -124,6 +128,25 @@ out="$(rm_run "$REL/bad" "$TMP/ag2")"; rc=$?
   && ! grep -q '^run ' "$FAKE_DOCKER_LOG"
 check "run-main.sh --airgap: sha256 mismatch -> Russian error, nothing kept, no container" $? "rc=$rc $out
 $(cat "$FAKE_DOCKER_LOG")"
+
+# ------------------------------------------------------------------ the digest of main's own image for the «Версии» block
+D_REG="sha256:$(printf 'ab%.0s' $(seq 32))"; D_ID="sha256:$(printf 'cd%.0s' $(seq 32))"
+dig_run() { : >"$FAKE_DOCKER_LOG"; PATH="$FAKEBIN:$PATH" NSU_LLM_TOKEN_WAIT_S=0 bash "$RUN_MAIN" --env-file "$RUN_ENV" --advertise-ip 192.168.3.21 --airgap-dir "$TMP/none" >/dev/null 2>&1; grep '^run ' "$FAKE_DOCKER_LOG"; }
+out="$(FAKE_REPO_DIGEST="ghcr.io/o/nsu-llm-main@$D_REG" FAKE_IMAGE_ID="$D_ID" dig_run)"
+grep -qF -- "-e MAIN_IMAGE_DIGEST=$D_REG" <<<"$out"
+check "run-main.sh passes the registry digest of the image as MAIN_IMAGE_DIGEST" $? "$out"
+out="$(FAKE_IMAGE_ID="$D_ID" dig_run)"
+grep -qF -- "-e MAIN_IMAGE_DIGEST=$D_ID" <<<"$out"
+check "run-main.sh: an image built here (no RepoDigests) reports its id" $? "$out"
+out="$(dig_run)"
+! grep -q MAIN_IMAGE_DIGEST <<<"$out" && grep -q '^run ' <<<"$out"
+check "run-main.sh: no digest found, no MAIN_IMAGE_DIGEST (and the container still starts)" $? "$out"
+out="$(FAKE_IMAGE_ID="not-a-digest" dig_run)"
+! grep -q MAIN_IMAGE_DIGEST <<<"$out"
+check "run-main.sh: a value that is not a digest is not passed" $? "$out"
+out="$(bash "$RUN_MAIN" --dry-run --env-file "$RUN_ENV" --advertise-ip 192.168.3.21 2>&1)"
+! grep -q MAIN_IMAGE_DIGEST <<<"$out"
+check "run-main.sh --dry-run asks docker for nothing" $? "$out"
 
 # ------------------------------------------------------------------ token for nodes: the agent token, from agent-token.sh
 AGENT_T='K10fake::node:agent42'

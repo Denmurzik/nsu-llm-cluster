@@ -1,16 +1,38 @@
 """Standalone node registry: registration, heartbeats and liveness of nodes that run without k3s."""
 
 import hmac
+import logging
 from datetime import UTC, datetime
 
+from kubernetes_asyncio.client import ApiException
 from sqlalchemy import delete, or_, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.deployments.service import live_nodes
-from app.models import NodeAssignment, NodeWake, StandaloneNode
+from app.deps import REDIS_ERRORS
+from app.k8s import K8sUnavailable
+from app.metrics import live
+from app.models import ControllerTimer, NodeAssignment, NodeModels, NodeWake, StandaloneNode
+from app.nodes import cleanup, relay, versions, wake
 
-__all__ = ["heartbeat", "live_nodes", "remove", "set_wake", "stop", "token_matches", "upsert"]
+log = logging.getLogger(__name__)
+
+__all__ = [
+    "delete_k8s_node",
+    "forget_live",
+    "heartbeat",
+    "live_nodes",
+    "remove",
+    "set_models",
+    "set_wake",
+    "stop",
+    "token_matches",
+    "upsert",
+]
+
+KEY_UPDATE_SEEN = "node:upd-seen:"  # Redis: when the node last asked «should I update» (api/admin_versions.py KEY_SEEN)
+NOT_READY_TIMER = "notready:"  # ControllerTimer key of a node that went NotReady (controllers/workloads.py)
 
 
 def token_matches(presented: str, secret: str, user: str) -> bool:
@@ -92,6 +114,19 @@ async def set_wake(db: AsyncSession, name: str, mac: str, ip: str, prefix: int) 
     )
 
 
+async def set_models(db: AsyncSession, name: str, models_bytes: int) -> None:
+    """Stores how many bytes the node's models volume holds; written only when it changed, the heartbeat of a standalone
+    node repeats it every 15 s. The caller commits."""
+    stmt = insert(NodeModels).values(node_name=name, models_bytes=models_bytes)
+    await db.execute(
+        stmt.on_conflict_do_update(
+            index_elements=[NodeModels.node_name],
+            set_={"models_bytes": models_bytes, "updated_at": datetime.now(UTC)},
+            where=NodeModels.models_bytes != stmt.excluded.models_bytes,
+        )
+    )
+
+
 async def stop(db: AsyncSession, name: str) -> bool:
     """A clean stop of the node (its container is shutting down, e.g. Windows «Завершение работы»): out of routing at
     once, its server runs no config any more; the record, the assignment and the NIC stay, so the PC is woken when
@@ -107,11 +142,51 @@ async def stop(db: AsyncSession, name: str) -> bool:
     return found
 
 
-async def remove(db: AsyncSession, name: str) -> bool:
-    """Deletes the registry row and the reported NIC (an uninstalled PC is never woken); the NodeAssignment stays so a
-    re-created node keeps its model."""
+async def remove(db: AsyncSession, name: str, commit: bool = True) -> bool:
+    """Deletes everything the database keeps for the node: the registry row, the reported NIC (an uninstalled PC is never
+    woken), the size of its models volume, its assignment (the deployment it served) and the controllers' pauses for
+    it. True when the registry row existed. `commit=False`: the caller commits (with an audit row)."""
     await db.execute(delete(NodeWake).where(NodeWake.node_name == name))
+    await db.execute(delete(NodeModels).where(NodeModels.node_name == name))
+    await db.execute(delete(NodeAssignment).where(NodeAssignment.node_name == name))
+    timers = (wake.TIMER_PREFIX, cleanup.PURGE_TIMER_PREFIX, cleanup.CACHE_TIMER_PREFIX, NOT_READY_TIMER)
+    await db.execute(delete(ControllerTimer).where(ControllerTimer.key.in_([p + name for p in timers])))
     result = await db.execute(delete(StandaloneNode).where(StandaloneNode.name == name).returning(StandaloneNode.name))
     found = result.first() is not None
-    await db.commit()
+    if commit:
+        await db.commit()
     return found
+
+
+async def delete_k8s_node(k8s, name: str) -> str:
+    """Deletes the Kubernetes Node object (and with it the node password k3s keeps): `deleted`, `absent` (there was none)
+    or `unavailable` (the cluster does not answer; logged, never raised: the rest of the removal goes on)."""
+    try:
+        if not await k8s.available():
+            return "unavailable"
+        return "deleted" if await k8s.delete_node(name) else "absent"
+    except (K8sUnavailable, ApiException) as exc:
+        log.warning("node %s: could not delete the Kubernetes node: %s", name, exc)
+        return "unavailable"
+
+
+async def forget_live(redis, name: str) -> bool:
+    """Deletes what the portal keeps for the node in Redis: its image report and update request, the live metrics sample
+    and its push rate limit, the cleanup orders and the last answer, the Wake-on-LAN commands waiting for it. The history
+    rows of the metrics stay. False when Redis did not answer (logged; every key has a TTL)."""
+    keys = [
+        versions.KEY_REPORT + name,
+        versions.KEY_REQUEST + name,
+        KEY_UPDATE_SEEN + name,
+        live.NODE_KEY + name,
+        live.RATE_KEY + name,
+        cleanup.ORDER_PREFIX + name,
+        cleanup.RESULT_PREFIX + name,
+        relay.KEY_PREFIX + name,
+    ]
+    try:
+        await redis.delete(*keys)
+    except REDIS_ERRORS as exc:
+        log.warning("node %s: its Redis keys were not deleted: %s", name, exc)
+        return False
+    return True

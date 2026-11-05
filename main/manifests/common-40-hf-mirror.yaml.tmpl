@@ -43,11 +43,21 @@ spec:
         llm.nsu/config-hash: "$CONFIG_HASH"
         # HF_TOKEN читается при старте контейнера: новый токен меняет шаблон, и под перезапускается
         llm.nsu/hf-token: "$HF_TOKEN_FINGERPRINT"
+        # так же ключ зеркала (им проверяются токены нод): после его смены (entrypoint.sh, SEC-2) под перезапускается
+        llm.nsu/mirror-token: "$HF_MIRROR_TOKEN_FINGERPRINT"
     spec:
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
-      nodeSelector:
-        kubernetes.io/hostname: llm-main
+      # только llm-main: по имени объекта Node (его не присвоить себе чужой ноде), а не по метке kubernetes.io/hostname,
+      # которую kubelet ставит себе сам; taint главного (entrypoint.sh) терпят только его поды
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchFields:
+                  - {key: metadata.name, operator: In, values: [llm-main]}
+      tolerations:
+        - {key: node-role.kubernetes.io/control-plane, operator: Exists, effect: NoSchedule}
       containers:
         # python3 образа LiteLLM: образ уже есть на главном (и в офлайн-наборе run-main --airgap), скрипт без зависимостей
         - name: hf-mirror
@@ -60,16 +70,24 @@ spec:
             - {name: HF_MIRROR_HOST, value: 127.0.0.1}
             - {name: HF_MIRROR_PORT, value: "$HF_MIRROR_PORT"}
             - {name: HF_MIRROR_MAX_GIB, value: "$HF_MIRROR_MAX_GIB"}
+            # the limit from the panel (portal: ConfigMap hf-mirror-settings), read at start; wins over the line above
+            - name: HF_MIRROR_MAX_GIB_OVERRIDE
+              valueFrom:
+                configMapKeyRef: {name: hf-mirror-settings, key: max_gib, optional: true}
             - {name: HF_MIRROR_UPSTREAM, value: "$HF_MIRROR_UPSTREAM"}
             - {name: HF_MIRROR_PREFIX, value: /hf}
             - {name: PYTHONUNBUFFERED, value: "1"}
-            # токен Hugging Face остаётся на главном: ноды получают только HF_MIRROR_TOKEN
+            # токен Hugging Face остаётся на главном: ноды получают от портала токены nsm1 на свои репозитории
             - name: HF_TOKEN
               valueFrom:
                 secretKeyRef: {name: llm-secrets, key: HF_TOKEN, optional: true}
+            # ключ подписи токенов нод (nsm1) и ключ портала (всё, /admin, /_mirror/transfers); оба только на главном
             - name: HF_MIRROR_TOKEN
               valueFrom:
                 secretKeyRef: {name: llm-secrets, key: HF_MIRROR_TOKEN}
+            - name: HF_MIRROR_ADMIN_TOKEN
+              valueFrom:
+                secretKeyRef: {name: llm-secrets, key: HF_MIRROR_ADMIN_TOKEN}
 $HF_MIRROR_PROXY_ENV
           ports:
             - name: http

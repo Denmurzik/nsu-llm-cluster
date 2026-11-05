@@ -24,7 +24,7 @@ REPO = "org/model-GGUF"
 FILE = "model-Q4_K_M.gguf"
 SHA1, SHA2 = "a" * 40, "b" * 40
 GiB = 2**30
-ADMIN = {"sub": "adm", "email": "admin@g.nsu.ru"}
+ADMIN = {"sub": "adm", "email": "admin@g.nsu.ru", "email_verified": True}
 USER = {"sub": "usr", "email": "ivan@g.nsu.ru"}
 SMALL = GgufMeta("llama", 32, 32, 8, 128, 4096, 32768)
 

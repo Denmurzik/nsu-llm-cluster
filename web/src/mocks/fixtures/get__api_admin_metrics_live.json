@@ -1,0 +1,60 @@
+{
+  "at": "2026-11-04T10:00:21+00:00",
+  "available": true,
+  "nodes": [
+    {
+      "name": "aud-204-gpu01",
+      "at": "2026-11-04T10:00:12+00:00",
+      "age_s": 9,
+      "gpu_count": 1,
+      "gpu_util": 63.0,
+      "vram_used_mib": 9830,
+      "vram_total_mib": 12288,
+      "gpu_temp_c": 71.0,
+      "power_w": 148.5,
+      "ram_used_mib": 14336,
+      "ram_total_mib": 32768,
+      "cpu_pct": 18.4,
+      "models_bytes": 21474836480,
+      "disk_free_bytes": 214748364800,
+      "llama_up": true,
+      "rpc_up": false
+    },
+    {
+      "name": "aud-101-pc02",
+      "at": "2026-11-04T10:00:05+00:00",
+      "age_s": 16,
+      "gpu_count": 0,
+      "gpu_util": null,
+      "vram_used_mib": null,
+      "vram_total_mib": null,
+      "gpu_temp_c": null,
+      "power_w": null,
+      "ram_used_mib": 3072,
+      "ram_total_mib": 8192,
+      "cpu_pct": 4.2,
+      "models_bytes": null,
+      "disk_free_bytes": null,
+      "llama_up": false,
+      "rpc_up": false
+    }
+  ],
+  "models": [
+    {
+      "name": "gemma-4-e4b",
+      "at": "2026-11-04T10:00:00+00:00",
+      "age_s": 21,
+      "backends": 2,
+      "backends_up": 2,
+      "tok_s_gen": 41.5,
+      "tok_s_prompt": 612.0,
+      "slots_busy": 1,
+      "queue": 0,
+      "rpm": 7,
+      "e429": 0,
+      "e5xx": 0,
+      "ttft_p50_ms": 380.0,
+      "ttft_p95_ms": 910.5
+    }
+  ]
+}

@@ -4,7 +4,7 @@
 # Использование:
 #   GHCR_OWNER=<владелец на GitHub> release/release.sh [--dry-run] [--skip-build] [--latest] <версия>
 #
-#   <версия>       например 0.1.0; должна совпадать с версией этого чекаута (main/install-main.sh, node/run-node.sh)
+#   <версия>       например 0.1.0; должна совпадать с версией этого чекаута (main/install-main.sh, node/IMAGE_VERSION)
 #   --dry-run      напечатать каждый шаг и ничего не менять: ни docker, ни ghcr.io, ни git, ни файлов
 #   --skip-build   не собирать: выложить уже имеющиеся локальные теги ghcr.io/<владелец>/... (после неудачной выкладки)
 #   --latest       кроме <версия> выложить и «плавающие» теги main, cpu, gpu
@@ -66,12 +66,17 @@ COMMIT="$(git -C "$REPO" rev-parse HEAD)"
 say "  [ок] дерево чистое, тега v$VERSION нет, коммит ${COMMIT:0:12}"
 
 ver_main="$(sed -n 's/^IMAGE="nsu-llm-main:\([^"]*\)".*/\1/p' "$REPO/main/install-main.sh" | head -n1)"
-ver_node="$(sed -n 's/^VERSION="\([^"]*\)".*/\1/p' "$REPO/node/run-node.sh" | head -n1)"
-for pair in "main/install-main.sh:$ver_main" "node/run-node.sh:$ver_node"; do
+ver_node="$(tr -d ' \r\n' <"$REPO/node/IMAGE_VERSION" 2>/dev/null)"
+for pair in "main/install-main.sh:$ver_main" "node/IMAGE_VERSION:$ver_node"; do
   [ "${pair#*:}" = "$VERSION" ] \
-    || die "версия выпуска $VERSION не совпадает с версией чекаута в ${pair%%:*} (${pair#*:}): образы и скрипты ищут друг друга по этой версии. Поднимите версию в main/install-main.sh, main/run-main.sh, node/run-node.sh, node/run-node.ps1, node/install-node.ps1 и NODE_IMAGE_TAG портала, зафиксируйте и повторите"
+    || die "версия выпуска $VERSION не совпадает с версией чекаута в ${pair%%:*} (${pair#*:}): образы и скрипты ищут друг друга по этой версии. Поднимите версию в main/install-main.sh, main/run-main.sh, node/IMAGE_VERSION (одна запасная версия для install-node.ps1, run-node.ps1, run-node.sh) и NODE_IMAGE_TAG портала, зафиксируйте и повторите"
 done
 say "  [ок] версия выпуска совпадает с версией скриптов чекаута ($VERSION)"
+# остальные места, называющие версию образа (скрипты главного, значения по умолчанию портала и манифестов, .env.example)
+if [ -f "$REPO/release/check-versions.sh" ]; then
+  bash "$REPO/release/check-versions.sh" "$REPO" "$VERSION" || die "версия образа указана не везде одинаково (см. выше): поднимите её во всех перечисленных файлах, зафиксируйте и повторите"
+  say "  [ок] версия совпадает во всех местах, где она названа (release/check-versions.sh)"
+fi
 K3S_VERSION="$(sed -n 's/^ARG K3S_VERSION=//p' "$REPO/main/Dockerfile" | head -n1)"
 LLAMA_TAG="$(sed -n 's/^ARG LLAMA_TAG=//p' "$REPO/node/Dockerfile" | head -n1)"
 [ -n "$K3S_VERSION" ] && [ -n "$LLAMA_TAG" ] || die "в Dockerfile не найдены ARG K3S_VERSION и ARG LLAMA_TAG"
@@ -133,9 +138,9 @@ login() {
 # ------------------------------------------------------------------ сборка
 build_all() {
   say "Сборка (nice -n 15, JOBS=$JOBS; кэш сборки сохраняется):"
-  run nice -n 15 docker build --provenance=false -f "$REPO/main/Dockerfile" -t "$IMG_MAIN" "$REPO"
-  run nice -n 15 docker build --provenance=false -f "$REPO/node/Dockerfile" --target cpu --build-arg "JOBS=$JOBS" -t "$IMG_CPU" "$REPO/node"
-  run nice -n 15 docker build --provenance=false -f "$REPO/node/Dockerfile" --target gpu --build-arg "JOBS=$JOBS" -t "$IMG_GPU" "$REPO/node"
+  run nice -n 15 docker build --provenance=false -f "$REPO/main/Dockerfile" -t "$IMG_MAIN" --build-arg "VERSION=$VERSION" --build-arg "GIT_COMMIT=$COMMIT" "$REPO"
+  run nice -n 15 docker build --provenance=false -f "$REPO/node/Dockerfile" --target cpu --build-arg "JOBS=$JOBS" -t "$IMG_CPU" --build-arg "VERSION=$VERSION" --build-arg "GIT_COMMIT=$COMMIT" "$REPO/node"
+  run nice -n 15 docker build --provenance=false -f "$REPO/node/Dockerfile" --target gpu --build-arg "JOBS=$JOBS" -t "$IMG_GPU" --build-arg "VERSION=$VERSION" --build-arg "GIT_COMMIT=$COMMIT" "$REPO/node"
 }
 
 declare -A DIGEST=() SIZE=()

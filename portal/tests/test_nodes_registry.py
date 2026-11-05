@@ -6,11 +6,16 @@ from sqlalchemy import select, update
 
 from app.deployments import service
 from app.models import NodeAssignment, StandaloneNode
-from app.nodes import registry
+from app import mirror_tokens
+from app.nodes import identity, registry
 from app.workloads.builders import llama_settings_env
 from tests.fakes.k8s import FakeK8s
 
 pytestmark = pytest.mark.docker
+
+
+def r_text(value) -> str:
+    return repr(value)
 
 AUTH = {"Authorization": "Bearer agent-test"}  # the agent token; tok-test is the k3s server token
 LEGACY = {"Authorization": "Bearer tok-test"}
@@ -51,7 +56,10 @@ async def test_register_requires_bearer(client, db_session):
 
     r = await client.post("/api/nodes/register", json=PAYLOAD, headers=AUTH)
     assert r.status_code == 200, r.text
-    assert r.json() == {"ok": True, "heartbeat_interval": 15}
+    reply = r.json()
+    # a new name gets its own key once (approval is off in the tests' settings, tests/test_node_identity.py has it on)
+    assert reply == {"ok": True, "heartbeat_interval": 15, "approved": True, "node_key": reply["node_key"]}
+    assert identity.KEY_RE.fullmatch(reply["node_key"])
     row = await db_session.get(StandaloneNode, "lab-1")
     assert (row.url, row.accel, row.vram_mib, row.ram_mib, row.version) == (
         "http://10.0.0.5:18080",
@@ -73,7 +81,16 @@ async def test_register_requires_bearer(client, db_session):
         assert r.status_code == 401, bad
 
 
-async def test_legacy_server_token_is_accepted_for_one_release(client, app, db_session, caplog):
+async def test_legacy_server_token_is_off_by_default(client):
+    """Infra finding L3: a fresh main does not take the k3s server token from nodes; only an upgraded install turns it on."""
+    from app.config import Settings
+
+    assert Settings().node_legacy_token is False
+    assert (await client.post("/api/nodes/register", json=PAYLOAD, headers=LEGACY)).status_code == 401
+
+
+async def test_legacy_server_token_is_accepted_for_one_release(client, app, db_session, caplog, settings):
+    settings.node_legacy_token = True  # an install upgraded from before the agent token (main's entrypoint sets it)
     # nodes installed before the agent token keep talking to the portal with the old token, with a warning
     caplog.set_level("WARNING", logger="app.nodes.routes")
     for auth in (LEGACY, {"Authorization": "Bearer K10abc::server:tok-test"}):
@@ -155,7 +172,7 @@ async def test_register_flips_k8s_assignment_to_standalone(client, db_session):
     assert (await db_session.get(NodeAssignment, "lab-1")).source == "standalone"
 
 
-async def test_heartbeat_returns_desired_and_404_unknown(client, db_session):
+async def test_heartbeat_returns_desired_and_404_unknown(client, db_session, node_keys):
     r = await client.post("/api/nodes/heartbeat", json={"name": "ghost", "applied_spec_hash": None}, headers=AUTH)
     assert r.status_code == 404
     assert r.json() == {"detail": "unknown node"}
@@ -163,7 +180,7 @@ async def test_heartbeat_returns_desired_and_404_unknown(client, db_session):
     await client.post("/api/nodes/register", json=PAYLOAD, headers=AUTH)
     r = await client.post("/api/nodes/heartbeat", json={"name": "lab-1", "applied_spec_hash": None}, headers=AUTH)
     assert r.status_code == 200, r.text
-    assert r.json() == {"ok": True, "heartbeat_interval": 15, "desired": None}
+    assert r.json() == {"ok": True, "heartbeat_interval": 15, "approved": True, "desired": None}
 
     dep = await service.get_by_name(db_session, "gemma-4-e4b")
     await service.assign(db_session, "lab-1", dep.id)
@@ -178,7 +195,7 @@ async def test_heartbeat_returns_desired_and_404_unknown(client, db_session):
         "parallel": dep.parallel,
         "spec_hash": service.spec_hash(dep),
         "model_revision": dep.revision or "",
-        "backend_api_key": "",
+        "backend_api_key": identity.backend_key_of(node_keys.keys["lab-1"]),  # the node's own (task SEC-1)
         # the HF mirror on main by its IP (MAIN_ADVERTISE_IP), with this node's name for the progress report (no mirror key)
         "hf_endpoint": "https://192.168.3.21/hf/c/lab-1",
         "hf_token": "",
@@ -203,7 +220,7 @@ async def test_heartbeat_refreshes_last_seen(client, db_session):
     assert [n.name for n in await registry.live_nodes(db_session, 45)] == ["lab-1"]
 
 
-async def test_delete_keeps_assignment_and_deletes_k8s_node(client, app, db_session):
+async def test_delete_removes_the_assignment_and_deletes_k8s_node(client, app, db_session):
     app.state.k8s = k8s = FakeK8s()
     k8s.add_node("lab-1", accel="cpu")
     dep_id = (await service.get_by_name(db_session, "gemma-4-e4b")).id
@@ -216,8 +233,7 @@ async def test_delete_keeps_assignment_and_deletes_k8s_node(client, app, db_sess
     assert k8s.deleted_nodes == ["lab-1"]
     db_session.expire_all()
     assert await db_session.get(StandaloneNode, "lab-1") is None
-    row = await db_session.get(NodeAssignment, "lab-1")
-    assert row is not None and row.deployment_id == dep_id
+    assert await db_session.get(NodeAssignment, "lab-1") is None  # task 2-31: the node's removal is complete
 
     # unknown name and an unavailable cluster are not errors
     k8s.unavailable = True
@@ -226,14 +242,17 @@ async def test_delete_keeps_assignment_and_deletes_k8s_node(client, app, db_sess
     assert k8s.deleted_nodes == ["lab-1"]
 
 
-async def test_re_registered_node_keeps_assignment(client, db_session):
+async def test_re_registered_node_keeps_assignment_unless_it_was_deleted(client, db_session):
     dep = await service.get_by_name(db_session, "gemma-4-e4b")
     await client.post("/api/nodes/register", json=PAYLOAD, headers=AUTH)
     await service.assign(db_session, "lab-1", dep.id)
-    await client.delete("/api/nodes/lab-1", headers=AUTH)
-    await client.post("/api/nodes/register", json=PAYLOAD, headers=AUTH)
+    await client.post("/api/nodes/register", json=PAYLOAD, headers=AUTH)  # a restart of the container
     r = await client.post("/api/nodes/heartbeat", json={"name": "lab-1"}, headers=AUTH)
     assert r.json()["desired"]["spec_hash"] == service.spec_hash(dep)
+    await client.delete("/api/nodes/lab-1", headers=AUTH)  # -Uninstall: a node installed again starts without a model
+    await client.post("/api/nodes/register", json=PAYLOAD, headers=AUTH)
+    r = await client.post("/api/nodes/heartbeat", json={"name": "lab-1"}, headers=AUTH)
+    assert r.json()["desired"] is None
 
 
 async def test_live_nodes_respects_ttl(db_session):
@@ -252,14 +271,21 @@ async def test_live_nodes_respects_ttl(db_session):
     assert await registry.remove(db_session, "stale") is True
 
 
-async def test_heartbeat_hands_the_backend_key_to_an_assigned_node(client, app, db_session, monkeypatch):
+async def test_heartbeat_hands_the_node_its_own_backend_key(client, app, db_session, monkeypatch, node_keys):
+    """Rule 3 of task SEC-1: the shared BACKEND_API_KEY never goes to a node that has its own key; the heartbeat hands out
+    the node's own backend key, derived from its key (the node computes the same, registrar.sh)."""
     monkeypatch.setattr(app.state.settings, "backend_api_key", SecretStr("hex-backend-key"))
     dep = await service.get_by_name(db_session, "gemma-4-e4b")
     await client.post("/api/nodes/register", json=PAYLOAD, headers=AUTH)
+    await client.post("/api/nodes/register", json={**PAYLOAD, "name": "lab-2", "url": "http://10.0.0.6:18080"}, headers=AUTH)
     await service.assign(db_session, "lab-1", dep.id)
-    r = await client.post("/api/nodes/heartbeat", json={"name": "lab-1"}, headers=AUTH)
-    assert r.json()["desired"]["backend_api_key"] == "hex-backend-key"
-    assert service.spec_hash(dep) == r.json()["desired"]["spec_hash"]  # the key is not part of the spec
+    await service.assign(db_session, "lab-2", dep.id)
+    one = (await client.post("/api/nodes/heartbeat", json={"name": "lab-1"}, headers=AUTH)).json()["desired"]
+    two = (await client.post("/api/nodes/heartbeat", json={"name": "lab-2"}, headers=AUTH)).json()["desired"]
+    assert one["backend_api_key"] == identity.backend_key_of(node_keys.keys["lab-1"])
+    assert two["backend_api_key"] == identity.backend_key_of(node_keys.keys["lab-2"])
+    assert len({one["backend_api_key"], two["backend_api_key"], "hex-backend-key"}) == 3
+    assert service.spec_hash(dep) == one["spec_hash"]  # the key is not part of the spec
 
 
 async def test_main_node_cannot_be_deleted_with_the_cluster_token(client, app):
@@ -324,7 +350,10 @@ async def test_heartbeat_points_a_standalone_node_at_the_mirror(app, client, db_
     monkeypatch.setattr(settings, "hf_mirror_token", SecretStr("hf_" + "ab" * 20))
     monkeypatch.setattr(settings, "hf_mirror_url", "https://192.168.3.21/hf/")
     desired = (await client.post("/api/nodes/heartbeat", json={"name": "lab-1"}, headers=AUTH)).json()["desired"]
-    assert (desired["hf_endpoint"], desired["hf_token"]) == ("https://192.168.3.21/hf/c/lab-1", "hf_" + "ab" * 20)
+    # a token for the repositories of its deployment only, never the mirror's own key (rule 4 of task SEC-1)
+    scoped = mirror_tokens.mint("hf_" + "ab" * 20, "lab-1", {dep.repo})
+    assert (desired["hf_endpoint"], desired["hf_token"]) == ("https://192.168.3.21/hf/c/lab-1", scoped)
+    assert "hf_" + "ab" * 20 not in r_text(desired)
     assert service.spec_hash(dep) == desired["spec_hash"]  # the mirror address is not part of the spec
     monkeypatch.setattr(settings, "hf_mirror_enabled", False)
     desired = (await client.post("/api/nodes/heartbeat", json={"name": "lab-1"}, headers=AUTH)).json()["desired"]
@@ -334,7 +363,8 @@ async def test_heartbeat_points_a_standalone_node_at_the_mirror(app, client, db_
     await db_session.commit()
     desired = (await client.post("/api/nodes/heartbeat", json={"name": "lab-1"}, headers=AUTH)).json()["desired"]
     assert desired["model_repo"] == "local/own"
-    assert (desired["hf_endpoint"], desired["hf_token"]) == ("https://192.168.3.21/hf/c/lab-1", "hf_" + "ab" * 20)
+    scoped = mirror_tokens.mint("hf_" + "ab" * 20, "lab-1", {"local/own"})
+    assert (desired["hf_endpoint"], desired["hf_token"]) == ("https://192.168.3.21/hf/c/lab-1", scoped)
 
 
 async def test_heartbeat_carries_the_llama_settings_to_a_standalone_node(app, client, db_session, monkeypatch):

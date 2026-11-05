@@ -24,7 +24,7 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 
-$Version = '0.1.0'
+$Version = '0.2.0'
 $Container = 'llm-main'
 if (-not $Image) { $Image = "nsu-llm-main:$Version" }
 if (-not $AirgapDir) { $AirgapDir = Join-Path $env:ProgramData 'nsu-llm-main\images' }
@@ -200,13 +200,31 @@ $run = @('run', '-d', '--name', $Container, '--hostname', 'llm-main', '--privile
     '--ulimit', 'nofile=1048576:1048576',
     '--log-driver', 'json-file', '--log-opt', 'max-size=50m', '--log-opt', 'max-file=5',
     '--tmpfs', '/run', '--tmpfs', '/var/run',
-    '-p', '443:443', '-p', '80:80', '-p', '6443:6443',
+    # только IPv4 (SEC-2 L1): по IPv6 docker-proxy подставил бы адрес шлюза bridge, и фильтры по адресу клиента его бы пропустили
+    '-p', '0.0.0.0:443:443', '-p', '0.0.0.0:80:80', '-p', '0.0.0.0:6443:6443',
     '-v', 'llm-main-k3s:/var/lib/rancher/k3s', '-v', 'llm-main-kubelet:/var/lib/kubelet', '-v', 'llm-main-data:/var/lib/llm',
     '-v', 'llm-main-hf:/var/lib/llm-hf', '-v', 'llm-main-registry:/var/lib/llm-registry',
     '--env-file', $EnvFileFull)
 if ($Airgap -or (Test-Path (Join-Path $AirgapDir '*.tar')) -or (Test-Path (Join-Path $AirgapDir '*.tar.zst'))) { $run += @('-v', "${AirgapDir}:/var/lib/rancher/k3s/agent/images:ro") }
 if ($Certs) { $run += @('-v', ((Resolve-Path $Certs).Path + ':/certs:ro'), '-e', 'TLS_CERT=1') }
 if ($AdvertiseIp) { $run += @('-e', "MAIN_ADVERTISE_IP=$AdvertiseIp") }
+# Digest образа главного для блока «Версии» («Состояние»): изнутри контейнера его не видно. Digest реестра (RepoDigests, образ скачан с
+# ghcr.io), иначе id образа; не определился: переменная не передаётся.
+if (-not $DryRun) {
+    $mainDigest = ''
+    $prevEap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    try {
+        foreach ($l in @(& docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' $Image 2>$null)) {
+            if ("$l" -match '@(sha256:[0-9a-f]{64})\s*$') { $mainDigest = $Matches[1]; break }
+        }
+        if (-not $mainDigest) {
+            $id = "$(& docker image inspect --format '{{.Id}}' $Image 2>$null | Select-Object -First 1)".Trim()
+            if ($id -match '^sha256:[0-9a-f]{64}$') { $mainDigest = $id }
+        }
+    }
+    finally { $ErrorActionPreference = $prevEap }
+    if ($mainDigest) { $run += @('-e', "MAIN_IMAGE_DIGEST=$mainDigest") }
+}
 $run += $Image
 Invoke-Docker @run
 

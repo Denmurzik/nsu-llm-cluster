@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Entrypoint and Caddyfile tests against the built image (nsu-llm-main:0.1.0), mostly in dry-run mode: no k3s is started.
-# Build first: docker build --provenance=false -f main/Dockerfile -t nsu-llm-main:0.1.0 .
+# Entrypoint and Caddyfile tests against the built image (nsu-llm-main:0.2.0), mostly in dry-run mode: no k3s is started.
+# Build first: docker build --provenance=false -f main/Dockerfile -t nsu-llm-main:0.2.0 .
 set -uo pipefail
 export MSYS_NO_PATHCONV=1
 
-IMAGE="${IMAGE:-nsu-llm-main:0.1.0}"
-VOL="it-14-ep-data-$$"
+IMAGE="${IMAGE:-nsu-llm-main:0.2.0}"
+VOL="nsu-llm-it14-ep-data-$$"
 CERTS_DIR="$(mktemp -d)"
 CERTS_MOUNT="$CERTS_DIR"; command -v cygpath >/dev/null 2>&1 && CERTS_MOUNT="$(cygpath -m "$CERTS_DIR")"
 FAILED=0
@@ -80,9 +80,37 @@ agent1="$(sed -n 's/^AGENT_TOKEN=//p' <<<"$out1")"; server1="$(sed -n 's/^CLUSTE
 [[ "$agent1" =~ ^[0-9a-f]{64}$ ]] && [ "$agent1" != "$server1" ]
 check "AGENT_TOKEN is hex64 and differs from CLUSTER_TOKEN" $? "agent=$agent1 server=$server1"
 out3b="$(ep_run "${BASE_ENV[@]}" -- 'grep -E "^(AGENT_TOKEN|CLUSTER_TOKEN|NODE_LEGACY_TOKEN)=" /run/llm/portal.env')"
-grep -Eq '^AGENT_TOKEN=[0-9a-f]{64}$' <<<"$out3b" && grep -q '^CLUSTER_TOKEN=from-env-token$' <<<"$out3b" \
-  && ! grep -q '^NODE_LEGACY_TOKEN=' <<<"$out3b"
-check "portal.env has AGENT_TOKEN and (for old nodes) CLUSTER_TOKEN" $? "$out3b"
+grep -Eq '^AGENT_TOKEN=[0-9a-f]{64}$' <<<"$out3b" && ! grep -q '^CLUSTER_TOKEN=' <<<"$out3b" \
+  && grep -q '^NODE_LEGACY_TOKEN=false$' <<<"$out3b"
+check "fresh install: portal.env has AGENT_TOKEN, NODE_LEGACY_TOKEN defaults to false and the server token stays out (SEC-2 L3)" $? "$out3b"
+# an install from before this version (secrets.env without NODE_LEGACY_TOKEN_DEFAULT) keeps taking the server token, and
+# remembers it; NODE_LEGACY_TOKEN in .env still wins
+out3b2="$(ep_run "${BASE_ENV[@]}" -- 'S=/var/lib/llm/secrets.env; sed -i /^NODE_LEGACY_TOKEN_DEFAULT=/d $S;
+  /opt/llm/main/entrypoint.sh >/dev/null; grep -E "^(CLUSTER_TOKEN|NODE_LEGACY_TOKEN)=" /run/llm/portal.env | sed "s/^/RUN1 /";
+  /opt/llm/main/entrypoint.sh >/dev/null; grep ^NODE_LEGACY_TOKEN= /run/llm/portal.env | sed "s/^/RUN2 /"; grep ^NODE_LEGACY_TOKEN_DEFAULT= $S;
+  NODE_LEGACY_TOKEN=false /opt/llm/main/entrypoint.sh >/dev/null; grep -c ^CLUSTER_TOKEN= /run/llm/portal.env | sed "s/^/RUN3 /"')"
+grep -q '^RUN1 CLUSTER_TOKEN=from-env-token$' <<<"$out3b2" && grep -q '^RUN1 NODE_LEGACY_TOKEN=true$' <<<"$out3b2" \
+  && grep -q '^RUN2 NODE_LEGACY_TOKEN=true$' <<<"$out3b2" && grep -q '^NODE_LEGACY_TOKEN_DEFAULT=true$' <<<"$out3b2" \
+  && grep -q '^RUN3 0$' <<<"$out3b2"
+check "install from before SEC-2: NODE_LEGACY_TOKEN defaults to true, remembered; .env false still wins" $? "$out3b2"
+# SEC-2 L2: the mirror key of an install from before SEC-2 was in llm-node-secrets (every node knows it): replaced once, then kept
+out3m="$(ep_run "${BASE_ENV[@]}" -- 'S=/var/lib/llm/secrets.env; sed -i /^HF_MIRROR_TOKEN_MAIN_ONLY=/d $S; sed -n "s/^HF_MIRROR_TOKEN=/OLD /p" $S;
+  /opt/llm/main/entrypoint.sh 2>&1 | grep -c "HF_MIRROR_TOKEN заменён" | sed "s/^/MSG /"; sed -n "s/^HF_MIRROR_TOKEN=/NEW /p" $S;
+  /opt/llm/main/entrypoint.sh >/dev/null 2>&1; sed -n "s/^HF_MIRROR_TOKEN=/AGAIN /p" $S; grep -c ^HF_MIRROR_TOKEN_MAIN_ONLY=1$ $S')"
+m_old="$(sed -n 's/^OLD //p' <<<"$out3m")"; m_new="$(sed -n 's/^NEW //p' <<<"$out3m")"; m_again="$(sed -n 's/^AGAIN //p' <<<"$out3m")"
+[[ "$m_new" =~ ^hf_[0-9a-f]{40}$ ]] && [ "$m_old" != "$m_new" ] && [ "$m_new" = "$m_again" ] && grep -q '^MSG 1$' <<<"$out3m" && grep -q '^1$' <<<"$out3m"
+check "install from before SEC-2: HF_MIRROR_TOKEN (known to every node) is replaced once and then kept" $? "$out3m"
+# the old value set in .env (review I4): refused with a working fix; removing it from .env gives a new key; re-adding it is refused
+out3n="$(ep_run "${BASE_ENV[@]}" -- 'S=/var/lib/llm/secrets.env; sed -i -e /^HF_MIRROR_TOKEN_MAIN_ONLY=/d -e /^HF_MIRROR_TOKEN_LEAKED=/d $S;
+  old=$(sed -n "s/^HF_MIRROR_TOKEN=//p" $S); echo "OLD $old";
+  HF_MIRROR_TOKEN=$old /opt/llm/main/entrypoint.sh >/tmp/o1 2>&1; echo "RC1 $?"; grep -c "уберите строку\|Уберите строку" /tmp/o1 | sed "s/^/MSG /";
+  /opt/llm/main/entrypoint.sh >/dev/null 2>&1; echo "RC2 $?"; sed -n "s/^HF_MIRROR_TOKEN=/NEW /p" $S;
+  HF_MIRROR_TOKEN=$old /opt/llm/main/entrypoint.sh >/dev/null 2>&1; echo "RC3 $?";
+  HF_MIRROR_TOKEN=hf_0123456789abcdef0123456789abcdef01234567 /opt/llm/main/entrypoint.sh >/dev/null 2>&1; echo "RC4 $?"')"
+n_old="$(sed -n 's/^OLD //p' <<<"$out3n")"; n_new="$(sed -n 's/^NEW //p' <<<"$out3n")"
+grep -q '^RC1 64$' <<<"$out3n" && grep -q '^MSG 1$' <<<"$out3n" && grep -q '^RC2 0$' <<<"$out3n" && [[ "$n_new" =~ ^hf_[0-9a-f]{40}$ ]] \
+  && [ "$n_new" != "$n_old" ] && grep -q '^RC3 64$' <<<"$out3n" && grep -q '^RC4 0$' <<<"$out3n"
+check "old HF_MIRROR_TOKEN in .env: exit 64 with the fix; without it a new key; the old value is refused later too, a new one accepted" $? "$out3n"
 out3c="$(ep_run "${BASE_ENV[@]}" -e NODE_LEGACY_TOKEN=false -- 'grep ^NODE_LEGACY_TOKEN= /run/llm/portal.env')"
 grep -q '^NODE_LEGACY_TOKEN=false$' <<<"$out3c"
 check "portal.env passes NODE_LEGACY_TOKEN" $? "$out3c"
@@ -115,14 +143,44 @@ grep -A2 'handle /api/playground/chat' <<<"$out4" | grep -q 'max_size 24MB'
 check "Caddyfile: the Playground chat route takes up to 24 MB, the rest of the portal 1 MB" $? "$out4"
 [ "$(grep -c 'max_size 1MB' <<<"$out4")" = 1 ]
 check "Caddyfile: only the catch-all portal route stays at 1 MB" $? "$out4"
-grep -q 'handle /v2/\*' <<<"$out4" && grep -q 'reverse_proxy 127.0.0.1:5000' <<<"$out4" \
-  && grep -q 'not client_ip 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 127.0.0.0/8 ::1' <<<"$out4" \
+grep -q 'handle /v2/\*' <<<"$out4" && grep -q 'reverse_proxy 127.0.0.1:5001' <<<"$out4" \
+  && grep -q 'not client_ip 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 127.0.0.0/8 ::1 ::ffff:a00:0/104 ::ffff:ac10:0/108 ::ffff:c0a8:0/112 ::ffff:7f00:0/104$' <<<"$out4" \
   && grep -q '@registry_write not method GET HEAD' <<<"$out4" && grep -q 'common-50-registry.yaml' <<<"$out4" && ! grep -qE '@@[A-Z_]+@@' <<<"$out4"
-check "registry: /v2/ proxied to 127.0.0.1:5000, read-only, limited to the private subnets by default, manifest rendered" $? "$out4"
-out4r="$(ep_run "${BASE_ENV[@]}" -e REGISTRY_PORT=5111 -e 'REGISTRY_ALLOW_FROM=10.1.0.0/16, 192.168.5.7' -- 'cat /run/llm/Caddyfile')"
-grep -q 'reverse_proxy 127.0.0.1:5111' <<<"$out4r" && grep -q 'not client_ip 10.1.0.0/16 192.168.5.7$' <<<"$out4r"
-check "REGISTRY_PORT and REGISTRY_ALLOW_FROM reach the Caddyfile" $? "$out4r"
-for bad in REGISTRY_PORT=80 REGISTRY_PORT=x 'REGISTRY_ALLOW_FROM=10.0.0.0/8 }' 'REGISTRY_ALLOW_FROM=,' 'REGISTRY_ALLOW_FROM=evil.example'; do
+check "registry: /v2/ proxied to the registry on 127.0.0.1:5001, read-only, limited to the private subnets by default, manifest rendered" $? "$out4"
+# SEC-2 M2: the registry needs the nsu-push password; Caddy adds it for reads (/v2/ and the loopback read listener on
+# REGISTRY_PORT), the Secret carries only its bcrypt hash, the hash is stable across restarts, registry-push.sh finds the port
+out4a="$(ep_run "${BASE_ENV[@]}" -- 'S=/var/lib/llm/secrets.env; pw=$(sed -n s/^REGISTRY_PASSWORD=//p $S); echo "PW=$pw";
+  M=/var/lib/rancher/k3s/server/manifests/common-50-registry.yaml; sed -n "s/^  htpasswd: //p" $M | sed "s/^/H1 /";
+  grep -c "header_up Authorization \"Basic $(printf nsu-push:%s "$pw" | base64 -w0)\"" /run/llm/Caddyfile | sed "s/^/AUTHS /";
+  grep -A1 "^http://127.0.0.1:5000 {" /run/llm/Caddyfile; cat /run/llm/registry.env; grep -c "$pw" $M | sed "s/^/PW_IN_MANIFEST /";
+  stat -c "caddyfile mode=%a" /run/llm/Caddyfile;
+  /opt/llm/main/entrypoint.sh >/dev/null; sed -n "s/^  htpasswd: //p" $M | sed "s/^/H2 /"')"
+pw="$(sed -n 's/^PW=//p' <<<"$out4a")"; h1="$(sed -n 's/^H1 //p' <<<"$out4a")"; h2="$(sed -n 's/^H2 //p' <<<"$out4a")"
+[[ "$pw" =~ ^[0-9a-f]{48}$ ]] && [[ "$h1" =~ ^\"nsu-push:\$2a\$06\$ ]] && [ "$h1" = "$h2" ] && grep -q '^AUTHS 2$' <<<"$out4a" \
+  && grep -q '^http://127.0.0.1:5000 {' <<<"$out4a" && grep -q 'bind 127.0.0.1' <<<"$out4a" \
+  && grep -q '^REGISTRY_BACKEND_PORT=5001$' <<<"$out4a" && grep -q '^REGISTRY_USER=nsu-push$' <<<"$out4a" \
+  && grep -q '^PW_IN_MANIFEST 0$' <<<"$out4a" && grep -q 'caddyfile mode=600' <<<"$out4a"
+check "registry auth: REGISTRY_PASSWORD generated, Secret has only a stable bcrypt hash, Caddy adds the password for reads on /v2/ and 127.0.0.1:5000" $? "$out4a"
+out4r="$(ep_run "${BASE_ENV[@]}" -e REGISTRY_PORT=5111 -e REGISTRY_BACKEND_PORT=5222 -e 'REGISTRY_ALLOW_FROM=10.1.0.0/16, 192.168.5.7' -- 'cat /run/llm/Caddyfile; cat /run/llm/registry.env')"
+grep -q 'reverse_proxy 127.0.0.1:5222' <<<"$out4r" && grep -q '^http://127.0.0.1:5111 {' <<<"$out4r" && grep -q 'not client_ip 10.1.0.0/16 192.168.5.7$' <<<"$out4r" \
+  && grep -q '^REGISTRY_BACKEND_PORT=5222$' <<<"$out4r"
+check "REGISTRY_PORT, REGISTRY_BACKEND_PORT and REGISTRY_ALLOW_FROM reach the Caddyfile" $? "$out4r"
+# SEC-2 L1: the node API only from the class subnets (default: private ranges), before the catch-all portal route
+p_nodes="$(grep -n 'path /api/nodes /api/nodes/\*' <<<"$out4" | cut -d: -f1)"; p_all="$(grep -n '^	handle {$' <<<"$out4" | head -n1 | cut -d: -f1)"
+[ -n "$p_nodes" ] && [ -n "$p_all" ] && [ "$p_nodes" -lt "$p_all" ] && grep -q 'API нод доступен только из сети класса' <<<"$out4"
+check "Caddyfile: /api/nodes only from NODE_ALLOW_FROM (private subnets by default), ahead of the portal route" $? "$out4"
+out4n="$(ep_run "${BASE_ENV[@]}" -e 'NODE_ALLOW_FROM=10.20.0.0/16, 10.4.1.20' -- 'grep -A2 "path /api/nodes" /run/llm/Caddyfile')"
+grep -q 'not client_ip 10.20.0.0/16 10.4.1.20$' <<<"$out4n"
+check "NODE_ALLOW_FROM reaches the Caddyfile" $? "$out4n"
+out4m="$(ep_run "${BASE_ENV[@]}" -e 'REGISTRY_ALLOW_FROM=203.0.113.0/24' -- 'grep -A2 "path /api/nodes" /run/llm/Caddyfile')"
+grep -q 'not client_ip 203.0.113.0/24$' <<<"$out4m"
+check "NODE_ALLOW_FROM not set: the subnets of REGISTRY_ALLOW_FROM (a class in a public subnet keeps working after the update)" $? "$out4m"
+for bad in 'NODE_ALLOW_FROM=,' 'NODE_ALLOW_FROM=evil.example' 'NODE_ALLOW_FROM=10.0.0.0/8 }'; do
+  outb="$(ep_run "${BASE_ENV[@]}" -e "$bad" -- 'true')"
+  grep -q '^rc=64$' <<<"$outb" && grep -q "NODE_ALLOW_FROM" <<<"$outb"
+  check "$bad -> exit 64 naming the variable" $? "$outb"
+done
+for bad in REGISTRY_PORT=80 REGISTRY_PORT=x REGISTRY_BACKEND_PORT=80 REGISTRY_BACKEND_PORT=5000 'REGISTRY_ALLOW_FROM=10.0.0.0/8 }' 'REGISTRY_ALLOW_FROM=,' 'REGISTRY_ALLOW_FROM=evil.example'; do
   outb="$(ep_run "${BASE_ENV[@]}" -e "$bad" -- 'true')"
   grep -q '^rc=64$' <<<"$outb" && grep -q "REGISTRY_" <<<"$outb"
   check "$bad -> exit 64 naming the variable" $? "$outb"
@@ -148,8 +206,8 @@ grep -qxF 'NO_PROXY=.nsu.ru\,127.0.0.1\,localhost\,::1' <<<"$outp" && grep -qxF 
 check "with a proxy, 127.0.0.1, localhost and ::1 bypass it (portal.env and the mirror pod)" $? "$outp"
 outs="$(ep_run "${BASE_ENV[@]}" -e HF_TOKEN=hf_realtoken -- 'cat /var/lib/rancher/k3s/server/manifests/common-10-secrets.yaml')"
 node_secret="$(sed -n '/name: llm-node-secrets/,$p' <<<"$outs")"
-grep -q '^  BACKEND_API_KEY: "[A-Za-z0-9._~-]*"$' <<<"$node_secret" && grep -q '^  HF_TOKEN: ""$' <<<"$node_secret" \
-  && ! grep -q 'LITELLM_MASTER_KEY\|SALT\|PASSWORD\|DATABASE_URL\|hf_realtoken' <<<"$node_secret"
+grep -q '^  HF_TOKEN: ""$' <<<"$node_secret" \
+  && ! grep -q 'LITELLM_MASTER_KEY\|SALT\|PASSWORD\|DATABASE_URL\|hf_realtoken\|BACKEND_API_KEY\|HF_MIRROR_TOKEN' <<<"$node_secret"
 check "llm-node-secrets (read by the nodes' kubelets) holds no key of main and, with the mirror on, no HF token" $? "$outs"
 outb="$(ep_run "${BASE_ENV[@]}" -e HF_MIRROR_MAX_GIB=0 -- 'true')"
 grep -q '^rc=64$' <<<"$outb" && grep -q "HF_MIRROR_MAX_GIB" <<<"$outb"
@@ -163,13 +221,24 @@ check "portal.env has database url, web dist, migrations dir, hostname, oidc sec
 out4b="$(ep_run "${BASE_ENV[@]}" -e ADMIN_REQUIRE_EMAIL_VERIFIED=false -- 'cat /run/llm/portal.env')"
 grep -q '^ADMIN_REQUIRE_EMAIL_VERIFIED=false$' <<<"$out4b"
 check "portal.env passes ADMIN_REQUIRE_EMAIL_VERIFIED" $? "$out4b"
+# no provider defaults: without OIDC_ISSUER / OIDC_CLIENT_ID main starts, says so loudly and never writes a provider of its own
+! grep -q '^OIDC_ISSUER=\|^OIDC_CLIENT_ID=\|nsu.ru\|nsuts' <<<"$out4" && grep -q 'не задана переменная OIDC_ISSUER' <<<"$out4" && grep -q 'не задана переменная OIDC_CLIENT_ID' <<<"$out4"
+check "no OIDC_ISSUER / OIDC_CLIENT_ID: a warning for each, no NSU value in portal.env" $? "$out4"
+out4c="$(ep_run "${BASE_ENV[@]}" -e OIDC_ISSUER=https://sso.example.org/realms/x -e OIDC_CLIENT_ID=cid -e 'LOGIN_PROVIDER_NAME=Campus SSO' -- 'cat /run/llm/portal.env')"
+grep -q '^OIDC_ISSUER=https://sso.example.org/realms/x$' <<<"$out4c" && grep -q '^OIDC_CLIENT_ID=cid$' <<<"$out4c"   && grep -qxF 'LOGIN_PROVIDER_NAME=Campus\ SSO' <<<"$out4c" && ! grep -q 'не задана переменная OIDC' <<<"$out4c"
+check "portal.env passes OIDC_ISSUER, OIDC_CLIENT_ID and LOGIN_PROVIDER_NAME; no warning when set" $? "$out4c"
 grep -q 'portal.env mode=600' <<<"$out4"
 check "portal.env is mode 600" $?
 
 # 5b. scale settings: defaults reach the portal, LITELLM_WORKERS reaches the LiteLLM manifest, bad values exit 64
-grep -q '^REDIS_URL=redis://127.0.0.1:6379/0$' <<<"$out4" && grep -q '^PORTAL_WORKERS=4$' <<<"$out4" \
+grep -Eq '^REDIS_URL=redis://:[0-9a-f]{48}@127.0.0.1:6379/0$' <<<"$out4" && grep -q '^PORTAL_WORKERS=4$' <<<"$out4" \
   && grep -q '^LITELLM_WORKERS=4$' <<<"$out4" && grep -q '^QUEUE_FACTOR=2$' <<<"$out4" && grep -q 'common-25-redis.yaml' <<<"$out4"
 check "portal.env has redis url, workers and queue factor; redis manifest rendered" $? "$out4"
+# SEC-2: the portal's own key to the mirror and the signing key reach the portal, differ, and the secrets of Redis and the
+# registry stay out of it (the portal reads Redis through REDIS_URL, the registry through Caddy)
+adm="$(sed -n 's/^HF_MIRROR_ADMIN_TOKEN=//p' <<<"$out4")"; sig="$(sed -n 's/^HF_MIRROR_TOKEN=//p' <<<"$out4")"
+[[ "$adm" =~ ^[0-9a-f]{48}$ ]] && [[ "$sig" =~ ^hf_[0-9a-f]{40}$ ]] && ! grep -q '^REDIS_PASSWORD=\|^REGISTRY_PASSWORD=' <<<"$out4"
+check "portal.env: HF_MIRROR_ADMIN_TOKEN and HF_MIRROR_TOKEN (different), no REDIS_PASSWORD or REGISTRY_PASSWORD" $? "adm=$adm sig=$sig"
 out4b="$(ep_run "${BASE_ENV[@]}" -e LITELLM_WORKERS=2 -e QUEUE_FACTOR=4 -- 'M=/var/lib/rancher/k3s/server/manifests/common-30-litellm.yaml; grep -A1 -- "- --num_workers" $M; grep "database_connection_pool_limit\|overload_hook" $M; grep QUEUE_FACTOR /run/llm/portal.env')"
 grep -q '"2"' <<<"$out4b" && grep -q 'database_connection_pool_limit: 60' <<<"$out4b" \
   && grep -q 'overload_hook.py: |' <<<"$out4b" && grep -q '^QUEUE_FACTOR=4$' <<<"$out4b"
@@ -190,6 +259,15 @@ touch "$CERTS_DIR/tls.crt" "$CERTS_DIR/tls.key"
 out5="$(ep_run "${BASE_ENV[@]}" -e TLS_CERT=1 -v "$CERTS_MOUNT:/certs:ro" -- 'cat /run/llm/Caddyfile')"
 grep -q 'tls /certs/tls.crt /certs/tls.key' <<<"$out5" && ! grep -q 'local_certs' <<<"$out5" && ! grep -q 'tls internal' <<<"$out5"
 check "TLS_CERT: custom certificate, no local_certs" $? "$out5"
+# SEC-2 M1: /ca.crt.p7s (the k3s-CA signature of /ca.crt) on both sites; nothing to sign without a /ca.crt
+[ "$(grep -A1 'handle /ca.crt.p7s {' <<<"$out5" | grep -c 'respond 404')" = 2 ]
+check "TLS_CERT without ca.crt: /ca.crt.p7s answers 404 on both sites" $? "$out5"
+[ "$(grep -c 'handle /ca.crt.p7s {' <<<"$out4")" = 2 ] && [ "$(grep -c 'rewrite \* /ca.crt.p7s' <<<"$out4")" = 2 ] \
+  && grep -q 'root \* /var/lib/llm/ca-sign' <<<"$out4" && grep -q 'header Content-Type application/pkcs7-signature' <<<"$out4"
+check "internal CA: /ca.crt.p7s served from /var/lib/llm/ca-sign on both sites" $? "$out4"
+out5s="$(docker run --rm --entrypoint sh "$IMAGE" -c 'test -x /opt/llm/main/sign-ca.sh && openssl version' 2>&1)"
+grep -q '^OpenSSL 3' <<<"$out5s"
+check "sign-ca.sh is in the image with OpenSSL 3 (cms)" $? "$out5s"
 printf -- '-----BEGIN CERTIFICATE-----\nOWNCA\n-----END CERTIFICATE-----\n' >"$CERTS_DIR/ca.crt"
 out5c="$(ep_run "${BASE_ENV[@]}" -e TLS_CERT=1 -v "$CERTS_MOUNT:/certs:ro" -- 'cat /var/lib/rancher/k3s/server/manifests/common-15-ca.yaml')"
 grep -q 'name: llm-ca' <<<"$out5c" && [ "$(grep -c OWNCA <<<"$out5c")" = 2 ] && grep -q 'bundle.crt: |' <<<"$out5c"

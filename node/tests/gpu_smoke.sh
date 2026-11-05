@@ -4,7 +4,7 @@
 # Needs only docker, python3 and curl. Uses containers it-t2-gpu-smoke and it-t2-mock, network it-t2-net, host port 28080.
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-IMAGE="${IMAGE:-nsu-llm-node:0.1.0-gpu}"
+IMAGE="${IMAGE:-nsu-llm-node:0.2.0-gpu}"
 CTR="it-t2-gpu-smoke"
 MOCK="it-t2-mock"
 NET="it-t2-net"

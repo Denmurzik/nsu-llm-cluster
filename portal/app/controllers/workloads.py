@@ -1,24 +1,27 @@
 """Workload controller: node assignments and model deployments -> node labels and Kubernetes objects."""
 
 import ipaddress
+import json
 import logging
 import re
 import time
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from kubernetes_asyncio.client.exceptions import ApiException
 from sqlalchemy import delete, select
 
+from app import settings_store
 from app.catalog import placement
 from app.catalog.sources import model_sources
 from app.deployments import schedule, service
 from app.deployments.service import NodeCandidate
-from app.k8s import A_GROUP_HASH, A_SPEC_HASH, L_DEPLOYMENT, K8sUnavailable, NodeInfo
-from app.models import ControllerTimer, NodeAssignment, NodeWake, StandaloneNode
-from app.nodes import relay, wake
+from app.k8s import A_GROUP_HASH, A_SPEC_HASH, L_DEPLOYMENT, L_NODE_DEPLOYMENT, K8sUnavailable, NodeInfo
+from app.models import ControllerTimer, NodeAssignment, NodeModels, NodeWake, StandaloneNode
+from app.nodes import cleanup, identity, registry, relay, wake
 from app.workloads import builders
 from app.workloads.builders import RpcWorker
+from app.nodes import versions
 
 log = logging.getLogger(__name__)
 
@@ -108,6 +111,39 @@ class _Waking:
     tries: int = 0
 
 
+@dataclass
+class _Purge:
+    """A cleanup of a node's models volume (task 2-26) that is waiting for its time or has been handed to the node: kept
+    in the database (`purge:<node>`) so that a restart of the controllers neither forgets the idle time nor issues the
+    cleanup twice."""
+
+    since: float  # the cleanup became due (`_now`); MODEL_CACHE_IDLE_S counts from here
+    sig: cleanup.Signature  # what the volume is cleaned for
+    ref: str = ""  # the Job (k3s) or the order (standalone) handed to the node, empty before
+    issued_at: float = 0.0
+    not_before: float = 0.0  # a cleanup that failed is not repeated before
+    source: str = ""
+
+    def dump(self) -> str:
+        return json.dumps(
+            {"sig": self.sig.dump(), "ref": self.ref, "at": self.issued_at, "nb": self.not_before, "src": self.source}
+        )
+
+    @staticmethod
+    def load(since: float, text: str) -> "_Purge | None":
+        try:
+            raw = json.loads(text)
+            sig = cleanup.Signature.load(raw["sig"])
+            if sig is None:
+                return None
+            return _Purge(since, sig, str(raw.get("ref", "")), float(raw.get("at", 0)), float(raw.get("nb", 0)), str(raw.get("src", "")))
+        except (ValueError, KeyError, TypeError):
+            return None
+
+
+CLEANUP_RETRY_S = 300.0  # a failed cleanup is tried again after this long (at least)
+
+
 def _url_host(url: str) -> str | None:
     host = url.removeprefix("http://").rpartition(":")[0]
     return host or None
@@ -122,9 +158,17 @@ class WorkloadController:
         self._unplaced: set[tuple] = set()  # groups whose missing placement was logged (logged once, not every pass)
         self._repos: str | None = None  # the repo list last written to the ConfigMap llm-model-repos
         self._waking: dict[str, _Waking] = {}  # node name -> its Wake-on-LAN attempts
+        self._cached: dict[str, tuple[float, cleanup.Signature]] = {}  # node -> what its models volume was last cleaned for
+        self._purging: dict[str, _Purge] = {}  # node -> the cleanup of its models volume that is due or running
 
     async def reconcile_once(self) -> None:
         state = self.app_state
+        # The pods run the node image pinned by the digest main's registry reports (task 2-30). Built before the registry has
+        # answered (the main container is starting), they would carry the bare tag and be re-templated a minute later: every
+        # model would load twice. A main without a registry gets its pods after versions.PIN_WAIT_S.
+        if not await versions.refresh_pins(state):
+            log.info("workloads: the registry of main has not answered yet, the pods wait")
+            return
         try:
             nodes = [n for n in await state.k8s.list_nodes() if not n.is_main]
         except _K8S_ERRORS as exc:
@@ -134,11 +178,20 @@ class WorkloadController:
             await service.purge_standalone(db, nodes, state.settings.standalone_purge_s)
             await self._load_timers(db)
             await service.refresh_missing_meta(db, model_sources(state), self._meta_backoff)
+            # only nodes the admin approved serve (app.nodes.identity): an unapproved one gets no assignment, no label, no pods
+            required = await identity.approval_required(state)
+            live_standalone = await service.live_nodes(db, state.settings.standalone_ttl_s)
+            approved = await identity.approved_names(
+                db, [n.name for n in nodes] + [sn.name for sn in live_standalone], required
+            )
             candidates = [
-                NodeCandidate(n.name.lower(), n.accel, "k8s", n.vram_mib, n.mem_mib) for n in nodes if n.ready and n.accel
+                NodeCandidate(n.name.lower(), n.accel, "k8s", n.vram_mib, n.mem_mib)
+                for n in nodes
+                if n.ready and n.accel and n.name.lower() in approved
             ]
-            for sn in await service.live_nodes(db, state.settings.standalone_ttl_s):
-                candidates.append(NodeCandidate(sn.name.lower(), sn.accel, "standalone", sn.vram_mib, sn.ram_mib))
+            for sn in live_standalone:
+                if sn.name.lower() in approved:
+                    candidates.append(NodeCandidate(sn.name.lower(), sn.accel, "standalone", sn.vram_mib, sn.ram_mib))
             await service.auto_assign(db, candidates)
             every = await service.list_all(db)
             rows = (await db.scalars(select(NodeAssignment).where(NodeAssignment.deployment_id.is_not(None)))).all()
@@ -146,6 +199,7 @@ class WorkloadController:
             live_rows = await service.live_nodes(db, state.settings.standalone_ttl_s)
             live = {sn.name for sn in live_rows}
             nics = {w.node_name: w for w in (await db.scalars(select(NodeWake))).all()}
+            models = {m.node_name: m.models_bytes for m in (await db.scalars(select(NodeModels))).all()}
         timers_before = self._timer_state()
         now = schedule.now_utc()
         drain = state.settings.schedule_drain_s
@@ -154,9 +208,12 @@ class WorkloadController:
         by_name = {r.node_name: r for r in rows}
         roster: dict[int, set[str]] = {}  # deployment id -> nodes assigned to it, on maintenance or away included
         for r in rows:
-            roster.setdefault(r.deployment_id, set()).add(r.node_name)
+            if r.node_name in approved:
+                roster.setdefault(r.deployment_id, set()).add(r.node_name)
         node_dep = {}
         for n in nodes:
+            if n.name.lower() not in approved:
+                continue
             dep = service.effective_deployment(by_name.get(n.name.lower()), every, n.accel, "k8s", now, drain)
             if dep is not None:
                 node_dep[n.name.lower()] = dep
@@ -169,7 +226,9 @@ class WorkloadController:
         for name in sorted((set(records) | set(nics)) - in_cluster - {x.lower() for x in live}):
             sn = records.get(name)
             down.append((name, sn.accel if sn else None, "standalone", _url_host(sn.url) if sn else None))
-        await self._wake(down, nics, by_name, every, now, relay.candidates(nodes, live_rows, nics))
+        relays = [r for r in relay.candidates(nodes, live_rows, nics) if r.name in approved]
+        await self._wake(down, nics, by_name, every, now, relays)
+        await self._cleanup(nodes, live_rows, set(records), by_name, every, now, models)
         try:
             owned = {(o.kind, o.name): o for o in await state.k8s.list_owned()}
             leader_pods = {
@@ -188,9 +247,17 @@ class WorkloadController:
     # ---- pauses kept in the database ----------------------------------------------------
 
     async def _load_timers(self, db) -> None:
-        self._not_ready_since, self._lost, self._waking = {}, {}, {}
+        self._not_ready_since, self._lost, self._waking, self._cached, self._purging = {}, {}, {}, {}, {}
         for t in (await db.scalars(select(ControllerTimer))).all():
-            if t.key.startswith(wake.TIMER_PREFIX):
+            if t.key.startswith(cleanup.PURGE_TIMER_PREFIX):
+                purge = _Purge.load(t.since, t.members)
+                if purge is not None:
+                    self._purging[t.key.removeprefix(cleanup.PURGE_TIMER_PREFIX)] = purge
+            elif t.key.startswith(cleanup.CACHE_TIMER_PREFIX):
+                sig = cleanup.Signature.load(t.members)
+                if sig is not None:
+                    self._cached[t.key.removeprefix(cleanup.CACHE_TIMER_PREFIX)] = (t.since, sig)
+            elif t.key.startswith(wake.TIMER_PREFIX):
                 tries = int(t.members) if t.members.isdigit() else 0
                 self._waking[t.key.removeprefix(wake.TIMER_PREFIX)] = _Waking(t.since, tries)
             elif t.key.startswith(_NOT_READY):
@@ -206,6 +273,10 @@ class WorkloadController:
             state[f"{_LOST}{dep}:{index}"] = (lost.since, ",".join(lost.members), lost.leader_lost)
         for node, w in self._waking.items():
             state[f"{wake.TIMER_PREFIX}{node}"] = (w.since, str(w.tries), False)
+        for node, (at, sig) in self._cached.items():
+            state[f"{cleanup.CACHE_TIMER_PREFIX}{node}"] = (at, sig.dump(), False)
+        for node, purge in self._purging.items():
+            state[f"{cleanup.PURGE_TIMER_PREFIX}{node}"] = (purge.since, purge.dump(), False)
         return state
 
     async def _save_timers(self, before: dict[str, tuple[float, str, bool]]) -> None:
@@ -236,7 +307,8 @@ class WorkloadController:
         Main sends every attempt; with WOL_VIA_NODE (`wake.via_node`) the first live node by name of the PC's subnet
         (`relays`) also sends it on its own network (app.nodes.relay)."""
         s = self.app_state.settings
-        if not s.wol_enabled:
+        live = await settings_store.live_many(self.app_state, ("wol_enabled", "wol_delay_s", "wol_max_tries"))
+        if not live["wol_enabled"]:
             self._waking.clear()
             return
         t = _now()
@@ -247,14 +319,16 @@ class WorkloadController:
                 continue
             needed.add(name)
             w = self._waking.setdefault(name, _Waking(t))
-            if w.tries >= s.wol_max_tries or t < wake.attempt_due_at(w.since, w.tries, s.wol_delay_s, s.wol_retry_s):
+            if w.tries >= live["wol_max_tries"] or t < wake.attempt_due_at(
+                w.since, w.tries, live["wol_delay_s"], s.wol_retry_s
+            ):
                 continue
             w.tries += 1
             addrs = wake.targets(nic.ip, nic.prefix, s.wol_overrides, (last_ip or nic.ip) if s.wol_unicast else None)
             errors = wake.send(nic.mac, addrs)
             log.info(
                 "wake-on-lan: node %s down since %.0f s, attempt %d of %d: magic packet for %s to %s (UDP %s)",
-                name, t - w.since, w.tries, s.wol_max_tries, nic.mac, ", ".join(addrs) or "nowhere",
+                name, t - w.since, w.tries, live["wol_max_tries"], nic.mac, ", ".join(addrs) or "nowhere",
                 ", ".join(map(str, wake.PORTS)),
             )
             for e in errors:
@@ -279,6 +353,95 @@ class WorkloadController:
             log.warning("wake-on-lan: node %s: the packet via node %s (%s) failed: %s", name, r.name, how, error)
         else:
             log.info("wake-on-lan: node %s: magic packet via node %s (%s) to %s", name, r.name, how, broadcast)
+
+    # ---- cleanup of model weights ----------------------------------------------------------
+
+    async def _cleanup(
+        self, nodes: list[NodeInfo], live_rows, records: set[str], by_name, every, now, models: dict[str, int]
+    ) -> None:
+        """Removes the model files and the tensor cache a node does not need (task 2-26, app.nodes.cleanup).
+
+        What a node needs is decided by the deployment it is assigned to (`cleanup.node_deployments`: the working window
+        does not matter, a deployment that is deleted or disabled does not count) plus the one it is lent to right now.
+        Per node, `cleanup.Signature` tells what its volume is cleaned for, and it is remembered after every cleanup:
+        - a node without a deployment is cleaned of everything MODEL_CACHE_IDLE_S after it was seen so;
+        - a node whose deployment changed the files it needs is cleaned at once, down to what the new one uses; the tensor
+          cache stays when the node is still in a split group of the same model, a different split model (or none) takes
+          it away;
+        - the first time a node with a deployment is seen nothing is known to clean: the signature is only remembered.
+        A node that is not live waits (its time keeps running). A cleanup is a Job on a k3s node and an order in the
+        heartbeat reply of a standalone node; a failed one is tried again after CLEANUP_RETRY_S."""
+        s = self.app_state.settings
+        t = _now()
+        in_cluster = {n.name.lower() for n in nodes}
+        candidates = [(n.name.lower(), n.accel, "k8s", n.ready) for n in nodes]
+        candidates += [
+            (sn.name.lower(), sn.accel, "standalone", True) for sn in live_rows if sn.name.lower() not in in_cluster
+        ]
+        present = in_cluster | records
+        for name in set(self._purging) - present:
+            del self._purging[name]
+        for name in set(self._cached) - present:
+            del self._cached[name]
+        for name, accel, source, ready in sorted(candidates, key=lambda c: c[0]):
+            assigned, needed = cleanup.node_deployments(by_name.get(name), every, accel, source, now, s.schedule_drain_s)
+            await self._purge_step(name, accel, source, ready, assigned, needed, models.get(name), t)
+
+    async def _purge_step(self, name, accel, source, ready, assigned, needed, models_bytes, t) -> None:
+        idle_s = await settings_store.live(self.app_state, "model_cache_idle_s")  # the panel's value, no restart
+        target = cleanup.signature(assigned)
+        purge = self._purging.get(name)
+        if purge is not None and purge.ref:  # handed to the node: see how it ended
+            outcome = await cleanup.poll(self.app_state, name, purge.source or source, purge.ref, purge.issued_at, t)
+            if outcome.state == "running":
+                return
+            if outcome.state == "failed":
+                log.warning("models cleanup of node %s failed: %s", name, outcome.error)
+                self._purging[name] = replace(purge, ref="", not_before=t + max(idle_s, CLEANUP_RETRY_S))
+                return
+            log.info(
+                "models cleanup of node %s done: %d bytes freed%s",
+                name, outcome.freed_bytes, f", skipped {', '.join(outcome.skipped)}" if outcome.skipped else "",
+            )
+            self._cached[name] = (t, purge.sig)
+            del self._purging[name]
+            if outcome.models_bytes is not None:
+                async with self.app_state.sessionmaker() as db:
+                    await registry.set_models(db, name, outcome.models_bytes)
+                    await db.commit()
+        cached = self._cached.get(name)
+        stored = cached[1] if cached else None
+        if stored == target:
+            self._purging.pop(name, None)
+            return
+        if stored is None and target != cleanup.IDLE:  # first sight of a node with a deployment: nothing known to clean
+            self._cached[name] = (t, target)
+            self._purging.pop(name, None)
+            return
+        purge = self._purging.get(name)
+        if purge is None or purge.sig != target:
+            purge = self._purging[name] = _Purge(t, target)
+        delay = idle_s if target == cleanup.IDLE else 0.0
+        if not ready or t < purge.since + delay or t < purge.not_before:
+            return
+        if target == cleanup.IDLE and models_bytes == 0:  # the node reported an empty volume: nothing to remove
+            self._cached[name] = (t, target)
+            del self._purging[name]
+            return
+        # the tensor cache stays for a node still in a split group of the model it was filled for, and for a lent split one
+        rpc = any(d.mode == "split" for d in needed if d is not assigned) or (
+            bool(target.rpc) and stored is not None and stored.rpc == target.rpc
+        )
+        ref, error = await cleanup.send(self.app_state, name, source, accel, cleanup.keep_for(needed, rpc=rpc))
+        if ref is None:
+            log.warning("models cleanup of node %s not sent: %s", name, error)
+            self._purging[name] = replace(purge, not_before=t + CLEANUP_RETRY_S)
+            return
+        log.info(
+            "models cleanup of node %s sent (%s): %s",
+            name, "no deployment" if target == cleanup.IDLE else "the model of its deployment changed", ref,
+        )
+        self._purging[name] = replace(purge, ref=ref, issued_at=t, source=source)
 
     # ---- the pass ----------------------------------------------------------------------
 
@@ -544,7 +707,7 @@ class WorkloadController:
                 await self._guarded(f"class taint of node {node.name}", k8s.add_class_taint(node.name))
         for node in nodes:
             if node.deployment != labels[node.name]:
-                await self._guarded(f"label of node {node.name}", k8s.patch_node_labels(node.name, {L_DEPLOYMENT: labels[node.name]}))
+                await self._guarded(f"label of node {node.name}", k8s.patch_node_labels(node.name, {L_NODE_DEPLOYMENT: labels[node.name], L_DEPLOYMENT: None}))
         for kind, name in [key for key in owned if key not in plan.desired and key not in plan.hold]:
             await self._guarded(f"delete of {kind} {name}", k8s.delete(kind, name))
         for pod in plan.force:

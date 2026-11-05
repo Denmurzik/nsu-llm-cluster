@@ -11,7 +11,7 @@ from sqlalchemy import delete, select, update
 from app.api.playground import MAX_CONTENT_CHARS, MAX_MESSAGES
 from app.auth.sessions import create_session
 from app.controllers.backends import BACKEND_STATUS_KEY
-from app.models import ModelDeployment, NodeAssignment, OAuthState, PortalFlag, User, WebSession
+from app.models import ModelDeployment, NodeAssignment, PortalFlag, User, WebSession
 from tests.fakes.litellm import FakeLiteLLM
 from tests.helpers.auth import csrf_headers, install_fake_oidc, login
 
@@ -89,7 +89,7 @@ async def test_counts_come_from_the_controllers_status_in_redis(client, app, fak
     await status_in_redis(app, [{"model_name": "m1", "node": "a"}, {"model_name": "m1", "node": "b"}])
     fake.unavailable = True  # the gateway is not consulted while the status is fresh
     r = await client.get("/api/public/status")
-    assert r.json() == {"models": [{"name": "m1", "status": "ready", "ready_backends": 2}]}
+    assert r.json() == {"login_provider": "SSO", "models": [{"name": "m1", "status": "ready", "ready_backends": 2}]}
 
 
 async def test_a_stale_status_in_redis_falls_back_to_the_gateway(client, app, fake):
@@ -97,14 +97,14 @@ async def test_a_stale_status_in_redis_falls_back_to_the_gateway(client, app, fa
     await status_in_redis(app, [{"model_name": "m1", "node": "a"}], age_s=3600)
     fake.unavailable = True
     r = await client.get("/api/public/status")
-    assert r.json() == {"models": [{"name": "m1", "status": "unknown", "ready_backends": None}]}
+    assert r.json() == {"login_provider": "SSO", "models": [{"name": "m1", "status": "unknown", "ready_backends": None}]}
 
 
 async def test_without_a_status_in_redis_the_gateway_is_asked(client, app, fake):
     await add_deployment(app)
     await fake.add_model("pm-1", "m1", "http://k1:18080/v1", "k8s", "k1", 8192)
     r = await client.get("/api/public/status")
-    assert r.json() == {"models": [{"name": "m1", "status": "ready", "ready_backends": 1}]}
+    assert r.json() == {"login_provider": "SSO", "models": [{"name": "m1", "status": "ready", "ready_backends": 1}]}
 
 
 async def test_counts_are_cached_for_the_ttl(client, app, fake):
@@ -179,7 +179,8 @@ async def test_overlong_return_to_becomes_the_root_not_a_500(client, app, db_ses
     install_fake_oidc(app)
     r = await client.get("/auth/login", params={"return_to": "/" + "a" * 3000})
     assert r.status_code == 302
-    assert (await db_session.scalar(select(OAuthState.return_to))) == "/"
+    (key,) = [k async for k in app.state.redis.scan_iter("oauth:state:*")]
+    assert json.loads(await app.state.redis.get(key))["return_to"] == "/"
 
 
 async def test_login_on_the_ip_address_moves_to_the_public_name(client, app, db_session):
@@ -189,7 +190,7 @@ async def test_login_on_the_ip_address_moves_to_the_public_name(client, app, db_
     assert r.headers["location"] == "https://double.fresh.nsuts.ru/auth/login?return_to=%2Fkeys%3Fa%3D1"
     r = await client.get("/auth/login", headers={"Host": "192.168.3.21:443"})
     assert r.headers["location"] == "https://double.fresh.nsuts.ru/auth/login"
-    assert (await db_session.scalars(select(OAuthState))).all() == []  # the redirect stores no state
+    assert [k async for k in app.state.redis.scan_iter("oauth:state:*")] == []  # the redirect stores no state
     r = await client.get("/auth/login", headers={"Host": "double.fresh.nsuts.ru"})
     assert r.headers["location"].startswith("http://fake-oidc")
 

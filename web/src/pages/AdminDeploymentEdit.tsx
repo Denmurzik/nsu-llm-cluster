@@ -9,6 +9,7 @@ import { Confirm } from "../components/Modal";
 import { NodePicker, takenNodes, TakeOverConfirm } from "../components/NodePicker";
 import { NodeRamFields } from "../components/NodeRamFields";
 import { PodStatusTable } from "../components/PodStatusTable";
+import { PrefetchButton } from "../components/PrefetchButton";
 import { Cells, StatusLabel } from "../components/Status";
 import { ErrorNotice, Ic, Loading, Notice, PageHead } from "../components/ui";
 import { ACCEL_LABEL, ENGINE_LABEL } from "../lib/labels";
@@ -138,6 +139,13 @@ export function AdminDeploymentEdit() {
             setVersion((v) => v + 1);
           }}
         />
+      )}
+
+      {!d.repo.startsWith("local/") && (
+        <div className="statusbar">
+          <span className="muted small">Файлы модели в кэше зеркала главного</span>
+          <PrefetchButton dep={d} />
+        </div>
       )}
 
       <EditForm

@@ -3,7 +3,7 @@
 # заранее создавший C:\ProgramData\NSU-LLM, мог бы подменить скрипты, которые потом запускаются от администратора при каждой
 # загрузке, или выдать себе чтение файла с секретами. Права такого объекта нельзя чинить на месте: дескриптор, открытый раньше
 # (например, с WRITE_DAC), переживает смену DACL, и ученик снова выдаст себе доступ. Поэтому:
-#   Secure-Dir       — недоверенный каталог (или недоверенный объект внутри) откладывается в сторону: переименовывается в
+#   Secure-Dir       — (-NoUsers: Users без доступа, только SYSTEM и Administrators) недоверенный каталог (или недоверенный объект внутри) откладывается в сторону: переименовывается в
 #                      <каталог>.untrusted-<время> рядом; каталог создаётся заново сразу с нужным SD
 #                      ([IO.Directory]::CreateDirectory(path, DirectorySecurity)): владелец Administrators, SYSTEM и Administrators
 #                      полный доступ, Users чтение, без наследования от ProgramData. Не удалось отложить — ошибка.
@@ -41,6 +41,7 @@ function Test-SdCurrentIsAdmin {
 function Test-SdTrustedSid([string]$sid) {
     if ($SdTrustedSids -contains $sid) { return $true }
     if ($sid -like 'S-1-5-80-*') { return $true }
+    if (@($global:SdExtraSids) -contains $sid) { return $true }   # -ExtraSids: пользователь, под которым работает Docker Desktop (его назвал установщик)
     return ($sid -eq [Security.Principal.WindowsIdentity]::GetCurrent().User.Value -and (Test-SdCurrentIsAdmin))
 }
 function Get-SdAcl([string]$p) { if ([IO.Directory]::Exists($p)) { return [IO.Directory]::GetAccessControl($p) }; return [IO.File]::GetAccessControl($p) }
@@ -90,14 +91,16 @@ function Test-TrustedPath([string]$Path, [string[]]$Exclude = @()) {
 
 if (-not (Test-Path Function:\New-SdDirSecurity)) {
     # SD каталога: владелец Administrators; SYSTEM и Administrators полный доступ, Users (кроме -NoUsers) чтение; без наследования.
-    function New-SdDirSecurity([switch]$NoUsers, [switch]$NoOwner) {
+    function New-SdDirSecurity([switch]$NoUsers, [switch]$NoOwner, [string[]]$ExtraSids = @()) {
         $sec = New-Object Security.AccessControl.DirectorySecurity
-        if (-not $NoOwner) { $sec.SetOwner((New-Object Security.Principal.SecurityIdentifier 'S-1-5-32-544')) }
+        # NSU_LLM_TEST_NO_SD_OWNER: только для тестов (без повышения владельцем Administrators назначить нельзя)
+        if (-not $NoOwner -and -not $env:NSU_LLM_TEST_NO_SD_OWNER) { $sec.SetOwner((New-Object Security.Principal.SecurityIdentifier 'S-1-5-32-544')) }
         $sec.SetAccessRuleProtection($true, $false)
         $inh = [Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
         $rules = New-Object System.Collections.ArrayList
         [void]$rules.Add(@('S-1-5-18', 'FullControl')); [void]$rules.Add(@('S-1-5-32-544', 'FullControl'))
         if (-not $NoUsers) { [void]$rules.Add(@('S-1-5-32-545', 'ReadAndExecute')) }
+        foreach ($x in @($ExtraSids | Where-Object { $_ })) { [void]$rules.Add(@($x, 'FullControl')) }
         foreach ($r in $rules) {
             $sec.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule((New-Object Security.Principal.SecurityIdentifier $r[0]), $r[1], $inh, 'None', 'Allow')))
         }
@@ -146,7 +149,10 @@ function Clear-SdExcluded([string]$p, [switch]$DryRun) {
 function Get-SdStamp { return (Get-Date).ToString('yyyyMMdd-HHmmss') }
 
 # Защищает каталог до записи в него. -DryRun печатает план и ничего не меняет.
-function Secure-Dir([string]$Path, [string[]]$Exclude = @(), [switch]$DryRun) {
+function Secure-Dir([string]$Path, [string[]]$Exclude = @(), [switch]$DryRun, [switch]$NoUsers, [string[]]$ExtraSids = @()) {
+    # -ExtraSids: SID пользователя, под которым Docker Desktop читает каталог для bind-mount (администратор без повышения: группа
+    # Administrators в его токене «только для запрета» и записи на группу не действуют). Им выдаётся полный доступ и им доверяется.
+    $global:SdExtraSids = @($ExtraSids | Where-Object { $_ })
     $Path = [IO.Path]::GetFullPath($Path)
     $exists = [IO.Directory]::Exists($Path) -or [IO.File]::Exists($Path)
     if ($exists -and (Test-SdReparse $Path)) {
@@ -158,7 +164,7 @@ function Secure-Dir([string]$Path, [string[]]$Exclude = @(), [switch]$DryRun) {
         if (-not (Test-SdExcluded $x)) { throw (New-SdError "Каталог $x принадлежит $(Get-SdOwner $x), а не администратору: его содержимое скрипт не трогает и доверять ему не может" "Проверьте его от администратора; если он не нужен, удалите (Remove-Item -Recurse -Force '$x') и повторите.") }
     }
     $aside = "$Path.untrusted-$(Get-SdStamp)"
-    $plan = "владелец Administrators, SYSTEM и Administrators полный доступ, Users чтение, без наследования от ProgramData$(if ($excl) { "; содержимое $(($excl | ForEach-Object { Split-Path -Leaf $_ }) -join ', ') не трогается" })"
+    $plan = "владелец Administrators, SYSTEM и Administrators полный доступ, $(if ($NoUsers) { 'Users без доступа' } else { 'Users чтение' })$(if ($ExtraSids) { ', полный доступ ' + ($ExtraSids -join ',') }), без наследования от ProgramData$(if ($excl) { "; содержимое $(($excl | ForEach-Object { Split-Path -Leaf $_ }) -join ', ') не трогается" })"
     # Сам каталог недоверенный: откладывается целиком. С исключённым каталогом внутри (диск дистрибутива) переносить нельзя:
     # тогда допустим только каталог администратора, у которого чужие лишь права (наследование от ProgramData); они заменяются целиком.
     if ($exists -and -not (Test-SdItem $Path)) {
@@ -176,7 +182,7 @@ function Secure-Dir([string]$Path, [string[]]$Exclude = @(), [switch]$DryRun) {
     }
     if (-not $exists) {
         if ($DryRun) { Write-Host "[dry-run] создать каталог $Path сразу с правами: $plan"; return }
-        [void][IO.Directory]::CreateDirectory($Path, (New-SdDirSecurity))
+        [void][IO.Directory]::CreateDirectory($Path, (New-SdDirSecurity -NoUsers:$NoUsers -ExtraSids $ExtraSids))
         if (-not (Test-TrustedPath $Path $Exclude)) { throw (New-SdError "Каталог $Path появился раньше, чем установщик его создал (владелец $(Get-SdOwner $Path))" "Удалите его от администратора и повторите.") }
         return
     }
@@ -190,7 +196,7 @@ function Secure-Dir([string]$Path, [string[]]$Exclude = @(), [switch]$DryRun) {
         return
     }
     foreach ($x in $excl) { Clear-SdExcluded $x }                       # до смены прав корня: защищённый каталог их не наследует
-    [IO.Directory]::SetAccessControl($Path, (New-SdDirSecurity -NoOwner))   # DACL целиком, собственные записи ученика уходят
+    [IO.Directory]::SetAccessControl($Path, (New-SdDirSecurity -NoOwner -NoUsers:$NoUsers -ExtraSids $ExtraSids))   # DACL целиком, собственные записи ученика уходят
     if ($bad) {
         New-SecureDir $quar -NoUsers
         foreach ($b in $bad) {
@@ -226,4 +232,67 @@ function Move-SecureFileInto([string]$Temp, [string]$Path) {
         try { [IO.File]::Delete($old) } catch { }
     }
     [IO.File]::Move($Temp, $Path)
+}
+
+# ------------------------------------------------------------------ корень CA главного по токену подключения (общая для install-node.ps1 и run-node.ps1)
+# Токен K10<H>::node:<секрет> несёт H = sha256 ответа https://<главный>:6443/cacerts (CA сервера k3s, его же проверяет k3s agent).
+# Главный подписывает точные байты своего /ca.crt этим CA (CMS DER, https://<главный>/ca.crt.p7s). Корень принимается, если H сошёлся,
+# подпись верна и подписавший сертификат РАВЕН первому сертификату /cacerts (цепочки к CA k3s мало: он выпускает и сертификаты нод, их
+# ключи лежат на самих нодах). Контракт с main/sign-ca.sh и node/rootfs/opt/llm/bin/fetch-main-ca.sh.
+# Результат: Status = verified (Pem проверен) | mismatch (подмена, Why) | unverifiable (токен без K10 или главный не подписывает: решает
+# отпечаток/подтверждение, Pem и Fp заполнены) | public (у главного нет /ca.crt: системные корни) | unreachable (нет связи).
+function Get-CaPemSha256([string]$pem) {
+    if ($pem -notmatch '(?s)-----BEGIN CERTIFICATE-----(.+?)-----END CERTIFICATE-----') { return '' }
+    $der = [Convert]::FromBase64String(($matches[1] -replace '\s', ''))
+    return ((([Security.Cryptography.SHA256]::Create().ComputeHash($der)) | ForEach-Object { $_.ToString('x2') }) -join '')
+}
+function Invoke-CaFetch([string]$url, [string]$curlExe) {
+    $f = [IO.Path]::GetTempFileName()
+    $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    try {
+        $code = "$(& $curlExe -sS -k --ssl-no-revoke --connect-timeout 5 -m 20 -o $f -w '%{http_code}' $url 2>$null)".Trim()
+        $bytes = $(if (Test-Path -LiteralPath $f) { [IO.File]::ReadAllBytes($f) } else { [byte[]]@() })
+        return [pscustomobject]@{ Code = $code; Bytes = $bytes }
+    }
+    finally { $ErrorActionPreference = $prev; Remove-Item -Force -LiteralPath $f -ErrorAction SilentlyContinue }
+}
+# $Fetch: scriptblock { param($url) } -> @{ Code; Bytes }; по умолчанию curl.exe -k (подмена нужна тестам)
+function Test-MainCaByToken([string]$MainAddr, [string]$Token, [string]$CurlExe = 'curl.exe', [scriptblock]$Fetch = $null) {
+    $res = [pscustomobject]@{ Status = 'unreachable'; Pem = ''; Fp = ''; Why = '' }
+    if (-not $Fetch) { $Fetch = { param($u) Invoke-CaFetch $u $CurlExe } }
+    $hostOnly = $MainAddr -replace ':\d+$', ''
+    $ca = & $Fetch "https://$MainAddr/ca.crt"
+    if ($ca.Code -eq '404') { $res.Status = 'public'; return $res }
+    if ($ca.Code -ne '200' -or $ca.Bytes.Length -eq 0) { $res.Why = "https://$MainAddr/ca.crt недоступен (HTTP $($ca.Code))"; return $res }
+    $res.Pem = [Text.Encoding]::UTF8.GetString($ca.Bytes)
+    $res.Fp = Get-CaPemSha256 $res.Pem
+    if (-not $res.Fp) { $res.Status = 'mismatch'; $res.Why = "https://$MainAddr/ca.crt не сертификат PEM"; $res.Pem = ''; return $res }
+    $res.Status = 'unverifiable'
+    if ($Token -notmatch '^K10([0-9a-f]{64})::') { $res.Why = 'токен без хеша CA (не вида K10<sha256>::...)'; return $res }
+    $want = $matches[1]
+    $k3s = & $Fetch "https://${hostOnly}:6443/cacerts"
+    if ($k3s.Code -ne '200') { $res.Status = 'unreachable'; $res.Why = "https://${hostOnly}:6443/cacerts недоступен (HTTP $($k3s.Code))"; return $res }
+    $got = ((([Security.Cryptography.SHA256]::Create().ComputeHash($k3s.Bytes)) | ForEach-Object { $_.ToString('x2') }) -join '')
+    if ($got -ne $want) { $res.Status = 'mismatch'; $res.Why = "CA k3s главного не совпал с хешем в токене (получен sha256 $got, в токене $want): подмена в сети или токен от другого кластера"; $res.Pem = ''; return $res }
+    $sig = & $Fetch "https://$MainAddr/ca.crt.p7s"
+    # Токен K10 + нет подписи = не «старый главный», а возможная подмена: MITM на 443 ответил бы 404 только на .p7s. Отказ, без вопроса про отпечаток.
+    if ($sig.Code -eq '404') { $res.Status = 'mismatch'; $res.Pem = ''; $res.Why = 'главный не отдал подпись /ca.crt.p7s при токене K10 (подмена в сети или главный старше подписи CA; главный подписывает в течение пары секунд после запуска k3s, повторите через минуту или обновите главный)'; return $res }
+    if ($sig.Code -ne '200') { $res.Status = 'unreachable'; $res.Why = "https://$MainAddr/ca.crt.p7s недоступен (HTTP $($sig.Code))"; return $res }
+    try {
+        Add-Type -AssemblyName System.Security
+        $first = [Text.Encoding]::UTF8.GetString($k3s.Bytes)
+        if ($first -notmatch '(?s)-----BEGIN CERTIFICATE-----(.+?)-----END CERTIFICATE-----') { throw 'в /cacerts нет сертификата' }
+        $k3sCert = New-Object Security.Cryptography.X509Certificates.X509Certificate2(,[Convert]::FromBase64String(($matches[1] -replace '\s', '')))
+        $cms = New-Object Security.Cryptography.Pkcs.SignedCms((New-Object Security.Cryptography.Pkcs.ContentInfo(,$ca.Bytes)), $true)
+        $cms.Decode($sig.Bytes)
+        $cms.CheckSignature($true)
+        if ($cms.SignerInfos.Count -lt 1 -or $cms.SignerInfos[0].Certificate.Thumbprint -ne $k3sCert.Thumbprint) { throw 'подписавший сертификат не равен CA k3s' }
+    }
+    catch {
+        $res.Status = 'mismatch'; $res.Pem = ''
+        $res.Why = "подпись https://$MainAddr/ca.crt не сходится с CA k3s главного ($(("$($_.Exception.Message)" -split "`r?`n")[0])): подмена в сети"
+        return $res
+    }
+    $res.Status = 'verified'
+    return $res
 }

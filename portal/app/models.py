@@ -45,6 +45,8 @@ class User(Base):
     username: Mapped[str] = mapped_column(String(255), default="")
     full_name: Mapped[str] = mapped_column(String(512), default="")
     role: Mapped[str] = mapped_column(String(16), default="user")
+    # the provider's email_verified at the last login (True only for a JSON true); None: unknown (logged in before 0012)
+    email_verified: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     created_at: Mapped[datetime] = _ts(default=_now, server_default=func.now())
     last_login_at: Mapped[datetime] = _ts(default=_now, server_default=func.now())
     # auto: the role comes from ADMIN_EMAILS at every login; manual: set in the panel and kept (task 2-31a)
@@ -67,16 +69,6 @@ class WebSession(Base):
     csrf_token: Mapped[str] = mapped_column(String(128))
     created_at: Mapped[datetime] = _ts(default=_now, server_default=func.now())
     expires_at: Mapped[datetime] = _ts()
-
-
-class OAuthState(Base):
-    __tablename__ = "oauth_states"
-
-    state: Mapped[str] = mapped_column(String(255), primary_key=True)
-    nonce: Mapped[str] = mapped_column(String(255))
-    code_verifier: Mapped[str] = mapped_column(String(255))
-    return_to: Mapped[str] = mapped_column(String(2048), default="/")
-    created_at: Mapped[datetime] = _ts(default=_now, server_default=func.now())
 
 
 class ApiKeyRef(Base):
@@ -319,3 +311,58 @@ class MetricSample(Base):
     kind: Mapped[str] = mapped_column(String(16))  # node | model
     name: Mapped[str] = mapped_column(String(255))  # the node or the deployment
     data: Mapped[dict[str, Any]] = mapped_column(JSON)
+
+
+class NodeModels(Base):
+    """How many bytes the models volume of a node holds (task 2-26): POST /api/nodes/models in k3s mode (the node
+    container measures its volume every few minutes), the heartbeat in standalone mode, the result of a cleanup. Shown on
+    the «Ноды» page. Removed with the node."""
+
+    __tablename__ = "node_models"
+
+    node_name: Mapped[str] = mapped_column(String(255), primary_key=True)
+    models_bytes: Mapped[int] = mapped_column(BigInteger)
+    updated_at: Mapped[datetime] = _ts(default=_now, onupdate=_now, server_default=func.now())
+
+
+class NodeIdentity(Base):
+    """Who a node is (task SEC-1, app.nodes.identity): the hash of its own key, issued once at its first registration
+    with the agent token, and whether an admin approved it. The agent token only joins: every later call for the name
+    must carry the node's key (X-Node-Key). Removed with the node; «Сбросить ключ ноды» clears the key and the approval.
+
+    `backend_key` is the node's own llama-server key (derived from its key, app.nodes.identity.backend_key_of): LiteLLM
+    reaches this node's backends with it and nobody else's. `legacy`: a node known before identities existed (migration
+    0011); until it gets a key it may call without one, from its known address only."""
+
+    __tablename__ = "node_identities"
+
+    name: Mapped[str] = mapped_column(String(255), primary_key=True)
+    key_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    backend_key: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    key_issued_at: Mapped[datetime | None] = _ts(nullable=True)
+    approved: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"))
+    approved_at: Mapped[datetime | None] = _ts(nullable=True)
+    approved_by: Mapped[str | None] = mapped_column(String(320), nullable=True)
+    legacy: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"))
+    last_ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = _ts(default=_now, server_default=func.now())
+    # the client nonce of the registration that got the key, and when the key was first used (a lost reply, 0013)
+    key_nonce_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    key_used_at: Mapped[datetime | None] = _ts(nullable=True)
+
+
+class NodeClaim(Base):
+    """A registration of a known name without its key, kept for the admin (app.nodes.identity, fix rounds 1-2 of SEC-1):
+    several per name, each with its own key, address and time; the admin picks one («Сделать нодой») or rejects them.
+    Removed with the name, by the admin's choice, or after CLAIM_TTL_S."""
+
+    __tablename__ = "node_claims"
+    __table_args__ = (Index("ix_node_claims_name", "name"),)
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(255))
+    key_hash: Mapped[str] = mapped_column(String(64))
+    backend_key: Mapped[str] = mapped_column(String(64))
+    ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    nonce_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    at: Mapped[datetime] = _ts(default=_now, server_default=func.now())

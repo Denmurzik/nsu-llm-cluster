@@ -27,6 +27,9 @@ export STUB_ROOT="$(W "$TMP/remote")"
 export NSU_LLM_ADMIN_USER='.\classadmin'
 export NSU_LLM_ADMIN_PASSWORD='Pw-Secret-9x'
 TOKEN='agent-token-SECRET-123'
+# SecureString values show up in the stub log as <SecureString:first 8 hex of their SHA-256>
+TOKEN_H="$(printf '%s' "$TOKEN" | sha256sum | cut -c1-8)"
+PW_H="$(printf '%s' "$NSU_LLM_ADMIN_PASSWORD" | sha256sum | cut -c1-8)"
 
 # --- syntax
 "$PS" -NoProfile -Command '$e=$null;$t=$null;[void][Management.Automation.Language.Parser]::ParseFile("'"$SCRIPT"'",[ref]$t,[ref]$e); if ($e.Count) { $e | % { "$($_.Extent.StartLineNumber): $($_.Message)" }; exit 1 }' \
@@ -41,8 +44,8 @@ ME_SID="$(/c/Windows/System32/whoami.exe /user /fo csv /nh 2>/dev/null | tr -d '
 
 # --- fixtures
 mkdir -p "$TMP/img" "$TMP/work" "$TMP/scripts"
-for f in install-node.ps1 run-node.ps1 node-boot.ps1 wsl-setup.sh pull-image.sh; do echo "# fake $f" > "$TMP/scripts/$f"; done
-echo "\$Version = '0.1.0'" >> "$TMP/scripts/install-node.ps1"
+for f in install-node.ps1 run-node.ps1 node-boot.ps1 wsl-setup.sh pull-image.sh IMAGE_VERSION; do echo "# fake $f" > "$TMP/scripts/$f"; done
+echo 0.1.0 > "$TMP/scripts/IMAGE_VERSION"
 echo cpu-image > "$TMP/img/nsu-llm-node-0.1.0-cpu.tar.gz"
 echo gpu-image-bigger > "$TMP/img/nsu-llm-node-0.1.0-gpu.tar.gz"
 CPU="$(W "$TMP/img/nsu-llm-node-0.1.0-cpu.tar.gz")"; GPU="$(W "$TMP/img/nsu-llm-node-0.1.0-gpu.tar.gz")"
@@ -55,6 +58,14 @@ pc03,192.168.3.103,standalone,nvidia
 EOF
 COMMON="-ScriptsFrom '$(W "$TMP/scripts")' -Inventory '$INV' -ImageTarCpu '$CPU' -ImageTarGpu '$GPU' -Main 10.0.0.5 -Token $TOKEN -AllowFrom '192.168.3.0/24,10.0.0.5' -NonInteractive"
 
+# class-deploy asks main for the image version (GET /api/node-image) through curl.exe: here a fake, main is down by default
+CURL_DOWN="$TMP/curl-down.bat"; printf '@echo off
+exit /b 7
+' > "$CURL_DOWN"
+CURL_TAG="$TMP/curl-tag.bat"; printf '@echo off
+echo {"tag":"0.1.1","cpu":"nsu-llm-node:0.1.1-cpu","nvidia":"nsu-llm-node:0.1.1-gpu"}
+' > "$CURL_TAG"
+export NSU_LLM_CURL="$(W "$CURL_DOWN")"
 scenario() { printf '%s' "$1" > "$TMP/scn.json"; }
 reset() { rm -rf "$TMP/remote" "$TMP/work/class-deploy-logs" "$TMP/work/class-answers.json"; : > "$TMP/stub.log"; }
 # run <args...>: out in $OUT, exit code in $RC
@@ -74,7 +85,11 @@ run "-Action check $COMMON"
 contains "check: closed port reported" "$OUT" "порт 5985 закрыт"
 contains "check: failed login reported with the cause" "$OUT" "Access is denied"
 contains "check: prints the command that enables WinRM" "$OUT" "Enable-PSRemoting -Force -SkipNetworkProfileCheck"
-contains "check: prints the local-account token policy fix" "$OUT" "LocalAccountTokenFilterPolicy"
+lacks "check: does not recommend LocalAccountTokenFilterPolicy=1 (it opens pass-the-hash on every PC)" "$OUT" "New-ItemProperty"
+contains "check: says why that policy is not recommended" "$OUT" "не рекомендуется"
+contains "check: names the HTTPS and Kerberos way to check the server" "$OUT" "WinRM по HTTPS"
+contains "check: names Kerberos" "$OUT" "Kerberos"
+contains "check: points at LAPS for a password of its own per PC" "$OUT" "-Laps"
 contains "check: prints the exact TrustedHosts command with all addresses" "$OUT" "Set-Item WSMan:\\localhost\\Client\\TrustedHosts -Value '192.168.3.101,192.168.3.102,192.168.3.103' -Force"
 contains "check: reachable host is ok in the table" "$OUT" "WinRM работает"
 lacks "check: no remote run" "$LOG" "RUN "
@@ -170,13 +185,18 @@ contains "install: status ПЕРЕЗАГРУЗКА" "$OUT" "ПЕРЕЗАГРУЗ
 # arguments for the node installer
 r1="$(echo "$LOG" | grep '^RUN 192.168.3.101')"
 contains "install args: main" "$r1" "Main=10.0.0.5"
-contains "install args: token passed to the installer" "$r1" "Token=$TOKEN"
+contains "install args: token passed to the installer" "$r1" "Token=<SecureString:$TOKEN_H>"
 contains "install args: node name" "$r1" "Name=pc01"
 contains "install args: mode" "$r1" "Mode=k3s"
 contains "install args: accel" "$r1" "Accel=cpu"
 contains "install args: allow-from" "$r1" "AllowFrom=192.168.3.0/24,10.0.0.5"
 contains "install args: non-interactive" "$r1" "NonInteractive=True"
-contains "install args: task password is the admin password" "$r1" "TaskPassword=Pw-Secret-9x"
+contains "install args: the task password travels as a SecureString, not a string" "$r1" "TaskPassword=<SecureString:$PW_H>"
+contains "install args: the agent token travels as a SecureString" "$r1" "Token=<SecureString:$TOKEN_H>"
+contains "install run: the one-time task password is a SecureString too" "$r1" "taskpw=<SecureString:$PW_H>"
+lacks "install run: no plain password in the arguments" "$r1" "Pw-Secret-9x"
+lacks "install run: no plain token in the arguments" "$r1" "agent-token-SECRET-123"
+lacks "install run: no plain task password" "$r1" "taskpw=PLAIN"
 contains "install args: cpu image from the stage dir" "$r1" "ImageTar=C:\\ProgramData\\NSU-LLM-stage\\nsu-llm-node-0.1.0-cpu.tar.gz"
 r2="$(echo "$LOG" | grep '^RUN 192.168.3.102')"
 contains "install args: auto accel with a GPU gets the gpu image" "$r2" "nsu-llm-node-0.1.0-gpu.tar.gz"
@@ -199,7 +219,7 @@ pq="$(ls -d "$TMP/remote/192.168.3.101/ProgramData/NSU-LLM-stage.untrusted-"* 2>
 contains "secure: the planted file sits in the side dir" "$(cat "$pq/install-node.ps1" 2>/dev/null)" "planted"
 # files
 st="$TMP/remote/192.168.3.101/ProgramData/NSU-LLM-stage"
-for f in install-node.ps1 run-node.ps1 node-boot.ps1 wsl-setup.sh pull-image.sh nsu-llm-node-0.1.0-cpu.tar.gz; do
+for f in install-node.ps1 run-node.ps1 node-boot.ps1 wsl-setup.sh pull-image.sh IMAGE_VERSION nsu-llm-node-0.1.0-cpu.tar.gz; do
   [ -f "$st/$f" ] && pass "smb copy: $f on pc01" || fail "smb copy: $f on pc01"
 done
 [ ! -f "$st/nsu-llm-node-0.1.0-gpu.tar.gz" ] && pass "smb copy: only the needed image" || fail "smb copy: only the needed image"
@@ -308,7 +328,7 @@ if [ -d "/c/Program Files/PowerShell/7/Modules" ]; then
   contains "pwsh 7 module path: token saved" "$(cat "$TMP/work/class-answers.json" 2>/dev/null)" "AgentTokenProtected"
   : > "$TMP/stub.log"
   OUT="$(PSModulePath="$P7" "$PS" -NoProfile -ExecutionPolicy Bypass -File "$STUBS" -Scenario "$(W "$TMP/scn.json")" -Script "$SCRIPT" -ArgLine "-Action uninstall -Inventory '$INV' -Only pc01 -NonInteractive" 2>&1 < /dev/null)"; RC=$?
-  contains "pwsh 7 module path: the saved token is decrypted" "$(grep '^RUN 192.168.3.101' "$TMP/stub.log")" "Token=$TOKEN"
+  contains "pwsh 7 module path: the saved token is decrypted" "$(grep '^RUN 192.168.3.101' "$TMP/stub.log")" "Token=<SecureString:$TOKEN_H>"
 else
   echo "skip - PowerShell 7 not installed: module path test skipped"
 fi
@@ -317,7 +337,7 @@ reset
 "$PS" -NoProfile -Command "\$e = ConvertTo-SecureString '$TOKEN' -AsPlainText -Force | ConvertFrom-SecureString; '{\"Main\":\"10.0.0.5\",\"AgentTokenProtected\":\"' + \$e + '\"}'" > "$TMP/work/class-answers.json"
 scenario '{"trusted":"*","hosts":{"192.168.3.101":{}}}'
 run "-Action uninstall -Inventory '$INV' -Only pc01 -NonInteractive"
-contains "old answers file: token decrypted" "$(echo "$LOG" | grep '^RUN 192.168.3.101')" "Token=$TOKEN"
+contains "old answers file: token decrypted" "$(echo "$LOG" | grep '^RUN 192.168.3.101')" "Token=<SecureString:$TOKEN_H>"
 
 # ------------------------------------------------------------------ skips
 reset
@@ -329,11 +349,31 @@ contains "skip: low disk" "$OUT" "на C: свободно 9"
 contains "skip: old Windows" "$OUT" "Windows сборки 19045"
 lacks "skips: nothing is copied or run" "$LOG" "RUN "
 
+# Windows 10 PCs: docker=wsl needs Windows 11 22H2 (skipped), docker=desktop (Docker Desktop) installs on any build
+reset
+INV10="$(W "$TMP/work/class-nodes-win10.csv")"
+cat > "$TMP/work/class-nodes-win10.csv" <<'EOF'
+name,address,mode,accel,docker
+pc01,192.168.3.101,k3s,cpu,wsl
+pc02,192.168.3.102,k3s,cpu,desktop
+pc03,192.168.3.103,standalone,nvidia,desktop
+EOF
+scenario '{"trusted":"*","hosts":{"192.168.3.101":{"probe":{"Build":19045}},"192.168.3.102":{"probe":{"Build":19045}},"192.168.3.103":{"probe":{"Build":22631}}}}'
+run "-Action install ${COMMON/$INV/$INV10}"
+contains "win10 + docker=wsl: still skipped, with the way out in the message" "$OUT" "Windows сборки 19045: нужен Windows 11 22H2 (22621) или новее; на Windows 10 укажите в списке ПК docker=desktop"
+lacks "win10 + docker=wsl: nothing is run on that PC" "$LOG" "RUN 192.168.3.101"
+contains "win10 + docker=desktop: not skipped, installer runs with Docker=desktop" "$(echo "$LOG" | grep '^RUN 192.168.3.102')" "Docker=desktop"
+lacks "win10 + docker=desktop: no Windows build skip for that PC" "$OUT" "pc02 ПРОПУЩЕН"
+contains "win10 + docker=desktop: warns the node lives only while a user is logged in" "$OUT" "pc02: Windows сборки 19045, нода пойдёт через Docker Desktop"
+contains "windows 11 + docker=desktop: installer runs with Docker=desktop" "$(echo "$LOG" | grep '^RUN 192.168.3.103')" "Docker=desktop"
+lacks "windows 11 + docker=desktop: no Windows 10 warning" "$OUT" "pc03: Windows сборки"
+
 # a job that dies: the tail of run.log is fetched from the PC into the host log
 reset
 scenario '{"trusted":"*","hosts":{"192.168.3.101":{"jobfail":true,"tail":"[5/9] загрузить образ ноды\nобрыв на середине"},"192.168.3.102":{},"192.168.3.103":{}}}'
 run "-Action install $COMMON"
 contains "dead job: reason shown" "$OUT" "remote session broke"
+contains "dead job: says the install on the PC goes on in the task and a re-run shows it" "$OUT" "установка на ПК продолжается в задаче планировщика: повторите ту же команду"
 contains "dead job: other hosts still finish" "$OUT" "[3/3]"
 contains "dead job: run.log tail fetched" "$LOG" "TAIL 192.168.3.101 C:\\ProgramData\\NSU-LLM-stage\\run.log"
 contains "dead job: tail in the host log" "$(cat "$TMP/work/class-deploy-logs"/*/pc01.log)" "[5/9] загрузить образ ноды"
@@ -350,7 +390,7 @@ contains "hang: tail in the host log" "$(cat "$TMP/work/class-deploy-logs"/*/pc0
 reset
 scenario '{"trusted":"*","hosts":{"192.168.3.101":{},
  "192.168.3.102":{"probe":{"HasGpu":true,"Driver":"566.36"}},
- "192.168.3.103":{"probe":{"HasGpu":true},"run":{"install":{"Code":1,"Output":"Внимание: GPU не виден в WSL — нода будет cpu.\nОШИБКА: После загрузки образа nsu-llm-node:0.1.0-cpu нет\n"}}}}}'
+ "192.168.3.103":{"probe":{"HasGpu":true},"run":{"install":{"Code":1,"Output":"Внимание: GPU не виден в WSL — нода будет cpu.\nОШИБКА: После загрузки образа nsu-llm-node:0.2.0-cpu нет\n"}}}}}'
 run "-Action install $COMMON -Only pc02,pc03"
 contains "old driver: plan says the PC goes cpu" "$OUT" "драйвер старее 570: cpu"
 contains "old driver: auto host gets the cpu image" "$(echo "$LOG" | grep '^RUN 192.168.3.102')" "nsu-llm-node-0.1.0-cpu.tar.gz"
@@ -382,6 +422,20 @@ scenario '{"trusted":"*","hosts":{"192.168.3.101":{}}}'
 run "-Action install -ScriptsFrom '$(W "$TMP/scripts2")' -Inventory '$INV' -Main 10.0.0.5 -Token $TOKEN -AllowFrom 10.0.0.5 -NonInteractive -Only pc01 -DryRun"
 contains "image discovery: matches \$Version of install-node.ps1" "$OUT" "nsu-llm-node-0.1.0-cpu.tar.gz"
 lacks "image discovery: a newer tar of another version is ignored" "$OUT" "0.0.9"
+
+# the version of the image archive is the one main runs (NODE_IMAGE_TAG), IMAGE_VERSION only when main does not answer
+reset
+mkdir -p "$TMP/scripts3"; cp "$TMP/scripts"/* "$TMP/scripts3/"
+echo v010 > "$TMP/scripts3/nsu-llm-node-0.1.0-cpu.tar.gz"
+echo v011 > "$TMP/scripts3/nsu-llm-node-0.1.1-cpu.tar.gz"; touch -d '-1 hour' "$TMP/scripts3/nsu-llm-node-0.1.1-cpu.tar.gz"
+scenario '{"trusted":"*","hosts":{"192.168.3.101":{}}}'
+export NSU_LLM_CURL="$(W "$CURL_TAG")"
+run "-Action install -ScriptsFrom '$(W "$TMP/scripts3")' -Inventory '$INV' -Main 10.0.0.5 -Token $TOKEN -AllowFrom 10.0.0.5 -NonInteractive -Only pc01 -DryRun"
+contains "image discovery: main runs 0.1.1, so the 0.1.1 archive is taken" "$OUT" "nsu-llm-node-0.1.1-cpu.tar.gz"
+lacks "image discovery: the IMAGE_VERSION archive is not taken when main names another version" "$OUT" "Copy-Item smb nsu-llm-node-0.1.0-cpu.tar.gz"
+export NSU_LLM_CURL="$(W "$CURL_DOWN")"
+run "-Action install -ScriptsFrom '$(W "$TMP/scripts3")' -Inventory '$INV' -Main 10.0.0.5 -Token $TOKEN -AllowFrom 10.0.0.5 -NonInteractive -Only pc01 -DryRun"
+contains "image discovery: main does not answer, IMAGE_VERSION decides" "$OUT" "nsu-llm-node-0.1.0-cpu.tar.gz"
 
 # ------------------------------------------------------------------ status
 reset
@@ -473,10 +527,11 @@ reset
 scenario '{"trusted":"*","hosts":{"192.168.3.101":{},"192.168.3.102":{},"192.168.3.103":{}}}'
 run "-Action install -ScriptsFrom '$(W "$TMP/scripts")' -Inventory '$INV' -ImageTarCpu '$CPU' -ImageTarGpu '$GPU' -Only pc01" "10.0.0.5\n$TOKEN\n\nд\n"
 contains "interactive: asks for the main" "$OUT" "Адрес главного сервера"
-contains "interactive: allow-from default is built from the inventory and main" "$OUT" "[192.168.3.0/24,10.0.0.5]"
+contains "interactive: allow-from default is main only (the class subnet is never offered)" "$OUT" "[10.0.0.5]"
+lacks "interactive: the subnet of the class is not offered" "$OUT" "192.168.3.0/24"
 contains "interactive: plan shown before the confirmation" "$OUT" "План (install)"
 [ $RC -eq 0 ] && pass "interactive install ok" || { fail "interactive install ($RC)"; echo "$OUT" | sed 's/^/    | /'; }
-contains "interactive: default allow-from used" "$(echo "$LOG" | grep '^RUN 192.168.3.101')" "AllowFrom=192.168.3.0/24,10.0.0.5"
+contains "interactive: default allow-from used" "$(echo "$LOG" | grep '^RUN 192.168.3.101')" "AllowFrom=10.0.0.5 "
 
 # ------------------------------------------------------------------ the real remote block runs against a fake installer
 # The stub gives every address its own copy of the stage dir ($STUB_ROOT/<address>-stage) and sets the process execution policy to AllSigned,
@@ -491,7 +546,7 @@ Write-Host '[1/2] шаг один'
 Write-Host "installer got Main=$Main Name=$Name Mode=$Mode Accel=$Accel NI=$NonInteractive Tar=$ImageTar Proxy=$($PSBoundParameters['Proxy']) HTTPS_PROXY=$env:HTTPS_PROXY policy=$(Get-ExecutionPolicy -Scope Process)"
 if ($Token -ne 'agent-token-SECRET-123' -or $TaskPassword -ne 'Pw-Secret-9x') { Write-Host 'ОШИБКА: secrets lost'; exit 1 }
 if ($Name -eq 'pc02') { Write-Host 'ОШИБКА: boom'; exit 1 }
-if ($env:FAKE_NOIMAGE -and -not $ImageTar) { Write-Host 'ОШИБКА: Образ nsu-llm-node:0.1.0-cpu не найден ни в WSL, ни рядом со скриптом'; Write-Host 'Как исправить: Положите nsu-llm-node-0.1.0-cpu.tar.gz рядом с install-node.ps1 или укажите -ImageTar <путь>'; exit 1 }
+if ($env:FAKE_NOIMAGE -and -not $ImageTar) { Write-Host 'ОШИБКА: Образ nsu-llm-node:0.2.0-cpu не найден ни в WSL, ни рядом со скриптом'; Write-Host 'Как исправить: Положите nsu-llm-node-0.1.0-cpu.tar.gz рядом с install-node.ps1 или укажите -ImageTar <путь>'; exit 1 }
 if ($Name -eq 'pc03' -and $env:FAKE_SLOW) { Start-Sleep -Seconds 8 }
 Write-Host '[2/2] шаг два'
 exit 0
@@ -551,8 +606,52 @@ contains "task deadline: reported" "$OUT" "не завершилось за"
 contains "task deadline: what has run so far is in the host log" "$(cat "$TMP/work/class-deploy-logs"/*/pc03.log 2>/dev/null)" "[1/2] шаг один"
 for i in $(seq 1 30); do [ -f "$R/192.168.3.103-stage/run.done" ] && break; sleep 1; done
 
-# a task still running from an earlier run is not started twice
-# (covered by the remote block: Get-ScheduledTask reports Running -> error with Stop-ScheduledTask advice)
+# a task still running from an earlier run (the connection to the admin PC dropped, the install on the PC goes on) is not started twice:
+# the same kind of run attaches to it and shows its log from the start; another kind is refused with the Stop-ScheduledTask advice
+reset; mkfake
+mkdir -p "$R/192.168.3.101-stage"
+cp "$FAKE/install-node.ps1" "$R/192.168.3.101-stage/install-node.ps1"
+printf '[1/2] шаг один\r\nидущая установка продолжается\r\n[2/2] шаг два\r\n' > "$R/192.168.3.101-stage/run.log"
+printf 'install' > "$R/192.168.3.101-stage/run.action"
+printf '0' > "$R/192.168.3.101-stage/run.done"
+STUB_TASK_RUNNING=1 run "-Action install $LOCALRUN -Only pc01"
+alog="$(cat "$TMP/work/class-deploy-logs"/*/pc01.log 2>/dev/null)"
+contains "attach: says that the earlier run is still going" "$alog" "Прошлый запуск на ПК ещё идёт"
+contains "attach: shows the log of the running install from the start" "$alog" "идущая установка продолжается"
+contains "attach: live progress lines" "$OUT" "pc01: [2/2] шаг два"
+lacks "attach: no new task is registered" "$LOG" "Register-ScheduledTask"
+lacks "attach: no new task is started" "$LOG" "Start-ScheduledTask"
+contains "attach: the finished task is removed" "$LOG" "Unregister-ScheduledTask \NSU-LLM\NSU-LLM-Deploy"
+contains "attach: the log of the running install is not wiped" "$(cat "$R/192.168.3.101-stage/run.log" 2>/dev/null)" "идущая установка продолжается"
+[ $RC -eq 0 ] && pass "attach: the exit code is that of the running install" || { fail "attach: the exit code is that of the running install ($RC)"; echo "$OUT" | sed 's/^/    | /'; }
+contains "attach: says that the new parameters were not applied" "$alog" "новые параметры не применялись"
+# an update is the same installer as an install
+reset; mkfake
+mkdir -p "$R/192.168.3.101-stage"
+cp "$FAKE/install-node.ps1" "$R/192.168.3.101-stage/install-node.ps1"
+printf '[1/2] шаг один\r\n' > "$R/192.168.3.101-stage/run.log"; printf 'install' > "$R/192.168.3.101-stage/run.action"; printf '0' > "$R/192.168.3.101-stage/run.done"
+STUB_TASK_RUNNING=1 run "-Action update $LOCALRUN -Only pc01"
+contains "attach: an update attaches to a running install" "$(cat "$TMP/work/class-deploy-logs"/*/pc01.log 2>/dev/null)" "Прошлый запуск на ПК ещё идёт"
+# another kind of run is refused, nothing is wiped
+reset; mkfake
+mkdir -p "$R/192.168.3.101-stage"
+cp "$FAKE/install-node.ps1" "$R/192.168.3.101-stage/install-node.ps1"
+printf 'идущая установка продолжается\r\n' > "$R/192.168.3.101-stage/run.log"; printf 'install' > "$R/192.168.3.101-stage/run.action"
+STUB_TASK_RUNNING=1 run "-Action uninstall $LOCALRUN -Only pc01"
+contains "a running install: an uninstall is refused" "$OUT" "ещё идёт прошлый запуск"
+contains "a running install: the refusal names the running kind and Stop-ScheduledTask" "$(cat "$TMP/work/class-deploy-logs"/*/pc01.log 2>/dev/null)" "Stop-ScheduledTask"
+contains "a running install: the log is kept" "$(cat "$R/192.168.3.101-stage/run.log" 2>/dev/null)" "идущая установка продолжается"
+lacks "a running install: nothing registered" "$LOG" "Register-ScheduledTask"
+reset; mkfake
+mkdir -p "$R/192.168.3.101-stage"
+cp "$FAKE/install-node.ps1" "$R/192.168.3.101-stage/install-node.ps1"
+printf 'идущая установка продолжается\r\n' > "$R/192.168.3.101-stage/run.log"; printf 'install' > "$R/192.168.3.101-stage/run.action"
+STUB_TASK_RUNNING=1 run "-Action status $LOCALRUN -Only pc01"
+contains "a running install: a status request is not answered with the log of the install" "$(cat "$TMP/work/class-deploy-logs"/*/pc01.log 2>/dev/null)" "ещё идёт прошлый запуск"
+# the install task records what it runs
+reset; mkfake
+run "-Action install $LOCALRUN -Only pc02"   # pc02 fails in the fake installer: the stage dir is kept
+contains "task: the kind of run is recorded for a later attach" "$(cat "$R/192.168.3.102-stage/run.action" 2>/dev/null)" "install"
 
 # the image was removed from the node meanwhile: the installer asks for -ImageTar, the marker is dropped, the next run copies the tar
 reset; mkfake
@@ -612,12 +711,77 @@ rm -rf "$PD"
 # ------------------------------------------------------------------ interface agreement with install-node.ps1 (task 2-5, written in parallel)
 if [ -f "$NODE/install-node.ps1" ]; then
   names="$("$PS" -NoProfile -Command '$e=$null;$t=$null;$a=[Management.Automation.Language.Parser]::ParseFile("'"$(W "$NODE/install-node.ps1")"'",[ref]$t,[ref]$e); ($a.ParamBlock.Parameters | % { $_.Name.VariablePath.UserPath }) -join " "')"
-  for p in Main Token Mode Accel Docker Name AllowFrom ImageTar ImageSource TaskPassword NonInteractive Yes InsecureTls Status Uninstall; do
+  for p in Main Token Mode Accel Docker Name AllowFrom CaSha256 AcceptCa ImageTar ImageSource TaskPassword NonInteractive Yes InsecureTls Status Uninstall; do
     case " $names " in *" $p "*) pass "install-node.ps1 has -$p" ;; *) fail "install-node.ps1 has no -$p (class-deploy passes it)" ;; esac
   done
 else
   echo "skip - node/install-node.ps1 not present in this tree (task 2-5 is parallel); interface check runs once it lands"
 fi
+
+# ------------------------------------------------------------------ SEC-3: a password of its own per PC (LAPS), the CA fingerprint, no class-wide subnet
+reset
+scenario '{"trusted":"*","hosts":{"192.168.3.101":{},"192.168.3.102":{},"192.168.3.103":{}}}'
+run "-Action check $COMMON -Laps"
+contains "laps: pc01 is entered with its own account" "$LOG" 'New-PSSession 192.168.3.101 user=pc01\lapsadmin'
+contains "laps: pc02 with its own" "$LOG" 'New-PSSession 192.168.3.102 user=pc02\lapsadmin'
+lacks "laps: the shared account is not used" "$LOG" 'user=.\classadmin'
+lacks "laps: the LAPS password is never printed" "$OUT$LOG" "LapsPw-"
+reset
+scenario '{"trusted":"*","hosts":{"192.168.3.101":{},"192.168.3.102":{},"192.168.3.103":{}}}'
+run "-Action install $COMMON -Laps -Only pc01"
+contains "laps: the one-time task runs as the account of that PC" "$(echo "$LOG" | grep '^RUN 192.168.3.101')" 'taskuser=pc01\lapsadmin'
+contains "laps: and its password is a SecureString" "$(echo "$LOG" | grep '^RUN 192.168.3.101')" "taskpw=<SecureString:$(printf '%s' 'LapsPw-pc01-9z' | sha256sum | cut -c1-8)>"
+reset
+scenario '{"trusted":"*","laps":false,"hosts":{"192.168.3.101":{},"192.168.3.102":{},"192.168.3.103":{}}}'
+run "-Action check $COMMON -Laps"
+contains "laps: no password: the PC is reported unreachable with the cause" "$OUT" "пароль LAPS не получен"
+lacks "laps: no session is opened without a password" "$LOG" "New-PSSession"
+reset
+scenario '{"trusted":"*","hosts":{"192.168.3.101":{},"192.168.3.102":{},"192.168.3.103":{}}}'
+run "-Action install $COMMON -Only pc01"
+contains "without -Laps the shared account is used and the channel warning is printed" "$OUT" "сервер на ПК не проверяется"
+lacks "without -Laps LAPS is not asked" "$LOG" "LAPS "
+# one admin password for the whole class stays in the LSA of every PC: the residual risk is named at the moment of the install
+reset
+scenario '{"trusted":"*","hosts":{"192.168.3.101":{},"192.168.3.102":{},"192.168.3.103":{}}}'
+run "-Action install $COMMON"
+contains "shared password on several PCs: the LSA risk is named" "$OUT" "будет сохранён в LSA каждого из 3 ПК"
+contains "shared password: LAPS is the way out" "$OUT" "-Laps"
+reset
+run "-Action install $COMMON -Only pc01"
+lacks "a single PC: no shared-password warning" "$OUT" "будет сохранён в LSA каждого"
+reset
+run "-Action install $COMMON -Laps"
+lacks "-Laps: no shared-password warning" "$OUT" "будет сохранён в LSA каждого"
+reset
+run "-Action status $COMMON"
+lacks "status sends no password: no warning" "$OUT" "будет сохранён в LSA каждого"
+# the fingerprint of the CA of main goes to the installer; a malformed one stops the run
+FP="$(printf 'ab%.0s' $(seq 32))"
+NOALLOW="-ScriptsFrom '$(W "$TMP/scripts")' -Inventory '$INV' -ImageTarCpu '$CPU' -ImageTarGpu '$GPU' -Main 10.0.0.5 -Token $TOKEN -NonInteractive"
+reset
+scenario '{"trusted":"*","hosts":{"192.168.3.101":{},"192.168.3.102":{},"192.168.3.103":{}}}'
+run "-Action install $NOALLOW -CaSha256 $FP -Only pc01"
+contains "CA fingerprint is handed to the installer" "$(echo "$LOG" | grep '^RUN 192.168.3.101')" "CaSha256=$FP"
+lacks "no -AcceptCa unless asked" "$(echo "$LOG" | grep '^RUN 192.168.3.101')" "AcceptCa"
+reset
+run "-Action install $NOALLOW -AcceptCa -Only pc01"
+contains "-AcceptCa is handed over only when asked" "$(echo "$LOG" | grep '^RUN 192.168.3.101')" "AcceptCa=True"
+reset
+run "-Action install $NOALLOW -CaSha256 zzz -Only pc01"
+[ $RC -ne 0 ] && pass "a malformed -CaSha256 stops the run" || fail "a malformed -CaSha256 stops the run"
+contains "a malformed -CaSha256 is explained" "$OUT" "нужны 64 шестнадцатеричные цифры"
+# a subnet saved by an older version is dropped: only main
+reset
+scenario '{"trusted":"*","hosts":{"192.168.3.101":{},"192.168.3.102":{},"192.168.3.103":{}}}'
+printf '{"Main":"10.0.0.5","AllowFrom":"192.168.3.0/24,10.0.0.5"}' > "$TMP/work/class-answers.json"
+run "-Action install $NOALLOW -Only pc01"
+contains "a saved subnet of an older version is dropped with a warning" "$OUT" "открывал порты всей подсети класса"
+contains "and only main stays" "$(echo "$LOG" | grep '^RUN 192.168.3.101')" "AllowFrom=10.0.0.5 "
+reset
+printf '{"Main":"10.0.0.5","AllowFrom":"10.0.0.5,10.0.0.6"}' > "$TMP/work/class-answers.json"
+run "-Action install $NOALLOW -Only pc01"
+contains "a saved list of single addresses is kept" "$(echo "$LOG" | grep '^RUN 192.168.3.101')" "AllowFrom=10.0.0.5,10.0.0.6 "
 
 echo
 if [ $FAILS -eq 0 ]; then echo "all class-deploy tests passed"; else echo "$FAILS class-deploy test(s) failed"; exit 1; fi

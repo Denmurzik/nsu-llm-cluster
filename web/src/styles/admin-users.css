@@ -1,0 +1,89 @@
+/* Users and the audit log (task 2-32). Same tokens as app.css, no colours of its own. */
+
+/* the filters sit in one line above the table; the line has a fixed height so nothing moves while data loads */
+.filter-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: var(--s3);
+}
+.filter-bar .field {
+  flex: 0 1 200px;
+}
+.filter-bar .field.grow {
+  flex: 1 1 260px;
+}
+.filter-bar .btn {
+  flex: none;
+}
+
+/* «Показано 1–25 из 80» and the page buttons; always on screen, buttons disabled when there is no other page */
+.pager {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--s3);
+  min-height: 32px;
+  color: var(--text-2);
+  font-variant-numeric: tabular-nums;
+}
+.pager .pages {
+  display: flex;
+  gap: var(--s2);
+}
+
+/* the table and its pager are one block: the .page gap would put them far apart */
+.list-block {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s3);
+}
+
+.tag.bad {
+  color: var(--bad);
+}
+
+table.data td.reason {
+  max-width: 320px;
+  overflow-wrap: anywhere;
+}
+
+/* keys of a user: the dialog keeps its height while the list loads */
+.user-keys {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s3);
+  min-height: 160px;
+}
+
+/* ---------- audit log ---------- */
+
+table.data td.chev,
+table.data th.chev {
+  width: 40px;
+  padding-right: 0;
+}
+table.data tr.audit-detail td {
+  background: var(--raised);
+  padding-top: var(--s3);
+  padding-bottom: var(--s3);
+}
+.audit-details {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: var(--s1) var(--s4);
+  margin: 0;
+}
+.audit-details dt {
+  color: var(--text-3);
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 20px;
+}
+.audit-details dd {
+  margin: 0;
+  font-family: var(--mono);
+  font-size: 13px;
+  line-height: 20px;
+  overflow-wrap: anywhere;
+}

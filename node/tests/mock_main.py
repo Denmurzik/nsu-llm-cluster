@@ -6,6 +6,7 @@
 * Every request is appended to --calls (a JSON array of {method, path, body, auth}).
 * --desired is re-read on each heartbeat; a missing file or JSON null means "no desired config".
 * The first heartbeat succeeds, the second answers 404 once (forces a re-register).
+* POST /api/nodes/<name>/image (the image the node runs) answers 200.
 """
 import argparse
 import json
@@ -81,6 +82,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(204)
             if method == "POST" and self.path.startswith("/api/nodes/") and self.path.endswith("/stop"):
                 return self._send(204)
+            # what the node container runs (task 2-30); a portal older than that answers 404 here
+            if method == "POST" and self.path.startswith("/api/nodes/") and self.path.endswith("/image"):
+                return self._send(200, {"ok": True})
             return self._send(404, {"detail": "not found"})
 
     def do_POST(self):

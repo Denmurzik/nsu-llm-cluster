@@ -22,7 +22,7 @@ pytestmark = pytest.mark.docker
 
 GiB = 2**30
 REPO, FILE, MMPROJ = "org/model-GGUF", "model-Q4_K_M.gguf", "mmproj-F16.gguf"
-ADMIN = {"sub": "adm", "email": "admin@g.nsu.ru"}
+ADMIN = {"sub": "adm", "email": "admin@g.nsu.ru", "email_verified": True}
 USER = {"sub": "usr", "email": "ivan@g.nsu.ru"}
 META = GgufMeta("llama", 32, 32, 8, 128, 4096, 32768)
 CHAT = {"messages": [{"role": "user", "content": "Привет"}]}
@@ -222,7 +222,7 @@ async def test_a_database_role_change_is_picked_up_too(client, user_client, admi
     await key_access.sweep(app.state)
     async with app.state.sessionmaker() as db:
         row = await db.scalar(select(User).where(User.email == "admin@g.nsu.ru"))
-        row.role = "user"
+        row.role, row.role_source = "user", "manual"  # what the panel writes
         await db.commit()
     assert await key_access.sweep(app.state) == 1
     assert models_of(fake, admin["id"]) == [("public",)]
@@ -234,8 +234,8 @@ async def test_a_new_admin_gets_the_experimental_group(user_client, app, fake):
     await key_access.sweep(app.state)
     assert models_of(fake, user_client.me["id"]) == [("public",)]
     app.state.settings.admin_emails = "admin@g.nsu.ru,ivan@g.nsu.ru"
-    async with second_client(app) as c:  # the next login makes them an admin
-        await login(c, app, USER)
+    async with second_client(app) as c:  # the next (verified) login makes them an admin
+        await login(c, app, {**USER, "email_verified": True})
     assert await key_access.sweep(app.state) == 1
     assert models_of(fake, user_client.me["id"]) == [("public", "experimental")]
 
@@ -245,7 +245,7 @@ async def test_demotions_are_handled_before_promotions(client, user_client, admi
     await key_access.sweep(app.state)
     app.state.settings.admin_emails = "ivan@g.nsu.ru"  # the admin loses the role, the user is listed
     async with second_client(app) as c:
-        await login(c, app, USER)
+        await login(c, app, {**USER, "email_verified": True})
     monkeypatch.setattr(key_access, "BATCH", 1)
     assert await key_access.sweep(app.state) == 1
     assert models_of(fake, admin["id"]) == [("public",)]  # the cut came first

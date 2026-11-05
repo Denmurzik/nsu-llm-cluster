@@ -15,11 +15,32 @@ import hfEstimateSplit from "./fixtures/get__api_admin_hf_estimate--split.json";
 import nodes from "./fixtures/get__api_admin_nodes.json";
 import join from "./fixtures/get__api_admin_join.json";
 import status from "./fixtures/get__api_admin_status.json";
+import versions from "./fixtures/get__api_admin_versions.json";
 import users from "./fixtures/get__api_admin_users.json";
+import settings from "./fixtures/get__api_admin_settings.json";
+import userKeys from "./fixtures/get__api_admin_users_id_keys.json";
+import audit from "./fixtures/get__api_admin_audit.json";
 import podLogs from "./fixtures/get__api_admin_pods_name_logs.json";
 import localModels from "./fixtures/get__api_admin_local_models.json";
 import deploymentCommand from "./fixtures/get__api_admin_deployments_id_command.json";
-import type { LocalCatalog, ModelUpload } from "../types";
+import modelCache from "./fixtures/get__api_admin_cache.json";
+import prefetchJobs from "./fixtures/get__api_admin_prefetch.json";
+import metricsLive from "./fixtures/get__api_admin_metrics_live.json";
+import metricsNames from "./fixtures/get__api_admin_metrics_names.json";
+import metricsHistoryNode from "./fixtures/get__api_admin_metrics_history.json";
+import metricsHistoryModel from "./fixtures/get__api_admin_metrics_history--model.json";
+import type {
+  AdminUserFull,
+  ApiKey,
+  AuditEntry,
+  KeyLimitsJob,
+  LocalCatalog,
+  MetricsHistory,
+  ModelCache,
+  ModelUpload,
+  PrefetchJob,
+  SystemSetting,
+} from "../types";
 
 export const fixtures = {
   meUser,
@@ -38,10 +59,20 @@ export const fixtures = {
   nodes,
   join,
   status,
+  versions,
   users,
+  settings,
+  userKeys,
+  audit,
   podLogs,
   localModels,
   deploymentCommand,
+  modelCache,
+  prefetchJobs,
+  metricsLive,
+  metricsNames,
+  metricsHistoryNode,
+  metricsHistoryModel,
 };
 
 type Json = Record<string, unknown>;
@@ -53,14 +84,34 @@ export interface MockState {
   deployments: Json[];
   assignments: Record<string, string | null>;
   maintenance: Record<string, boolean>;
+  /** nodes removed from the cluster with «Удалить из кластера…» */
+  removed: string[];
   nextKeyId: number;
   nextDeploymentId: number;
   /** «Мои модели»: the catalog the mock serves; uploads change in place */
   local: LocalCatalog;
   nextUploadId: number;
+  /** «Кэш моделей»: the cache of the mirror and its background downloads */
+  cache: ModelCache;
+  prefetch: PrefetchJob[];
+  nextJobId: number;
+  /** «Настройки»: the settings the mock serves; saves and resets change them in place */
+  settings: SystemSetting[];
+  /** the mirror limit the running mirror uses (a restart applies the saved one) */
+  mirrorApplied: number;
+  /** the background job «Применить к существующим ключам»; each poll moves it on */
+  keyJob: KeyLimitsJob;
+  /** «Пользователи»: the rows the mock serves; a PATCH changes them in place */
+  users: AdminUserFull[];
+  /** keys per user id; Анна Петрова has the fixture keys, the others none */
+  userKeys: Record<string, ApiKey[]>;
+  /** the audit log, newest first */
+  audit: AuditEntry[];
 }
 
 const clone = <T,>(v: T): T => JSON.parse(JSON.stringify(v));
+
+const PETROVA = "7c1f6a3e-5b0d-4a52-9d44-0e2b8c1f3a10";
 
 function fresh(role: MockState["role"] = "user"): MockState {
   return {
@@ -69,10 +120,20 @@ function fresh(role: MockState["role"] = "user"): MockState {
     deployments: clone(deployments) as Json[],
     assignments: Object.fromEntries(nodes.nodes.map((n) => [n.name, n.deployment])),
     maintenance: Object.fromEntries(nodes.nodes.map((n) => [n.name, n.maintenance])),
+    removed: [],
     nextKeyId: 100,
     nextDeploymentId: 100,
     local: clone(localModels) as unknown as LocalCatalog,
     nextUploadId: 1,
+    cache: clone(modelCache) as unknown as ModelCache,
+    prefetch: clone(prefetchJobs.jobs) as unknown as PrefetchJob[],
+    nextJobId: 1,
+    settings: clone(settings) as unknown as SystemSetting[],
+    mirrorApplied: 500,
+    keyJob: { state: "none" },
+    users: clone(users.items) as unknown as AdminUserFull[],
+    userKeys: { [PETROVA]: clone(userKeys) as unknown as ApiKey[] },
+    audit: clone(audit.items) as unknown as AuditEntry[],
   };
 }
 
@@ -100,7 +161,7 @@ export function previewFor(body: Json) {
   const cache = "/var/lib/llm-models";
   const dir = (repo: string) => `${cache}/${repo.replace("/", "__")}`;
   const argv = [
-    "llama-server --host 0.0.0.0 --port 18080 --jinja --cache-ram 512 -fa auto",
+    "llama-server --host 0.0.0.0 --port 18080 --jinja --metrics --cache-ram 512 -fa auto",
     `--ctx-size ${Number(body.ctx_per_request ?? 8192) * parallel} --parallel ${parallel} --no-kv-unified`,
     "-ngl 99 -t $THREADS",
     `--alias ${String(body.name)}`,
@@ -221,6 +282,59 @@ function sse(chunks: string[], gapMs = 0): Response {
   return new HttpResponse(stream, { headers: { "Content-Type": "text/event-stream" } });
 }
 
+// -- task 2-32: users and the audit log ---------------------------------------------------------------------------
+function usersList(q: URLSearchParams) {
+  const text = (q.get("q") ?? "").trim().toLowerCase();
+  const role = q.get("role");
+  const blocked = q.get("blocked");
+  const rows = state.users.filter(
+    (u) =>
+      (!text || u.email.toLowerCase().includes(text) || u.full_name.toLowerCase().includes(text)) &&
+      (!role || u.role === role) &&
+      (blocked === null || String(u.blocked) === blocked),
+  );
+  const offset = Number(q.get("offset") ?? 0);
+  const limit = Number(q.get("limit") ?? 50);
+  return HttpResponse.json({ items: rows.slice(offset, offset + limit), total: rows.length });
+}
+
+const conflict = (detail: string) => HttpResponse.json({ detail }, { status: 409 });
+
+/** The rules of the portal (api/admin_users.py): not oneself, a manual role, a blocked user and the limits */
+async function userPatch({ request, params }: { request: Request; params: Record<string, string | readonly string[] | undefined> }) {
+  if (!csrfOk(request)) return forbidden();
+  const user = state.users.find((u) => u.id === params.id);
+  if (!user) return HttpResponse.json({ detail: "Пользователь не найден" }, { status: 404 });
+  const body = (await request.json()) as Partial<AdminUserFull> & { role_source?: "auto" };
+  const myself = user.id === meAdmin.id;
+  if (myself && body.blocked) return conflict("Нельзя заблокировать самого себя");
+  if (myself && body.role === "user") return conflict("Нельзя снять роль администратора с самого себя");
+  if (body.role) Object.assign(user, { role: body.role, role_source: "manual" });
+  if (body.role_source === "auto") Object.assign(user, { role_source: "auto", role: user.email === meAdmin.email ? "admin" : "user" });
+  if (body.blocked === true) Object.assign(user, { blocked: true, blocked_reason: body.blocked_reason || null });
+  if (body.blocked === false) Object.assign(user, { blocked: false, blocked_reason: null });
+  for (const f of ["rpm_limit", "tpm_limit", "max_keys"] as const) if (f in body) user[f] = body[f] ?? null;
+  return HttpResponse.json(user);
+}
+
+function auditList(q: URLSearchParams) {
+  const has = (value: string | null | undefined, part: string | null) =>
+    !part || (value ?? "").toLowerCase().includes(part.toLowerCase());
+  const since = q.get("since");
+  const until = q.get("until");
+  const rows = state.audit.filter(
+    (e) =>
+      (!q.get("action") || e.action.startsWith(q.get("action") as string)) &&
+      has(e.actor_email, q.get("actor")) &&
+      has(e.target, q.get("target")) &&
+      (!since || e.at >= since) &&
+      (!until || e.at <= until),
+  );
+  const offset = Number(q.get("offset") ?? 0);
+  const limit = Number(q.get("limit") ?? 50);
+  return HttpResponse.json({ items: rows.slice(offset, offset + limit), total: rows.length });
+}
+
 // -- task 2-24: the probe, waking a node and the models that take images -----------------------------------------
 /** the catalog fixture has `vision: false` everywhere (the contract test pins its shape); the mock turns it on for one
     model so the image flow can be tried and tested */
@@ -238,7 +352,92 @@ async function probeHandler({ request, params }: { request: Request; params: Rec
   return HttpResponse.json({ ok: true, status: 200, answer: "Москва", ttft_ms: 820, tokens_per_s: 62.4, error: null });
 }
 
+/** Queues downloads like the mirror: a file that is queued or running already keeps its job */
+function queueJobs(repo: string, revision: string, files: string[]): PrefetchJob[] {
+  const out: PrefetchJob[] = [];
+  for (const path of new Set(files)) {
+    let job = state.prefetch.find((j) => j.repo === repo && j.path === path && (j.state === "queued" || j.state === "running"));
+    if (!job) {
+      job = {
+        id: String(state.nextJobId++).padStart(12, "0"),
+        repo,
+        revision,
+        path,
+        state: "queued",
+        size: null,
+        written: 0,
+        speed_bps: 0,
+        error: null,
+        cached: false,
+        created: Date.now() / 1000,
+        started: null,
+        finished: null,
+      };
+      state.prefetch.push(job);
+    }
+    out.push(job);
+  }
+  return out;
+}
+
+// -- task 2-33: monitoring ---------------------------------------------------------------------------------------
+/** The history of the fixture repeated over the asked period, one point per step (the real one is made of the controllers' minute rows) */
+export function historyFor(url: URL): MetricsHistory {
+  const kind = url.searchParams.get("kind") === "model" ? "model" : "node";
+  const base = kind === "model" ? metricsHistoryModel : metricsHistoryNode;
+  const to = new Date(url.searchParams.get("to") ?? Date.now()).getTime();
+  const from = new Date(url.searchParams.get("from") ?? to - 3600_000).getTime();
+  const step = Math.max(60, Math.ceil((to - from) / 1000 / 300 / 60) * 60);
+  const count = Math.min(300, Math.floor((to - from) / 1000 / step));
+  const points = Array.from({ length: count }, (_, i) => ({
+    ...base.points[i % base.points.length],
+    t: new Date(to - (count - 1 - i) * step * 1000).toISOString(),
+  }));
+  return { ...base, kind, name: url.searchParams.get("name") ?? base.name, from: new Date(from).toISOString(), to: new Date(to).toISOString(), step, points } as MetricsHistory;
+}
+
+/** The rules of the portal (app/settings_store.py) for a value sent to a setting */
+function settingError(s: SystemSetting, value: unknown): string | null {
+  if (s.type === "bool") return typeof value === "boolean" ? null : `«${s.key}»: нужно значение да/нет`;
+  if (typeof value !== "number" || typeof value === "boolean") return `«${s.key}»: нужно число`;
+  if (s.type === "int" && !Number.isInteger(value)) return `«${s.key}»: нужно целое число`;
+  if (s.min !== null && value < s.min) return `«${s.key}»: не меньше ${s.min}`;
+  if (s.max !== null && value > s.max) return `«${s.key}»: не больше ${s.max}`;
+  return null;
+}
+
+/** a setting as the portal sends it: the restart marker of the mirror limit follows what the running mirror has */
+function settingOut(s: SystemSetting): SystemSetting {
+  const overridden = s.overridden;
+  return {
+    ...s,
+    overridden,
+    source: overridden ? "db" : "env",
+    pending_restart: s.restart_required && s.value !== state.mirrorApplied,
+  };
+}
+
+function settingByKey(key: unknown): SystemSetting | undefined {
+  return state.settings.find((x) => x.key === key);
+}
+
+const UNKNOWN_SETTING = () => HttpResponse.json({ detail: "Неизвестная настройка" }, { status: 404 });
+
+/** one poll of the job: the first shows it running, the next ones finish it */
+function pollKeyJob(): KeyLimitsJob {
+  const job = state.keyJob;
+  if (job.state === "running") {
+    const total = job.total ?? 0;
+    const done = Math.min(total, (job.done ?? 0) + Math.ceil(total / 2));
+    state.keyJob = done >= total ? { ...job, state: "done", done, finished_at: new Date().toISOString() } : { ...job, done };
+  }
+  return state.keyJob;
+}
+
 export const handlers = [
+  http.get("/api/admin/metrics/live", adminOnly(() => HttpResponse.json(metricsLive))),
+  http.get("/api/admin/metrics/names", adminOnly(() => HttpResponse.json(metricsNames))),
+  http.get("/api/admin/metrics/history", adminOnly(({ request }) => HttpResponse.json(historyFor(new URL(request.url))))),
   http.post("/api/admin/deployments/:id/probe", adminOnly(probeHandler)),
 
   http.get("/api/me", () => {
@@ -397,6 +596,53 @@ export const handlers = [
       return HttpResponse.json({ node: params.name, targets: ["192.168.3.255", "192.168.3.77"], relay: null });
     }),
   ),
+  http.delete(
+    "/api/admin/nodes/:name",
+    adminOnly(({ request, params }) => {
+      if (!csrfOk(request)) return forbidden();
+      const name = String(params.name);
+      const node = nodes.nodes.find((n) => n.name === name);
+      if (!node || state.removed.includes(name)) return HttpResponse.json({ detail: "Нода не найдена" }, { status: 404 });
+      if (node.is_main) return HttpResponse.json({ detail: "Главный сервер нельзя удалить" }, { status: 409 });
+      const held = state.assignments[name];
+      const force = new URL(request.url).searchParams.get("force") === "1";
+      if (held && !force) {
+        const mode = (state.deployments.find((d) => d.name === held)?.mode as string | undefined) ?? "replicas";
+        return HttpResponse.json(
+          {
+            detail: `Нода работает на развёртываниях: ${held}${mode === "split" ? " (split)" : ""}. Они потеряют её. Удалить всё равно можно с подтверждением`,
+            deployments: [{ name: held, mode }],
+          },
+          { status: 409 },
+        );
+      }
+      state.removed.push(name);
+      return HttpResponse.json({
+        node: name,
+        online: node.ready,
+        k8s: "deleted",
+        unassigned: held ? [held] : [],
+        uninstall: {
+          windows: `.\\install-node.ps1 -Uninstall -Name ${name}`,
+          linux: `sudo ./run-node.sh --uninstall --main 192.168.3.21 --name ${name}`,
+        },
+      });
+    }),
+  ),
+  http.post(
+    "/api/admin/nodes/:name/purge-models",
+    adminOnly(({ request, params }) => {
+      if (!csrfOk(request)) return forbidden();
+      return HttpResponse.json({
+        node: params.name,
+        status: "done",
+        freed_bytes: 12884901888,
+        models_bytes: 6442450944,
+        removed: ["unsloth__old-model-GGUF", "rpc"],
+        skipped: [],
+      });
+    }),
+  ),
   http.get(
     "/api/admin/hf/files",
     adminOnly(({ request }) => {
@@ -418,11 +664,13 @@ export const handlers = [
     adminOnly(() =>
       HttpResponse.json({
         ...nodes,
-        nodes: nodes.nodes.map((n) => ({
-          ...n,
-          deployment: state.assignments[n.name] ?? null,
-          maintenance: state.maintenance[n.name] ?? false,
-        })),
+        nodes: nodes.nodes
+          .filter((n) => !state.removed.includes(n.name))
+          .map((n) => ({
+            ...n,
+            deployment: state.assignments[n.name] ?? null,
+            maintenance: state.maintenance[n.name] ?? false,
+          })),
       }),
     ),
   ),
@@ -501,9 +749,187 @@ export const handlers = [
       return new HttpResponse(null, { status: 204 });
     }),
   ),
+  // -- task 2-29: the cache of the mirror and the downloads into it ---------------------------------------------------
+  http.get("/api/admin/cache", adminOnly(() => HttpResponse.json(state.cache))),
+  http.delete(
+    "/api/admin/cache/*",
+    adminOnly(({ request }) => {
+      if (!csrfOk(request)) return forbidden();
+      const [owner, name, ...rest] = decodeURIComponent(new URL(request.url).pathname.slice("/api/admin/cache/".length)).split("/");
+      const repo = `${owner}/${name}`;
+      const path = rest.join("/");
+      const hit = state.cache.files.filter((f) => f.repo === repo && (!path || f.path === path));
+      if (hit.length === 0) return HttpResponse.json({ detail: "В кэше нет такого файла" }, { status: 404 });
+      const users = [...new Set(hit.flatMap((f) => f.used_by.map((u) => u.name)))];
+      if (users.length)
+        return HttpResponse.json(
+          { detail: `Файл используется развёртыванием ${users.join(", ")}: удалите развёртывание или выберите другую модель` },
+          { status: 409 },
+        );
+      if (hit.some((f) => f.busy || f.downloading))
+        return HttpResponse.json({ detail: "Файл сейчас отдаётся нодам или скачивается: попробуйте позже" }, { status: 409 });
+      const freed = hit.reduce((s, f) => s + f.size, 0);
+      state.cache.files = state.cache.files.filter((f) => !hit.includes(f));
+      state.cache.used_bytes -= freed;
+      return HttpResponse.json({ deleted: hit.map((f) => ({ repo: f.repo, path: f.path, size: f.size })), freed_bytes: freed });
+    }),
+  ),
+  http.get("/api/admin/prefetch", adminOnly(() => HttpResponse.json({ jobs: state.prefetch, concurrency: 2 }))),
+  http.post(
+    "/api/admin/prefetch",
+    adminOnly(async ({ request }) => {
+      if (!csrfOk(request)) return forbidden();
+      const body = (await request.json()) as { repo: string; revision?: string | null; files: string[] };
+      if (!/^[\w.-]+\/[\w.-]+$/.test(body.repo))
+        return HttpResponse.json({ detail: "Репозиторий указывается как владелец/название" }, { status: 422 });
+      return HttpResponse.json({ jobs: queueJobs(body.repo, body.revision || "main", body.files) }, { status: 202 });
+    }),
+  ),
+  http.delete(
+    "/api/admin/prefetch/:id",
+    adminOnly(({ request, params }) => {
+      if (!csrfOk(request)) return forbidden();
+      const job = state.prefetch.find((j) => j.id === params.id);
+      if (!job) return HttpResponse.json({ detail: "Нет такого задания" }, { status: 404 });
+      if (job.state === "queued" || job.state === "running")
+        Object.assign(job, { state: "cancelled", error: "Скачивание отменено", finished: Date.now() / 1000 });
+      else state.prefetch = state.prefetch.filter((j) => j !== job);
+      return HttpResponse.json(job);
+    }),
+  ),
+  http.delete(
+    "/api/admin/prefetch",
+    adminOnly(({ request }) => {
+      if (!csrfOk(request)) return forbidden();
+      const before = state.prefetch.length;
+      state.prefetch = state.prefetch.filter((j) => j.state === "queued" || j.state === "running");
+      return HttpResponse.json({ removed: before - state.prefetch.length });
+    }),
+  ),
+  http.post(
+    "/api/admin/deployments/:id/prefetch",
+    adminOnly(({ request, params }) => {
+      if (!csrfOk(request)) return forbidden();
+      const dep = state.deployments.find((d) => d.id === Number(params.id));
+      if (!dep) return HttpResponse.json({ detail: "Развёртывание не найдено" }, { status: 404 });
+      const repo = String(dep.repo);
+      if (repo.startsWith("local/"))
+        return HttpResponse.json(
+          { detail: "У развёртывания только свои файлы (local/…): они лежат на главном, скачивать нечего" },
+          { status: 422 },
+        );
+      const files = [String(dep.file), ...(dep.mmproj_file ? [String(dep.mmproj_file)] : [])];
+      return HttpResponse.json({ jobs: queueJobs(repo, String(dep.revision || "main"), files) }, { status: 202 });
+    }),
+  ),
   http.get("/api/admin/join", adminOnly(() => HttpResponse.json(join))),
   http.get("/api/admin/status", adminOnly(() => HttpResponse.json(status))),
-  http.get("/api/admin/users", adminOnly(() => HttpResponse.json(users))),
+  // versions of the node image and «Обновить» (portal task 2-30)
+  http.get("/api/admin/versions", adminOnly(() => HttpResponse.json(versions))),
+  http.post(
+    "/api/admin/nodes/update",
+    adminOnly(async ({ request }) => {
+      if (!csrfOk(request)) return forbidden();
+      const body = (await request.json()) as { names: string[]; when: string };
+      return HttpResponse.json({ results: body.names.map((name) => ({ name, ok: true, when: body.when, waiting: false })) });
+    }),
+  ),
+  http.post(
+    "/api/admin/nodes/:name/update",
+    adminOnly(async ({ request, params }) => {
+      if (!csrfOk(request)) return forbidden();
+      const body = (await request.json()) as { when: string };
+      return HttpResponse.json({ name: params.name, ok: true, when: body.when, waiting: false });
+    }),
+  ),
+  http.delete(
+    "/api/admin/nodes/:name/update",
+    adminOnly(({ request, params }) => {
+      if (!csrfOk(request)) return forbidden();
+      return HttpResponse.json({ name: params.name, cancelled: true });
+    }),
+  ),
+  http.get("/api/admin/settings", adminOnly(() => HttpResponse.json(state.settings.map(settingOut)))),
+  http.put(
+    "/api/admin/settings/:key",
+    adminOnly(async ({ request, params }) => {
+      if (!csrfOk(request)) return forbidden();
+      const s = settingByKey(params.key);
+      if (!s) return UNKNOWN_SETTING();
+      const { value } = (await request.json()) as { value: unknown };
+      const error = settingError(s, value);
+      if (error) return HttpResponse.json({ detail: error }, { status: 422 });
+      s.value = value as number | boolean;
+      s.overridden = true;
+      s.updated_by = "admin@g.nsu.ru";
+      s.updated_at = new Date().toISOString();
+      return HttpResponse.json(settingOut(s));
+    }),
+  ),
+  http.delete(
+    "/api/admin/settings/:key",
+    adminOnly(({ request, params }) => {
+      if (!csrfOk(request)) return forbidden();
+      const s = settingByKey(params.key);
+      if (!s) return UNKNOWN_SETTING();
+      s.value = s.default;
+      s.overridden = false;
+      s.updated_by = null;
+      s.updated_at = null;
+      return HttpResponse.json(settingOut(s));
+    }),
+  ),
+  http.post(
+    "/api/admin/key-limits/apply",
+    adminOnly(({ request }) => {
+      if (!csrfOk(request)) return forbidden();
+      if (state.keyJob.state === "running") return HttpResponse.json({ detail: "Обновление ключей уже идёт" }, { status: 409 });
+      const get = (key: string) => Number(settingByKey(key)?.value);
+      state.keyJob = {
+        state: "running",
+        total: 4,
+        done: 0,
+        failed: 0,
+        rpm_limit: get("key_rpm_limit"),
+        tpm_limit: get("key_tpm_limit"),
+        started_at: new Date().toISOString(),
+        finished_at: null,
+        error: null,
+      };
+      return HttpResponse.json(state.keyJob, { status: 202 });
+    }),
+  ),
+  http.get("/api/admin/key-limits/job", adminOnly(() => HttpResponse.json(pollKeyJob()))),
+  http.post(
+    "/api/admin/hf-mirror/restart",
+    adminOnly(({ request }) => {
+      if (!csrfOk(request)) return forbidden();
+      const s = settingByKey("hf_mirror_max_gib");
+      if (!s) return UNKNOWN_SETTING();
+      state.mirrorApplied = Number(s.value);
+      return HttpResponse.json(settingOut(s));
+    }),
+  ),
+  http.get("/api/admin/users", adminOnly(({ request }) => usersList(new URL(request.url).searchParams))),
+  http.patch("/api/admin/users/:id", adminOnly(userPatch)),
+  http.get(
+    "/api/admin/users/:id/keys",
+    adminOnly(({ params }) => HttpResponse.json(state.userKeys[String(params.id)] ?? [])),
+  ),
+  http.delete(
+    "/api/admin/users/:id/keys/:keyId",
+    adminOnly(({ request, params }) => {
+      if (!csrfOk(request)) return forbidden();
+      const list = state.userKeys[String(params.id)] ?? [];
+      if (!list.some((k) => k.id === params.keyId)) return HttpResponse.json({ detail: "Ключ не найден" }, { status: 404 });
+      state.userKeys[String(params.id)] = list.filter((k) => k.id !== params.keyId);
+      const user = state.users.find((u) => u.id === params.id);
+      if (user) user.keys = Math.max(0, user.keys - 1);
+      return new HttpResponse(null, { status: 204 });
+    }),
+  ),
+  http.get("/api/admin/audit/export", adminOnly(() => new HttpResponse("id,time\n", { headers: { "Content-Type": "text/csv" } }))),
+  http.get("/api/admin/audit", adminOnly(({ request }) => auditList(new URL(request.url).searchParams))),
   http.get(
     "/api/admin/pods/:name/logs",
     adminOnly(({ params }) => HttpResponse.json({ ...podLogs, name: params.name })),

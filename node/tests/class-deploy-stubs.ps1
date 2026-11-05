@@ -10,6 +10,12 @@ $global:StubRoot = $env:STUB_ROOT
 $global:JobSeq = 0; $global:SessSeq = 0; $global:Running = 0
 $global:Tasks = @{}
 
+# SecureString в журнале: тип и начало SHA-256 открытого текста (значение не печатается, но его можно сверить)
+function SecureTag($v) {
+    $pt = (New-Object Net.NetworkCredential('', $v)).Password
+    $h = (([Security.Cryptography.SHA256]::Create().ComputeHash([Text.Encoding]::UTF8.GetBytes($pt)) | ForEach-Object { $_.ToString('x2') }) -join '').Substring(0, 8)
+    return "<SecureString:$h>"
+}
 function Log([string]$t) { Add-Content -Path $global:StubLog -Value $t -Encoding UTF8 }
 # Свойство сценария: узел -> поле, со значением по умолчанию.
 function HostCfg([string]$addr) { $p = $global:Scn.hosts.PSObject.Properties[$addr]; if ($p) { return $p.Value }; return $null }
@@ -41,6 +47,12 @@ function New-PSSession { [CmdletBinding()] param($ComputerName, $Credential, $Se
     if ((Cfg (HostCfg $ComputerName) 'needtrust' $false) -and (@($global:Trusted -split ',') -notcontains $ComputerName)) { throw 'Kerberos: the computer is not joined to the domain' }
     $global:SessSeq++
     return [pscustomobject]@{ ComputerName = $ComputerName; Id = $global:SessSeq }
+}
+# Windows LAPS: у каждого ПК свой пароль локального администратора (сценарий: "laps": false — нет пароля)
+function Get-LapsADPassword { [CmdletBinding()] param($Identity, [switch]$AsPlainText)
+    Log "LAPS $Identity"
+    if (-not (Cfg $global:Scn 'laps' $true)) { throw 'Windows LAPS: no password for this computer' }
+    return [pscustomobject]@{ Account = 'lapsadmin'; Password = "LapsPw-$Identity-9z" }
 }
 function Remove-PSSession { [CmdletBinding()] param($Session) Log "Remove-PSSession $($Session.ComputerName)" }
 
@@ -89,7 +101,7 @@ function Invoke-Command { [CmdletBinding()] param($Session, [scriptblock]$Script
         $items = @([pscustomobject]@{ Kind = 'tail'; Text = [string](Cfg $h 'tail' '') })
     }
     else {
-        Log ("RUN $addr action=$act mode=$($p.RunMode) cleanup=$($p.Cleanup) proxy=$($p.Proxy) args=" + (($p.Args.Keys | Sort-Object | ForEach-Object { "$_=$($p.Args[$_])" }) -join ' '))
+        Log ("RUN $addr action=$act mode=$($p.RunMode) cleanup=$($p.Cleanup) proxy=$($p.Proxy) args=" + (($p.Args.Keys | Sort-Object | ForEach-Object { "$_=$(if ($p.Args[$_] -is [Security.SecureString]) { SecureTag $p.Args[$_] } else { $p.Args[$_] })" }) -join ' ') + " taskpw=$(if ($p.TaskPassword -is [Security.SecureString]) { SecureTag $p.TaskPassword } elseif ($p.TaskPassword) { 'PLAIN' } else { '' }) taskuser=$($p.TaskUser)")
         if ((Cfg $global:Scn 'exec' '') -eq 'local') {
             # Настоящий удалённый блок на «диске ПК»: своя копия каталога раздачи на каждый адрес, политика выполнения как на чистом ПК.
             $q = @{}; foreach ($k in $p.Keys) { $q[$k] = $p[$k] }
@@ -147,6 +159,8 @@ function Start-ScheduledTask { [CmdletBinding()] param($TaskPath, $TaskName)
 }
 function Get-ScheduledTask { [CmdletBinding()] param($TaskPath, $TaskName)
     $t = $global:Tasks["$TaskPath$TaskName"]
+    # STUB_TASK_RUNNING: задача прошлого запуска (другого процесса) ещё идёт на ПК
+    if (-not $t -and $env:STUB_TASK_RUNNING) { return [pscustomobject]@{ TaskName = $TaskName; State = 'Running' } }
     if (-not $t) { throw "no task $TaskName" }
     return [pscustomobject]@{ TaskName = $TaskName; State = $(if ($t.Proc -and -not $t.Proc.HasExited) { 'Running' } else { 'Ready' }) }
 }
@@ -161,7 +175,7 @@ function Unregister-ScheduledTask { [CmdletBinding()] param($TaskPath, $TaskName
 # Права на «ПК класса» (точки подмены node\secure-dir.ps1). Без прав администратора владельца Administrators не поставить и
 # Users-только-чтение не дало бы тесту писать: SD каталога в журнал — как запрошен, на диск — без владельца и с этой учётной записью.
 # aclfail в сценарии узла: отложить недоверенный каталог не удаётся.
-function New-SdDirSecurity([switch]$NoUsers, [switch]$NoOwner) {
+function New-SdDirSecurity([switch]$NoUsers, [switch]$NoOwner, [string[]]$ExtraSids = @()) {
     Log "DirSec owner=$(if ($NoOwner) { 'keep' } else { 'S-1-5-32-544' }) protected=True ids=S-1-5-18:FullControl,S-1-5-32-544:FullControl$(if (-not $NoUsers) { ',S-1-5-32-545:ReadAndExecute' })"
     $sec = New-Object Security.AccessControl.DirectorySecurity
     $sec.SetAccessRuleProtection($true, $false)

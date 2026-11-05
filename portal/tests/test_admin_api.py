@@ -6,15 +6,14 @@ import pytest_asyncio
 from pydantic import SecretStr
 from sqlalchemy import delete
 
-from app.litellm_client import Activity, DayUsage
-from app.models import ApiKeyRef, ModelDeployment, NodeAssignment, PortalFlag, StandaloneNode, User
+from app.models import ModelDeployment, NodeAssignment, PortalFlag, StandaloneNode
 from tests.fakes.k8s import FakeK8s
 from tests.fakes.litellm import FakeLiteLLM
 from tests.helpers.auth import csrf_headers, login
 
 pytestmark = pytest.mark.docker
 
-ADMIN = {"sub": "adm", "email": "admin@g.nsu.ru", "name": "Админ"}
+ADMIN = {"sub": "adm", "email": "admin@g.nsu.ru", "email_verified": True, "name": "Админ"}
 USER = {"sub": "usr", "email": "ivan@g.nsu.ru", "name": "Иван Иванов"}
 MiB = 2**20
 GiB = 2**30
@@ -122,8 +121,17 @@ async def test_nodes_merges_k8s_standalone_assignment_and_capacity(client, app):
         "version": "v1.36.5+k3s1",
         "is_main": False,
         "maintenance": False,
+        "models_bytes": None,
         "wakeable": False,
         "wake": None,
+        # approval is off in the tests' settings: a cluster node without an identity counts as approved (task SEC-1)
+        "approved": True,
+        "has_key": False,
+        "claim_ip": None,
+        "legacy": False,
+        "claims": [],
+        "known_addresses": [],
+        "claims_refused": 0,
     }
     assert nodes["gpu01"]["capacity_bytes"] == 12288 * MiB - 1536 * MiB
     assert nodes["gpu01"]["deployment"] is None and nodes["gpu01"]["backends"] == 0
@@ -193,67 +201,6 @@ async def test_join_never_shows_the_server_token(client, app):
     assert r.status_code == 503
     assert r.json()["detail"] == "Токен подключения нод не создан: перезапустите главный сервер"
     assert "tok-test" not in r.text
-
-
-async def _add_user(app, email, name, keys=0, playground=0) -> User:
-    async with app.state.sessionmaker() as db:
-        user = User(sub=f"sub-{email}", email=email, full_name=name, role="user")
-        db.add(user)
-        await db.flush()
-        for i in range(keys):
-            db.add(ApiKeyRef(user_id=user.id, litellm_token=f"{email}-{i}", alias=f"k{i}", masked="sk-…abcd"))
-        for i in range(playground):
-            db.add(
-                ApiKeyRef(
-                    user_id=user.id,
-                    litellm_token=f"{email}-pg{i}",
-                    alias=f"__pg{i}",
-                    masked="sk-…pg",
-                    is_playground=True,
-                )
-            )
-        await db.commit()
-        return user
-
-
-async def test_users_lists_counts_and_handles_litellm_down(client, app):
-    busy = await _add_user(app, "busy@g.nsu.ru", "Занятой", keys=2, playground=1)
-    await _add_user(app, "idle@g.nsu.ru", "Тихий", keys=0)
-    today = datetime.now(UTC).date()
-    app.state.litellm.activity[str(busy.id)] = Activity(
-        prompt_tokens=10,
-        completion_tokens=5,
-        requests=3,
-        by_day=[DayUsage(today, 12, 2), DayUsage(today - timedelta(days=1), 3, 1)],
-    )
-
-    h = await as_admin(client, app)
-    r = await client.get("/api/admin/users", headers=h)
-    assert r.status_code == 200, r.text
-    users = {u["email"]: u for u in r.json()}
-    assert set(users) == {"admin@g.nsu.ru", "busy@g.nsu.ru", "idle@g.nsu.ru"}
-    assert users["admin@g.nsu.ru"]["role"] == "admin"
-    assert users["busy@g.nsu.ru"]["keys"] == 2  # the playground key is not counted
-    assert users["busy@g.nsu.ru"]["tokens_30d"] == 15
-    assert users["busy@g.nsu.ru"]["full_name"] == "Занятой"
-    assert users["idle@g.nsu.ru"]["keys"] == 0 and users["idle@g.nsu.ru"]["tokens_30d"] == 0
-    assert set(users["busy@g.nsu.ru"]) == {
-        "id",
-        "email",
-        "full_name",
-        "role",
-        "created_at",
-        "last_login_at",
-        "keys",
-        "tokens_30d",
-    }
-
-    app.state.litellm.unavailable = True
-    r = await client.get("/api/admin/users", headers=h)
-    assert r.status_code == 200
-    down = {u["email"]: u for u in r.json()}
-    assert down["busy@g.nsu.ru"]["keys"] == 2
-    assert all(u["tokens_30d"] is None for u in down.values())
 
 
 async def test_logs_only_for_owned_pods_and_line_bounds(client, app):

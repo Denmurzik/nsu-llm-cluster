@@ -16,7 +16,6 @@ async def test_migrations_create_tables(db_session):
     assert {
         "users",
         "web_sessions",
-        "oauth_states",
         "api_keys",
         "model_deployments",
         "node_assignments",
@@ -27,6 +26,8 @@ async def test_migrations_create_tables(db_session):
         "metric_samples",
         "alembic_version",
     } <= names
+    # the OAuth state of a login in progress lives in Redis: an anonymous /auth/login writes no row (finding L2)
+    assert "oauth_states" not in names
 
 
 async def test_assignment_fk_set_null_on_deployment_delete(db_session):

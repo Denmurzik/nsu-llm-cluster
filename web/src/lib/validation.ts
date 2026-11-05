@@ -33,6 +33,8 @@ const FIELD: Record<string, string> = {
   days: "число дней",
   lines: "число строк",
   deployment_id: "развёртывание",
+  files: "файлы",
+  revision: "версия",
 };
 
 function fieldName(loc: ValidationItem["loc"]): string {

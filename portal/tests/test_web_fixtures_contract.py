@@ -20,6 +20,7 @@ from app.models import ControllerTimer, ModelDeployment, NodeAssignment, NodeWak
 from tests.fakes.hf import FakeHf
 from tests.fakes.k8s import FakeK8s
 from tests.fakes.litellm import FakeLiteLLM
+from tests.fakes.mirror_admin import FakeMirrorAdmin, cached_file
 from tests.fakes.progress import FakeProgress
 from tests.helpers.auth import csrf_headers, login
 
@@ -29,11 +30,14 @@ FIXTURES = Path(__file__).resolve().parents[2] / "web" / "src" / "mocks" / "fixt
 GiB = 2**30
 REPO, FILE = "org/model-GGUF", "model-Q4_K_M.gguf"
 META = GgufMeta("gemma4", 42, 8, 2, 256, 2560, 131072)
-ADMIN = {"sub": "adm", "email": "admin@g.nsu.ru", "name": "Админ"}
+ADMIN = {"sub": "adm", "email": "admin@g.nsu.ru", "email_verified": True, "name": "Админ"}
 USER = {"sub": "usr", "email": "ivan@g.nsu.ru", "name": "Иван Иванов"}
 
 # fixture file -> {json path: reason}; the portal side is the contract, these are for the UI to follow
-KNOWN_UI_MISMATCHES: dict[str, dict[str, str]] = {}
+KNOWN_UI_MISMATCHES: dict[str, dict[str, str]] = {
+    # one list holds int, float and bool settings, so `value` and `default` have no single type
+    "get__api_admin_settings": {"$[].value": "mixed types", "$[].default": "mixed types"},
+}
 
 
 @pytest.fixture(autouse=True)
@@ -42,6 +46,23 @@ def _disk_reserve(monkeypatch):
     from app.localmodels.store import DISK_RESERVE, LocalStore
 
     monkeypatch.setattr(LocalStore, "reserve_bytes", lambda self: DISK_RESERVE)
+
+
+@pytest.fixture(autouse=True)
+def _registry_of_main():
+    """The image registry of main (task 2-30) answers from a fake: /api/admin/versions lists its tags."""
+    import httpx
+
+    from app.nodes import versions
+    from tests.test_node_versions import D1, D2, FakeRegistry
+
+    fake = FakeRegistry()
+    fake.tags = {"0.1.0-cpu": D1, "0.1.0-gpu": D2}
+    versions.REGISTRY.reset()
+    versions.REGISTRY.transport = httpx.MockTransport(fake)
+    yield
+    versions.REGISTRY.reset()
+    versions.REGISTRY.transport = None
 
 
 @pytest.fixture
@@ -173,12 +194,58 @@ async def _local_models(client, app, h) -> None:
     assert r.status_code == 201, r.text
 
 
+async def _mirror(app) -> None:
+    """The cache of the mirror: a file of the seeded deployment, a sharded model nobody uses, a download in progress and
+    the background downloads (queued, one asked twice is one job)."""
+    mirror = app.state.mirror_admin = FakeMirrorAdmin([
+        cached_file(REPO, FILE, 4 * GiB),
+        cached_file("org/big-GGUF", "Q4_K_M/big-Q4_K_M-00001-of-00002.gguf", 40 * GiB),
+        cached_file("org/big-GGUF", "Q4_K_M/big-Q4_K_M-00002-of-00002.gguf", 20 * GiB, busy=True),
+        cached_file("org/new-GGUF", "new-Q8_0.gguf", 3 * GiB, total=8 * GiB, partial=True, downloading=True, written=3 * GiB,
+                    mtime=None, last_served=None),
+    ])
+    await mirror.prefetch_add("org/new-GGUF", None, ["new-Q8_0.gguf", "mmproj-F16.gguf"])
+    mirror.jobs[0].update(state="running", size=8 * GiB, written=3 * GiB, speed_bps=50.0 * 2**20, started=1.0)
+
+
 async def _key(client, app, h) -> None:
     r = await client.post("/api/keys", json={"alias": "курсовая", "expires_days": 30}, headers=h)
     assert r.status_code == 201, r.text
     app.state.litellm.activity[next(iter(app.state.litellm.users))] = Activity(
         prompt_tokens=1, completion_tokens=1, requests=1, by_day=[DayUsage(date.today(), 2, 1)]
     )
+
+
+async def _metrics(client, app) -> None:
+    """Monitoring: a pushed node sample, a model sample of the controller and the minute rows of a node and of a deployment."""
+    from datetime import UTC, datetime, timedelta
+
+    from app.controllers.metrics import model_data
+    from app.metrics import live
+    from app.metrics.gateway_models import ModelMinute
+    from app.metrics.schemas import NodeMetricsIn
+    from app.metrics.scrape import Scrape
+    from app.models import MetricSample
+
+    now = datetime.now(UTC)
+    gpu = {"util_pct": 40, "vram_used_mib": 6000, "vram_total_mib": 12282, "temp_c": 61, "power_w": 120.5}
+    node = NodeMetricsIn.model_validate(
+        {"gpus": [gpu], "ram_used_mib": 8000, "ram_total_mib": 16000, "cpu_pct": 12.5, "models_bytes": 5, "disk_free_bytes": 9}
+    ).sample(now)
+    cpu_node = NodeMetricsIn.model_validate({"ram_used_mib": 1, "ram_total_mib": 2, "cpu_pct": 3}).sample(now)
+    await live.put(app.state.redis, live.NODE_KEY, "gpu01", node, live.NODE_LIVE_TTL_S)
+    await live.put(app.state.redis, live.NODE_KEY, "pc01", cpu_node, live.NODE_LIVE_TTL_S)
+    minute = ModelMinute(requests=4, e429=1, e5xx=1)
+    minute.ttft[2] = 3
+    model = model_data(Scrape(backends=2, up=2, tok_s_gen=40.0, tok_s_prompt=500.0, slots_busy=1, queue=0), minute, True)
+    await live.put(app.state.redis, live.MODEL_KEY, "m1", {"at": now.isoformat(), **model}, live.MODEL_LIVE_TTL_S)
+    node_row = {k: v for k, v in node.items() if k != "at"}
+    async with app.state.sessionmaker() as db:
+        for i in range(3):
+            at = now - timedelta(minutes=3 - i)
+            db.add(MetricSample(at=at, kind="node", name="gpu01", data=node_row))
+            db.add(MetricSample(at=at, kind="model", name="m1", data=model))
+        await db.commit()
 
 
 def _cases():
@@ -208,9 +275,19 @@ def _cases():
         "get__api_admin_nodes": ("admin", "GET /api/admin/nodes"),
         "get__api_admin_join": ("admin", "GET /api/admin/join"),
         "get__api_admin_status": ("admin", "GET /api/admin/status"),
+        "get__api_admin_versions": ("admin", "GET /api/admin/versions"),
         "get__api_admin_users": ("admin", "GET /api/admin/users"),
+        "get__api_admin_settings": ("admin", "GET /api/admin/settings"),
+        "get__api_admin_users_id_keys": ("admin", "GET /api/admin/users/{uid}/keys"),
+        "get__api_admin_audit": ("admin", "GET /api/admin/audit"),
         "get__api_admin_pods_name_logs": ("admin", "GET /api/admin/pods/llm-m1-cpu-abc/logs"),
         "get__api_admin_local_models": ("admin", "GET /api/admin/local-models"),
+        "get__api_admin_cache": ("admin", "GET /api/admin/cache"),
+        "get__api_admin_prefetch": ("admin", "GET /api/admin/prefetch"),
+        "get__api_admin_metrics_live": ("admin", "GET /api/admin/metrics/live"),
+        "get__api_admin_metrics_names": ("admin", "GET /api/admin/metrics/names"),
+        "get__api_admin_metrics_history": ("admin", "GET /api/admin/metrics/history?kind=node&name=gpu01"),
+        "get__api_admin_metrics_history--model": ("admin", "GET /api/admin/metrics/history?kind=model&name=m1"),
     }
 
 
@@ -242,10 +319,16 @@ async def test_fixture_matches_portal_response(name, client, app):
         async with app.state.sessionmaker() as db:
             db.add(ModelDeployment(name="m1", repo=REPO, file=FILE, ctx_per_request=8192, parallel=2, auto_assign=False))
             await db.commit()
-    if name in ("get__api_keys", "get__api_usage"):
+    if name in ("get__api_keys", "get__api_usage", "get__api_admin_users_id_keys"):
         await _key(client, app, h)
+    if "{uid}" in url:  # the keys of the admin who is logged in
+        url = url.replace("{uid}", (await client.get("/api/me")).json()["id"])
     if name == "get__api_admin_local_models":
         await _local_models(client, app, h)
+    if name in ("get__api_admin_cache", "get__api_admin_prefetch"):
+        await _mirror(app)
+    if name.startswith("get__api_admin_metrics"):
+        await _metrics(client, app)
 
     if method == "POST":
         response = await client.post(url, json={"alias": "диплом", "expires_days": 90}, headers=h)

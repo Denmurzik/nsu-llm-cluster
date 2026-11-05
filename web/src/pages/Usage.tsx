@@ -1,23 +1,16 @@
 import { useState } from "react";
 import { api } from "../api";
+import { UsageChart } from "../components/UsageChart";
+import { UsageOwner } from "../components/UsageOwner";
 import { ErrorNotice, Loading, PageHead } from "../components/ui";
-import { fmtDay, fmtInt } from "../lib/format";
+import { fmtInt } from "../lib/format";
 import { useResource } from "../lib/useResource";
-import type { Usage as UsageData } from "../types";
 
 const PERIODS = [
   { days: 1, label: "День" },
   { days: 7, label: "7 дней" },
   { days: 30, label: "30 дней" },
 ];
-
-/** Round the top of the axis to 1, 2 or 5 times a power of ten. */
-function niceMax(v: number): number {
-  if (v <= 0) return 1;
-  const pow = 10 ** Math.floor(Math.log10(v));
-  const n = v / pow;
-  return (n <= 1 ? 1 : n <= 2 ? 2 : n <= 5 ? 5 : 10) * pow;
-}
 
 export function Usage() {
   const [days, setDays] = useState(7);
@@ -46,6 +39,7 @@ export function Usage() {
           </div>
         }
       />
+      <UsageOwner />
       <ErrorNotice error={usage.error} />
       {usage.loading && !data && <Loading />}
       {data && (
@@ -69,54 +63,11 @@ export function Usage() {
             {data.by_day.length === 0 || data.requests === 0 ? (
               <p className="muted">За выбранный период запросов не было</p>
             ) : (
-              <Chart data={data} />
+              <UsageChart days={data.by_day} />
             )}
           </section>
         </>
       )}
-    </div>
-  );
-}
-
-function Chart({ data }: { data: UsageData }) {
-  const max = niceMax(Math.max(...data.by_day.map((d) => d.tokens)));
-  const ticks = [1, 0.75, 0.5, 0.25];
-  const every = Math.ceil(data.by_day.length / 10);
-  const last = data.by_day.length - 1;
-  return (
-    <div className="card">
-      <div className="chart">
-        <div className="yaxis" aria-hidden="true">
-          {ticks.map((t) => (
-            <span key={t} style={{ bottom: `${t * 100}%` }}>
-              {fmtInt(Math.round(max * t))}
-            </span>
-          ))}
-        </div>
-        <div
-          className="plot"
-          role="img"
-          aria-label={`Токены по дням, всего ${fmtInt(data.by_day.reduce((s, d) => s + d.tokens, 0))}`}
-        >
-          {ticks.map((t) => (
-            <i key={t} className="gridline" style={{ bottom: `${t * 100}%` }} />
-          ))}
-          {data.by_day.map((d, i) => (
-            <div
-              key={d.day}
-              data-testid="bar"
-              className={`bar${i === last ? " current" : ""}`}
-              style={{ ["--h" as string]: `${(d.tokens / max) * 100}%` }}
-              title={`${fmtDay(d.day)}: ${fmtInt(d.tokens)} токенов, ${fmtInt(d.requests)} запросов`}
-            />
-          ))}
-        </div>
-        <div className="xaxis" aria-hidden="true">
-          {data.by_day.map((d, i) => (
-            <span key={d.day}>{i % every === 0 || i === last ? fmtDay(d.day) : ""}</span>
-          ))}
-        </div>
-      </div>
     </div>
   );
 }

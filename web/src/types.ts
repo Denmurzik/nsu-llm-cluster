@@ -15,6 +15,8 @@ export type DeployMode = "replicas" | "split";
 export type Accel = "any" | "cpu" | "nvidia";
 
 export interface PublicStatus {
+  /** how the login button names the OIDC provider (LOGIN_PROVIDER_NAME) */
+  login_provider: string;
   models: { name: string; status: ModelStatus; ready_backends: number | null }[];
 }
 
@@ -284,9 +286,69 @@ export interface NodeInfo {
   version: string | null;
   is_main: boolean;
   maintenance: boolean;
+  /** bytes the models volume of the node holds (files of models and the tensor cache); null: not reported yet */
+  models_bytes?: number | null;
   /** the node reported its network card: the «Разбудить» button works */
   wakeable: boolean;
   wake: WakeState | null;
+  /** false: a new node waits for the admin's «Подтвердить» (no deployment, no keys); absent from an older portal: approved */
+  approved?: boolean;
+  /** the node has its own key (it registered with this portal) */
+  has_key?: boolean;
+  /** the address the node last called the portal from: what the admin compares before approving */
+  claim_ip?: string | null;
+  /** a node of before without its own key (an old image): it works from its old address until the migration window ends */
+  legacy?: boolean;
+  /** registrations of this name without its key, for the admin to pick one or reject (never approved in bulk) */
+  claims?: NodeClaim[];
+  /** every address the portal knows for the name: what a claim's address is compared with */
+  known_addresses?: string[];
+  /** registrations refused because too many claims waited (audit node.claim_refused) */
+  claims_refused?: number;
+}
+
+export interface NodeClaim {
+  id: number;
+  ip: string | null;
+  at: string;
+  /** the claim came from an address the portal knows for the name */
+  known: boolean;
+}
+
+/** a waiting new node: approved by «Подтвердить», also in bulk */
+export const waitsForApproval = (n: Pick<NodeInfo, "approved" | "claims">) => n.approved === false && !n.claims?.length;
+/** someone else registered a known name: the admin picks one claim in the row, never in bulk */
+export const hasClaims = (n: Pick<NodeInfo, "claims">) => (n.claims?.length ?? 0) > 0;
+
+/** answer of «Очистить модели»: `pending` when the node has not finished within the wait */
+export interface PurgeResult {
+  node: string;
+  status: "done" | "pending";
+  freed_bytes: number | null;
+  /** what the volume holds after the cleanup */
+  models_bytes: number | null;
+  removed: string[];
+  /** entries left alone because something wrote to them a moment ago */
+  skipped: string[];
+}
+
+/** answer of «Удалить из кластера…» */
+export interface NodeDeleteResult {
+  node: string;
+  /** the PC still answers: its agent registers the node again unless it is uninstalled on the PC */
+  online: boolean;
+  /** the Kubernetes Node object: deleted, was not there, or the cluster did not answer */
+  k8s: "deleted" | "absent" | "unavailable";
+  /** the deployments the node was taken off */
+  unassigned: string[];
+  /** commands that uninstall the node on the PC itself (no token in them) */
+  uninstall: { windows: string; linux: string };
+}
+
+/** one deployment of the 409 answer of a refused removal */
+export interface BusyDeployment {
+  name: string;
+  mode: "replicas" | "split";
 }
 
 /** Wake-on-LAN attempts of the controller while the node is down */
@@ -466,6 +528,12 @@ export interface SystemSetting {
   default: number | boolean;
   /** a value changed in the panel is stored */
   overridden: boolean;
+  /** db: the value of the panel, env: the default of the .env */
+  source: "db" | "env";
+  /** the section of the page (Russian) */
+  group: string;
+  /** a restart-only setting whose value is not what the running component uses yet */
+  pending_restart: boolean;
   min: number | null;
   max: number | null;
   /** Russian */
@@ -491,3 +559,241 @@ export interface AdminUserOps {
 
 /** The user row of the admin panel once the users API returns the migration 0009 fields */
 export type AdminUserFull = AdminUser & AdminUserOps;
+
+/* ---------- «Резервные копии» and the admin «Использование» (task 2-35) ---------- */
+
+export interface BackupFile {
+  /** the name the download takes */
+  name: string;
+  db: string;
+  size_bytes: number;
+  /** from a `<file>.sha256` beside the dump, when there is one */
+  sha256: string | null;
+}
+
+export interface BackupEntry {
+  /** the name the delete takes: a set time (`20261103T211700Z`) or `pre-restore-<time>` */
+  name: string;
+  /** a set of the daily backup, or the safety copy pg-restore.sh makes before it replaces the databases */
+  kind: "set" | "pre-restore";
+  at: string;
+  size_bytes: number;
+  /** a dump of every database is there */
+  complete: boolean;
+  /** the exact pg-restore.sh call, only for a complete set */
+  restore_command: string | null;
+  files: BackupFile[];
+}
+
+export interface BackupJob {
+  name: string;
+  state: "running" | "succeeded" | "failed";
+  manual: boolean;
+  started_at: string | null;
+  finished_at: string | null;
+}
+
+export interface BackupsData {
+  /** the backup folder can be read */
+  available: boolean;
+  items: BackupEntry[];
+  disk: { free_bytes: number; total_bytes: number } | null;
+  schedule: { cron: string; timezone: string; suspended: boolean; last_schedule_at: string | null } | null;
+  retention_keep: number | null;
+  /** null: Kubernetes could not be asked */
+  running: boolean | null;
+  last_run: BackupJob | null;
+}
+
+export type UsageGroup = "user" | "model" | "day";
+
+export interface UsageSum {
+  prompt_tokens: number;
+  completion_tokens: number;
+  tokens: number;
+  requests: number;
+}
+
+export interface UsageItem extends UsageSum {
+  key: string;
+  label: string;
+  /** users only */
+  email?: string;
+}
+
+export interface AdminUsage {
+  from: string;
+  to: string;
+  group: UsageGroup;
+  totals: UsageSum;
+  top_users: UsageItem[];
+  top_models: UsageItem[];
+  by_day: (UsageItem & { day: string })[];
+  items: UsageItem[];
+}
+
+/** Task 2-29: the cache of the Hugging Face mirror on main («Кэш моделей») */
+export interface CacheUser {
+  id: number;
+  name: string;
+  enabled: boolean;
+}
+
+export interface CacheFile {
+  repo: string;
+  path: string;
+  /** the commit the file came from */
+  revision: string | null;
+  /** bytes on the disk now (a download in progress: what is written) */
+  size: number;
+  /** the size of the whole file when known */
+  total: number | null;
+  /** seconds since the epoch; null while the file is not complete */
+  mtime: number | null;
+  last_served: number | null;
+  downloading: boolean;
+  /** not complete: being downloaded, or left by a download that died */
+  partial: boolean;
+  /** being sent to a node right now */
+  busy: boolean;
+  written?: number;
+  used_by: CacheUser[];
+}
+
+export interface ModelCache {
+  files: CacheFile[];
+  used_bytes: number;
+  limit_bytes: number;
+  disk_total_bytes: number;
+  disk_free_bytes: number;
+  disk_reserve_bytes: number;
+}
+
+export type PrefetchState = "queued" | "running" | "done" | "failed" | "cancelled";
+
+export interface PrefetchJob {
+  id: string;
+  repo: string;
+  revision: string;
+  path: string;
+  state: PrefetchState;
+  size: number | null;
+  written: number;
+  speed_bps: number;
+  error: string | null;
+  /** it was in the cache already: nothing was downloaded */
+  cached: boolean;
+  created: number;
+  started: number | null;
+  finished: number | null;
+}
+
+export interface PrefetchList {
+  jobs: PrefetchJob[];
+  concurrency: number;
+}
+
+export interface CacheDeleted {
+  deleted: { repo: string; path: string; size: number }[];
+  freed_bytes: number;
+}
+
+// -- task 2-33: monitoring ------------------------------------------------------------------------------------
+
+/** The latest sample a node pushed (every ~20 s); a field the node could not read is null */
+export interface LiveNode {
+  name: string;
+  at: string | null;
+  age_s: number | null;
+  gpu_count: number;
+  /** mean utilisation of the node's GPUs, % */
+  gpu_util: number | null;
+  vram_used_mib: number | null;
+  vram_total_mib: number | null;
+  /** hottest GPU, °C */
+  gpu_temp_c: number | null;
+  power_w: number | null;
+  ram_used_mib: number;
+  ram_total_mib: number;
+  cpu_pct: number;
+  models_bytes: number | null;
+  disk_free_bytes: number | null;
+  llama_up: boolean;
+  rpc_up: boolean;
+}
+
+/** The last minute of one deployment: the scrape of its llama-server backends and the gateway traffic */
+export interface LiveModel {
+  name: string;
+  at: string | null;
+  age_s: number | null;
+  backends: number;
+  backends_up: number;
+  tok_s_gen: number | null;
+  tok_s_prompt: number | null;
+  slots_busy: number | null;
+  queue: number | null;
+  rpm: number | null;
+  e429: number | null;
+  e5xx: number | null;
+  ttft_p50_ms: number | null;
+  ttft_p95_ms: number | null;
+}
+
+export interface MetricsLive {
+  at: string;
+  /** false when the live store (Redis) could not be read */
+  available: boolean;
+  nodes: LiveNode[];
+  models: LiveModel[];
+}
+
+export interface MetricsNames {
+  node: string[];
+  model: string[];
+}
+
+/** One point of the history: the time and the fields of the row (averages; the worst minute for errors, queue and temperature) */
+export type MetricPoint = { t: string } & Partial<Omit<LiveNode, "name" | "at" | "age_s">> &
+  Partial<Omit<LiveModel, "name" | "at" | "age_s">>;
+
+export interface MetricsHistory {
+  kind: "node" | "model";
+  name: string;
+  from: string;
+  to: string;
+  /** seconds per point */
+  step: number;
+  points: MetricPoint[];
+}
+
+/** The background job «Применить к существующим ключам» (portal: app/key_limits.py) */
+export interface KeyLimitsJob {
+  state: "none" | "running" | "done" | "failed";
+  total?: number | null;
+  done?: number;
+  failed?: number;
+  rpm_limit?: number | null;
+  tpm_limit?: number | null;
+  started_at?: string | null;
+  finished_at?: string | null;
+  error?: string | null;
+}
+
+/** `GET /api/admin/users`: one page of the table and the number of users that match the filters */
+export interface UsersPage {
+  items: AdminUserFull[];
+  total: number;
+}
+
+/** `PATCH /api/admin/users/{id}`: only the fields that are sent change; null of a limit means «общий лимит» */
+export interface UserPatch {
+  role?: Role;
+  /** «auto»: the role follows ADMIN_EMAILS again */
+  role_source?: "auto";
+  blocked?: boolean;
+  blocked_reason?: string | null;
+  rpm_limit?: number | null;
+  tpm_limit?: number | null;
+  max_keys?: number | null;
+}

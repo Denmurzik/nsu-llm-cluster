@@ -186,6 +186,7 @@ describe("role based navigation", () => {
     expect(within(nav).getByRole("link", { name: "Развёртывания" })).toHaveAttribute("href", "/admin/deployments");
     expect(within(nav).getByRole("link", { name: "Ноды" })).toHaveAttribute("href", "/admin/nodes");
     expect(within(nav).getByRole("link", { name: "Пользователи" })).toHaveAttribute("href", "/admin/users");
+    expect(within(nav).getByRole("link", { name: "Журнал" })).toHaveAttribute("href", "/admin/audit");
   });
 
   it("refuses admin pages for a regular user", async () => {

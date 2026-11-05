@@ -1,3 +1,4 @@
+import json
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock
 from urllib.parse import parse_qs, urlparse
@@ -14,16 +15,20 @@ from sqlalchemy import func, select, update
 
 from app.auth.oidc import OidcClient, OidcError
 from app.auth.sessions import create_session, current_user, delete_session, load_session, require_admin, require_csrf
-from app.models import OAuthState, User, WebSession
+from app.models import User, WebSession
 from tests.helpers.auth import authorize, csrf_headers, install_fake_oidc, login
 
 pytestmark = pytest.mark.docker
 
-ERROR_TEXT = "Не удалось войти через NSU ID"
+ERROR_TEXT = "Не удалось войти"
 
 
 async def count(db, model) -> int:
     return (await db.execute(select(func.count()).select_from(model))).scalar_one()
+
+
+async def oauth_keys(app) -> list[str]:
+    return [k async for k in app.state.redis.scan_iter("oauth:state:*")]
 
 
 async def start_login(client, app, **params):
@@ -45,13 +50,43 @@ async def test_login_redirects_to_provider_with_pkce(client, app):
     url = urlparse(r.headers["location"])
     assert url.path.endswith("/authorize")
     q = {k: v[0] for k, v in parse_qs(url.query).items()}
-    assert q["client_id"] == "double.fresh.nsuts.ru"
+    assert q["client_id"] == "nsu-llm-test"
     assert q["response_type"] == "code"
     assert q["response_mode"] == "query"
     assert q["scope"] == "openid profile email"
     assert q["redirect_uri"] == "https://double.fresh.nsuts.ru/auth/callback"
     assert q["code_challenge_method"] == "S256"
     assert q["code_challenge"] and q["state"] and q["nonce"]
+
+
+async def test_login_without_a_configured_provider_says_what_is_missing(client, app):
+    install_fake_oidc(app)
+    for field, name in (("oidc_issuer", "OIDC_ISSUER"), ("oidc_client_id", "OIDC_CLIENT_ID")):
+        saved = getattr(app.state.settings, field)
+        setattr(app.state.settings, field, "")
+        try:
+            r = await client.get("/auth/login")
+        finally:
+            setattr(app.state.settings, field, saved)
+        assert r.status_code == 503
+        assert "Вход не настроен" in r.text and name in r.text
+        assert "location" not in r.headers
+        assert "nsu.ru" not in r.text
+
+
+def test_the_provider_has_no_default():
+    from app.config import Settings
+
+    s = Settings()
+    assert s.oidc_issuer == "" and s.oidc_client_id == "" and "nsu" not in s.login_provider_name.lower()
+    assert s.login_provider_name == "SSO"
+
+
+async def test_public_status_names_the_login_provider(client, app):
+    app.state.settings.login_provider_name = "NSU ID"
+    assert (await client.get("/api/public/status")).json()["login_provider"] == "NSU ID"
+    app.state.settings.login_provider_name = "  "
+    assert (await client.get("/api/public/status")).json()["login_provider"] == "SSO"
 
 
 async def test_full_flow_creates_user_session_and_cookie(client, app, db_session):
@@ -69,7 +104,7 @@ async def test_full_flow_creates_user_session_and_cookie(client, app, db_session
 
     assert await count(db_session, User) == 1
     assert await count(db_session, WebSession) == 1
-    assert await count(db_session, OAuthState) == 0
+    assert await oauth_keys(app) == []  # the state was used up
     user = (await db_session.execute(select(User))).scalar_one()
     assert user.sub == "fake-user-1"
     assert user.email == "user@g.nsu.ru"
@@ -113,11 +148,12 @@ async def test_ensure_user_failure_is_not_fatal(client, app):
 
 async def test_admin_role_from_admin_emails(client, app):
     app.state.litellm = AsyncMock()
-    me = await login(client, app, claims={"sub": "adm-1", "email": "ADMIN@g.nsu.ru", "preferred_username": "adm"})
+    claims = {"sub": "adm-1", "email": "ADMIN@g.nsu.ru", "preferred_username": "adm", "email_verified": True}
+    me = await login(client, app, claims=claims)
     assert me["role"] == "admin"
 
 
-ADMIN_CLAIMS = {"sub": "adm-1", "email": "admin@g.nsu.ru", "preferred_username": "adm"}
+ADMIN_CLAIMS = {"sub": "adm-1", "email": "admin@g.nsu.ru", "preferred_username": "adm", "email_verified": True}
 
 
 async def test_admin_role_needs_a_verified_email_when_the_claim_says_so(client, app):
@@ -128,7 +164,13 @@ async def test_admin_role_needs_a_verified_email_when_the_claim_says_so(client, 
     me = await login(client, app, claims={**ADMIN_CLAIMS, "email_verified": True})
     assert me["role"] == "admin"
     client.cookies.clear()
-    me = await login(client, app, claims=ADMIN_CLAIMS)  # no claim at all: the login keeps working
+    client.cookies.clear()
+    # no claim at all (finding H2: Entra multi-tenant and small IdPs let anyone set the address): logged in, as a user
+    me = await login(client, app, claims={k: v for k, v in ADMIN_CLAIMS.items() if k != "email_verified"})
+    assert me["role"] == "user"
+    assert (await client.get("/api/me")).json()["role"] == "user"
+    client.cookies.clear()
+    me = await login(client, app, claims={**ADMIN_CLAIMS, "email_verified": "true"})  # some providers send a string
     assert me["role"] == "admin"
 
 
@@ -151,10 +193,8 @@ async def test_role_follows_the_current_admin_list_not_the_one_at_login(client, 
     db_session.expire_all()
     assert (await db_session.scalar(select(User))).role == "user"  # persisted, not only masked
 
-    app.state.settings.admin_emails = "admin@g.nsu.ru"  # listed again: a role comes back with the next login
-    assert (await client.post("/api/_test/admin2")).status_code == 403
-    client.cookies.clear()
-    assert (await login(client, app, claims=ADMIN_CLAIMS))["role"] == "admin"
+    app.state.settings.admin_emails = "admin@g.nsu.ru"  # listed again: the verified login still counts
+    assert (await client.post("/api/_test/admin2")).status_code == 200
 
 
 async def test_callback_rejects_unknown_state(client, app, db_session):
@@ -177,8 +217,9 @@ async def test_callback_rejects_replayed_state(client, app, db_session):
 async def test_callback_rejects_expired_state(client, app, db_session):
     r = await start_login(client, app)
     callback = await authorize(app, r)
-    await db_session.execute(update(OAuthState).values(created_at=datetime.now(UTC) - timedelta(minutes=11)))
-    await db_session.commit()
+    keys = await oauth_keys(app)
+    assert len(keys) == 1 and 0 < await app.state.redis.ttl(keys[0]) <= 600  # Redis forgets it after 10 minutes
+    await app.state.redis.delete(*keys)  # what the TTL does
     assert_login_failed(await client.get(callback))
     assert await count(db_session, WebSession) == 0
     assert await count(db_session, User) == 0
@@ -187,8 +228,9 @@ async def test_callback_rejects_expired_state(client, app, db_session):
 async def test_callback_rejects_nonce_mismatch(client, app, db_session):
     r = await start_login(client, app)
     callback = await authorize(app, r)
-    await db_session.execute(update(OAuthState).values(nonce="another-nonce"))
-    await db_session.commit()
+    (key,) = await oauth_keys(app)
+    flow = json.loads(await app.state.redis.get(key))
+    await app.state.redis.set(key, json.dumps({**flow, "nonce": "another-nonce"}))
     assert_login_failed(await client.get(callback))
     assert await count(db_session, WebSession) == 0
     assert await count(db_session, User) == 0
@@ -395,7 +437,7 @@ async def test_require_admin(client, app):
     r = await client.post("/api/_test/admin")
     assert r.status_code == 403
     assert r.json() == {"detail": "Недостаточно прав"}
-    await login(client, app, claims={"sub": "adm", "email": "admin@g.nsu.ru"})
+    await login(client, app, claims={"sub": "adm", "email": "admin@g.nsu.ru", "email_verified": True})
     assert (await client.post("/api/_test/admin")).json() == {"role": "admin"}
 
 

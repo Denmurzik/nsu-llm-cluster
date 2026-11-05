@@ -96,6 +96,13 @@ bash "$PATCH" --check-build "$TMP/missing" >/dev/null 2>&1 && fail "check-build 
 
 # --- Dockerfile wiring: both build stages ---
 grep -qx 'ARG LLAMA_TAG=b12033' "$DF" && pass "llama.cpp ref stays b12033" || fail "llama.cpp ref stays b12033"
+# SEC-2 M3: the tag is checked against its commit in both build stages, and every base image is pinned by digest
+grep -qx 'ARG LLAMA_COMMIT=785322d17f2d51e5185cf996a1f4e46d87640841' "$DF" && [ "$(grep -c 'rev-parse HEAD)" = "${LLAMA_COMMIT}" \]' "$DF")" = 2 ] \
+  && pass "llama.cpp clone verified against LLAMA_COMMIT in both build stages" || fail "llama.cpp clone verified against LLAMA_COMMIT"
+for f in "$DF" "$NODE/../main/Dockerfile"; do
+  unpinned="$(grep '^FROM ' "$f" | grep -v '@sha256:[0-9a-f]\{64\}' || true)"
+  [ -z "$unpinned" ] && pass "every FROM of $(basename "$(dirname "$f")")/Dockerfile is pinned by digest" || fail "unpinned FROM in $f: $unpinned"
+done
 for stage in build-cpu build-gpu; do
   body="$(awk -v s="$stage" '/^FROM /{on = ($NF == s)} on' "$DF")"
   [ -n "$body" ] || { fail "$stage: stage found"; continue; }
@@ -123,7 +130,7 @@ grep -q 'nvcr\.io/' "$DF" && fail "no nvcr.io image in the node Dockerfile" || p
 grep -qx 'ARG DEVICE_PLUGIN_TAG=v0.19.3' "$DF" && pass "device plugin pinned to v0.19.3" || fail "device plugin pinned to v0.19.3"
 grep -qx 'ARG DEVICE_PLUGIN_COMMIT=570e776d6813cb9f3e9c8c105cf8d79989db6650' "$DF" \
   && pass "device plugin tag checked against its commit" || fail "device plugin tag checked against its commit"
-has "$dp" '^FROM golang:[0-9.]*-bookworm AS device-plugin$' \
+has "$dp" '^FROM golang:[0-9.]*-bookworm@sha256:[0-9a-f]\{64\} AS device-plugin$' \
   && pass "device-plugin: Go on bookworm (glibc older than Ubuntu 24.04's)" || fail "device-plugin: Go on bookworm (glibc older than Ubuntu 24.04's)"
 has "$dp" 'git clone --depth 1 --branch "${DEVICE_PLUGIN_TAG}" https://github.com/NVIDIA/k8s-device-plugin /src' \
   && pass "device-plugin: sources of the pinned tag" || fail "device-plugin: sources of the pinned tag"
@@ -135,6 +142,31 @@ has "$dp" 'CGO_ENABLED=1' && pass "device-plugin: cgo (go-nvml)" || fail "device
 has "$gpu" '^COPY --from=device-plugin /out/nvidia-device-plugin /opt/llm/bin/nvidia-device-plugin$' \
   && pass "gpu image carries nvidia-device-plugin" || fail "gpu image carries nvidia-device-plugin"
 has "$cpu" 'device-plugin' && fail "cpu image has no device plugin" || pass "cpu image has no device plugin"
+
+# --- version and commit of the image (task 2-30): build arguments in the final stages, given last, label and environment ---
+MAIN_DF="$NODE/../main/Dockerfile"
+for stage in cpu gpu; do
+  body="$(awk -v s="$stage" '/^FROM /{on = ($NF == s)} on' "$DF")"
+  has "$body" '^ARG VERSION=dev$' && has "$body" '^ARG GIT_COMMIT=unknown$' \
+    && pass "$stage: ARG VERSION and GIT_COMMIT are declared in the stage" || fail "$stage: ARG VERSION and GIT_COMMIT are declared in the stage"
+  has "$body" '^LABEL org.opencontainers.image.version=$VERSION org.opencontainers.image.revision=$GIT_COMMIT$' \
+    && pass "$stage: version and revision labels" || fail "$stage: version and revision labels"
+  has "$body" '^ENV NODE_VERSION=$VERSION NODE_REVISION=$GIT_COMMIT$' \
+    && pass "$stage: NODE_VERSION and NODE_REVISION for the registrar" || fail "$stage: NODE_VERSION and NODE_REVISION for the registrar"
+  # the arguments come after the heavy layers, so another commit rebuilds nothing but the labels
+  [ "$(printf '%s\n' "$body" | grep -n '^ARG GIT_COMMIT' | cut -d: -f1)" -gt "$(printf '%s\n' "$body" | grep -n '^COPY rootfs/' | cut -d: -f1)" ] \
+    && pass "$stage: the build arguments follow the COPY layers" || fail "$stage: the build arguments follow the COPY layers"
+done
+main_body="$(cat "$MAIN_DF")"
+has "$main_body" '^ARG VERSION=dev$' && has "$main_body" '^ARG GIT_COMMIT=unknown$' \
+  && pass "main: ARG VERSION and GIT_COMMIT" || fail "main: ARG VERSION and GIT_COMMIT"
+has "$main_body" '^LABEL org.opencontainers.image.version=$VERSION org.opencontainers.image.revision=$GIT_COMMIT$' \
+  && pass "main: version and revision labels" || fail "main: version and revision labels"
+has "$main_body" '^ENV NSU_LLM_VERSION=$VERSION NSU_LLM_REVISION=$GIT_COMMIT$' \
+  && pass "main: NSU_LLM_VERSION and NSU_LLM_REVISION for the portal" || fail "main: NSU_LLM_VERSION and NSU_LLM_REVISION for the portal"
+RELEASE="$NODE/../release/release.sh"
+[ "$(grep -c -- '--build-arg "VERSION=$VERSION" --build-arg "GIT_COMMIT=$COMMIT"' "$RELEASE")" = 3 ] \
+  && pass "release.sh passes VERSION and GIT_COMMIT to all three builds" || fail "release.sh passes VERSION and GIT_COMMIT to all three builds"
 
 echo
 if [ "$FAILS" -eq 0 ]; then echo "ALL PASSED"; else echo "$FAILS FAILED"; exit 1; fi

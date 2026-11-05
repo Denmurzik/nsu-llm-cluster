@@ -18,6 +18,7 @@ import time
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.auth import roles
 from app.config import Settings
 from app.litellm_client import LiteLLMError, LiteLLMUnavailable, models_for_role
 from app.models import ApiKeyRef, PortalFlag, User
@@ -31,15 +32,11 @@ _last_warned = -_LOG_EVERY_S
 
 
 def effective_role(user: User, settings: Settings) -> str:
-    """The role `current_user` gives the user right now (the ADMIN_EMAILS list can have changed since the login)."""
+    """The role `current_user` gives the user right now (ADMIN_SUBS, ADMIN_EMAILS and the email_verified requirement can
+    have changed since the login; app.auth.roles)."""
     if user.role_source == "manual":
-        return user.role  # set in the panel: ADMIN_EMAILS does not touch it
-    listed = user.email.lower() in settings.admin_email_set
-    if user.role == "admin" and not listed:
-        return "user"
-    if user.role == "user" and listed and not settings.admin_require_email_verified:
-        return "admin"
-    return user.role
+        return user.role  # set in the panel: the lists do not touch it
+    return roles.auto_role(user, settings)
 
 
 async def sync_user_keys(db: AsyncSession, litellm, user: User, role: str) -> bool:

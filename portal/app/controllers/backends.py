@@ -27,7 +27,7 @@ import json
 import logging
 import math
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 
 import httpx
@@ -37,7 +37,9 @@ from app.deployments import schedule, service
 from app.deps import REDIS_ERRORS
 from app.k8s import K8sUnavailable
 from app import key_access
+from app.config import key_fingerprint
 from app.litellm_client import LiteLLMError, LiteLLMUnavailable, access_groups
+from app.nodes import identity
 
 log = logging.getLogger(__name__)
 
@@ -78,6 +80,9 @@ class Candidate:
     parallel: int | None = None  # slots of the backend; None when its deployment is unknown
     system_prompt: str | None = None  # of the deployment (gateway side)
     experimental: bool = False  # of the deployment: only admins' keys reach it
+    # the key LiteLLM sends to this backend: its node's own (app.nodes.identity), the shared key of before only for a
+    # legacy standalone node that has none yet; never in the id, never shown
+    api_key: str = field(default="", repr=False, compare=False)
 
     @property
     def id(self) -> str:
@@ -160,6 +165,9 @@ class BackendController:
             return None
         async with self.app_state.sessionmaker() as db:
             deployments = await service.list_all(db)
+            keys = await identity.backend_keys(db)
+            required = await identity.approval_required(self.app_state)
+            approved = await identity.approved_names(db, {e.node_name for e in endpoints}, required)
         by_name = {d.name: d for d in deployments}
         # past the end of its working window a deployment's pods drain (SCHEDULE_DRAIN_S): no new requests for them
         now = schedule.now_utc()
@@ -171,14 +179,30 @@ class BackendController:
             e for e in endpoints
             if e.deployment not in closed and not (e.role == "split-leader" and e.workload in unserved)
         ]
-        return [c for c in (_from_endpoint(e, by_name) for e in endpoints) if c is not None]
+        candidates = []
+        for c in (_from_endpoint(e, by_name) for e in endpoints):
+            if c is None:
+                continue
+            # a pod reads its node's own key from the node container (builders.BACKEND_KEY_FILE): a node without one, or not
+            # approved (its pods should not be there at all), gets no entry
+            key = keys.get(c.node.lower())
+            if key and c.node.lower() in approved:
+                candidates.append(replace(c, api_key=key))
+        return candidates
 
     async def _standalone_candidates(self) -> list[Candidate]:
         state = self.app_state
         candidates = []
+        legacy_key = state.settings.backend_api_key.get_secret_value()
         async with state.sessionmaker() as db:
             by_name = {d.name: d for d in await service.list_all(db)}
-            for node in await service.live_nodes(db, state.settings.standalone_ttl_s):
+            live = await service.live_nodes(db, state.settings.standalone_ttl_s)
+            required = await identity.approval_required(state)
+            approved = await identity.approved_names(db, [n.name for n in live], required)
+            keys = await identity.backend_keys(db)
+            for node in live:
+                if node.name.lower() not in approved:
+                    continue
                 desired = await service.desired_for_node(db, node.name)
                 if desired is None or node.applied_spec_hash != desired.spec_hash:
                     continue
@@ -195,6 +219,8 @@ class BackendController:
                         desired.parallel,
                         prompt,
                         experimental,
+                        # the key the heartbeat handed it (app.nodes.routes.heartbeat)
+                        keys.get(node.name.lower()) or legacy_key,
                     )
                 )
         return candidates
@@ -214,17 +240,16 @@ class BackendController:
         keep_k8s = k8s_candidates is None
         settings = self.app_state.settings
         self._forget_old()
-        fingerprint = settings.backend_key_fingerprint
-        # alive entries registered without the current backend key or with another in-flight bound (parallel,
-        # QUEUE_FACTOR or LITELLM_WORKERS changed) are updated in place: PATCH keeps the id and the entry
-        # stays in the router meanwhile
+        # alive entries registered without their backend's current key (the node got its own, or a new one after a reset)
+        # or with another in-flight bound (parallel, QUEUE_FACTOR or LITELLM_WORKERS changed) are updated in place: PATCH
+        # keeps the id and the entry stays in the router meanwhile
         for model_id, m in existing.items():
             c = wanted.get(model_id)
             if c is None or self._recently(model_id, "write"):
                 continue
             try:
-                if fingerprint and m.key_fingerprint != fingerprint:
-                    await litellm.update_model_key(model_id)
+                if c.api_key and m.key_fingerprint != key_fingerprint(c.api_key):
+                    await litellm.update_model_key(model_id, c.api_key)
                     self._remember(model_id, "write")
                 limit = max_parallel_requests(c.parallel, settings)
                 if m.max_parallel_requests != limit:
@@ -260,6 +285,7 @@ class BackendController:
                     max_parallel_requests=max_parallel_requests(c.parallel, settings),
                     experimental=c.experimental,
                     system_prompt=c.system_prompt,
+                    api_key=c.api_key,
                 )
             except _WRITE_ERRORS as exc:
                 # v1.106.6 answers a duplicate id (written through another worker) with a generic 500, so a failed

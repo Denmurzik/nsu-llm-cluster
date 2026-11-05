@@ -1,0 +1,153 @@
+{
+  "at": "2026-11-04T12:00:00+00:00",
+  "main": {
+    "version": "0.1.0",
+    "revision": "9f3c2ab4d1e07b65c8a2f4e91d0b3a7c5e6f8091",
+    "digest": null
+  },
+  "registry": {
+    "repo": "nsu-llm-node",
+    "available": true,
+    "error": null,
+    "tags": [
+      {
+        "tag": "0.1.0-gpu",
+        "current": true,
+        "accel": "nvidia",
+        "digest": "sha256:5b1a0c2e7d4f9a3b6c8e1d0f2a4b6c8d0e1f3a5b7c9d1e3f5a7b9c1d3e5f7a9b",
+        "version": "0.1.0",
+        "revision": "9f3c2ab4d1e07b65c8a2f4e91d0b3a7c5e6f8091",
+        "created": "2026-11-03T10:00:00Z"
+      },
+      {
+        "tag": "0.1.0-cpu",
+        "current": true,
+        "accel": "cpu",
+        "digest": "sha256:a41c7e90b2d35f68c1a0e4b79d2f3c5a8e6b1d4f7a0c3e5b8d1f4a7c0e3b6d9f",
+        "version": "0.1.0",
+        "revision": "9f3c2ab4d1e07b65c8a2f4e91d0b3a7c5e6f8091",
+        "created": "2026-11-03T10:00:00Z"
+      },
+      {
+        "tag": "0.0.9-cpu",
+        "current": false,
+        "accel": "cpu",
+        "digest": "sha256:0d9e8f7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c2d1e0f9a8b7c6d5e4f3a2b1c0d9e",
+        "version": "0.0.9",
+        "revision": "1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d",
+        "created": "2026-10-20T09:00:00Z"
+      }
+    ]
+  },
+  "offered": {
+    "cpu": {
+      "tag": "0.1.0-cpu",
+      "digest": "sha256:a41c7e90b2d35f68c1a0e4b79d2f3c5a8e6b1d4f7a0c3e5b8d1f4a7c0e3b6d9f",
+      "version": "0.1.0",
+      "revision": "9f3c2ab4d1e07b65c8a2f4e91d0b3a7c5e6f8091"
+    },
+    "nvidia": {
+      "tag": "0.1.0-gpu",
+      "digest": "sha256:5b1a0c2e7d4f9a3b6c8e1d0f2a4b6c8d0e1f3a5b7c9d1e3f5a7b9c1d3e5f7a9b",
+      "version": "0.1.0",
+      "revision": "9f3c2ab4d1e07b65c8a2f4e91d0b3a7c5e6f8091"
+    }
+  },
+  "auto_update": false,
+  "nodes": [
+    {
+      "name": "aud-101-pc01",
+      "source": "k8s",
+      "accel": "cpu",
+      "ready": true,
+      "version": "0.1.0",
+      "revision": "9f3c2ab4d1e07b65c8a2f4e91d0b3a7c5e6f8091",
+      "digest": "sha256:a41c7e90b2d35f68c1a0e4b79d2f3c5a8e6b1d4f7a0c3e5b8d1f4a7c0e3b6d9f",
+      "reported_at": "2026-11-04T08:00:00+00:00",
+      "outdated": false,
+      "update": null,
+      "update_error": null,
+      "update_failed_at": null,
+      "updater_seen_at": "2026-11-04T11:59:30+00:00"
+    },
+    {
+      "name": "aud-101-pc02",
+      "source": "k8s",
+      "accel": "cpu",
+      "ready": true,
+      "version": "0.0.9",
+      "revision": "1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d",
+      "digest": "sha256:0d9e8f7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c2d1e0f9a8b7c6d5e4f3a2b1c0d9e",
+      "reported_at": "2026-11-02T08:00:00+00:00",
+      "outdated": true,
+      "update": null,
+      "update_error": null,
+      "update_failed_at": null,
+      "updater_seen_at": "2026-11-04T11:59:30+00:00"
+    },
+    {
+      "name": "aud-204-gpu01",
+      "source": "k8s",
+      "accel": "nvidia",
+      "ready": true,
+      "version": "0.1.0",
+      "revision": "9f3c2ab4d1e07b65c8a2f4e91d0b3a7c5e6f8091",
+      "digest": "sha256:5b1a0c2e7d4f9a3b6c8e1d0f2a4b6c8d0e1f3a5b7c9d1e3f5a7b9c1d3e5f7a9b",
+      "reported_at": "2026-11-04T08:00:00+00:00",
+      "outdated": false,
+      "update": null,
+      "update_error": null,
+      "update_failed_at": null,
+      "updater_seen_at": "2026-11-04T11:59:30+00:00"
+    },
+    {
+      "name": "win-laptop-07",
+      "source": "standalone",
+      "accel": "cpu",
+      "ready": false,
+      "version": "0.1.0",
+      "revision": null,
+      "digest": null,
+      "reported_at": null,
+      "outdated": null,
+      "update": null,
+      "update_error": null,
+      "update_failed_at": null,
+      "updater_seen_at": null
+    }
+  ],
+  "groups": [
+    {
+      "version": "0.1.0",
+      "revision": "9f3c2ab4d1e07b65c8a2f4e91d0b3a7c5e6f8091",
+      "digest": "sha256:a41c7e90b2d35f68c1a0e4b79d2f3c5a8e6b1d4f7a0c3e5b8d1f4a7c0e3b6d9f",
+      "outdated": false,
+      "count": 1,
+      "nodes": ["aud-101-pc01"]
+    },
+    {
+      "version": "0.1.0",
+      "revision": "9f3c2ab4d1e07b65c8a2f4e91d0b3a7c5e6f8091",
+      "digest": "sha256:5b1a0c2e7d4f9a3b6c8e1d0f2a4b6c8d0e1f3a5b7c9d1e3f5a7b9c1d3e5f7a9b",
+      "outdated": false,
+      "count": 1,
+      "nodes": ["aud-204-gpu01"]
+    },
+    {
+      "version": "0.0.9",
+      "revision": "1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d",
+      "digest": "sha256:0d9e8f7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c2d1e0f9a8b7c6d5e4f3a2b1c0d9e",
+      "outdated": true,
+      "count": 1,
+      "nodes": ["aud-101-pc02"]
+    },
+    {
+      "version": "0.1.0",
+      "revision": null,
+      "digest": null,
+      "outdated": null,
+      "count": 1,
+      "nodes": ["win-laptop-07"]
+    }
+  ]
+}

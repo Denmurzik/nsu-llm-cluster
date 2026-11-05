@@ -1074,13 +1074,19 @@ def _split_groups(
     accels: dict[str, str | None],
     existing: dict[int, list[str]],
     away: set[str] = frozenset(),
+    memory: dict[str, placement.NodeMemory] | None = None,
 ) -> list[list[str]]:
     """Node names of the split groups the workload controller forms, by the same rules (`plan_groups`): the groups of
     the running leaders (`existing`) stay, the other nodes pair up. Nodes `away` (maintenance) count for the number of
-    groups the spare nodes leave room for, but are never placed."""
+    groups the spare nodes leave room for, but are never placed. `memory` (by lower-case node name) gives the RAM the
+    controller orders a new group by (the node with the most RAM leads), so the page shows the group it really forms."""
     if dep.mode != "split":
         return []
-    workers = [RpcWorker(n, "", 0, accels[n]) for n in names if accels.get(n) is not None and n not in away]
+    workers = [
+        RpcWorker(n, "", 0, accels[n], getattr(memory.get(n.lower()), "ram_mib", None) if memory else None)
+        for n in names
+        if accels.get(n) is not None and n not in away
+    ]
     planned = plan_groups(workers, dep.group_size, existing, limit=split_group_limit(dep, len(names)))
     return [[w.node_name for w in group] for group in planned.values()]
 
@@ -1192,7 +1198,12 @@ async def deployment_status(
         )
     counts = await ready_backends(litellm)
     groups = _split_groups(
-        dep, [n["name"] for n in nodes if n["source"] == "k8s"], accels, existing, {r.node_name for r in rows if r.maintenance}
+        dep,
+        [n["name"] for n in nodes if n["source"] == "k8s"],
+        accels,
+        existing,
+        {r.node_name for r in rows if r.maintenance},
+        memory,
     )
     return {
         "spec_hash": h,

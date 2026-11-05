@@ -9,8 +9,27 @@ from fastapi.staticfiles import StaticFiles
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
-from app.api import admin, admin_deployments, admin_local_models, admin_status, keys, models, playground, usage
+from app.api import (
+    admin,
+    admin_backups,
+    admin_cache,
+    admin_deployments,
+    admin_local_models,
+    admin_metrics,
+    admin_node_delete,
+    admin_node_identity,
+    admin_settings,
+    admin_status,
+    admin_usage,
+    admin_versions,
+    admin_users,
+    keys,
+    models,
+    playground,
+    usage,
+)
 from app.auth import routes as auth_routes
+from app.auth.routes import missing_oidc
 from app.auth.sessions import SlidingCookieMiddleware
 from app.catalog.hf import HfClient, MirrorFirstHf
 from app.config import Settings, get_settings
@@ -21,13 +40,16 @@ from app.deployments.counts import BackendCounts
 from app.deployments.progress import ProgressSource
 from app.deps import make_redis
 from app.k8s import K8sClient
-from app.localmodels.store import LocalStore
 from app.litellm_client import LiteLLMClient
+from app.localmodels.store import LocalStore
+from app.nodes import metrics_routes as node_metrics_routes
 from app.nodes import routes as node_routes
+from app.settings_store import RuntimeSettings
 
 log = logging.getLogger(__name__)
 
-_API_PREFIXES = ("api", "auth", "v1", "healthz", "readyz")
+# never the SPA: `health` too, or a node url pointing at the portal would pass the backend probe (GET /health -> index.html)
+_API_PREFIXES = ("api", "auth", "v1", "healthz", "readyz", "health")
 _VALUE_ERROR_PREFIX = "Value error, "
 
 
@@ -57,6 +79,7 @@ async def open_state(state, settings: Settings) -> None:
     state.settings = settings
     state.engine = engine
     state.sessionmaker = async_sessionmaker(engine, expire_on_commit=False)
+    state.runtime = RuntimeSettings(state, settings.settings_cache_ttl_s)
     if getattr(state, "redis", None) is None:
         state.redis = make_redis(settings.redis_url)
     state.litellm = LiteLLMClient(
@@ -73,10 +96,10 @@ async def open_state(state, settings: Settings) -> None:
     mirror = f"http://127.0.0.1:{settings.hf_mirror_port}" if settings.hf_mirror_enabled else None
     direct = HfClient(settings.hf_endpoint, settings.hf_token.get_secret_value() or None)
     if mirror:
-        state.hf = MirrorFirstHf(HfClient(mirror, settings.hf_mirror_token.get_secret_value() or None), direct)
+        state.hf = MirrorFirstHf(HfClient(mirror, settings.mirror_admin_key or None), direct)
     else:
         state.hf = direct
-    state.progress = ProgressSource(mirror, settings.hf_mirror_token.get_secret_value())
+    state.progress = ProgressSource(mirror, settings.mirror_admin_key)
     state.local_models = LocalStore(settings.hf_mirror_data_dir)
     # several processes start at once: one at a time migrates and seeds
     async with startup_lock(engine):
@@ -102,6 +125,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         await open_state(app.state, settings)
+        if missing := missing_oidc(settings):
+            log.error("login is not configured: %s is empty; «Войти» answers with an error until it is set", ", ".join(missing))
         # API workers run with CONTROLLERS_ENABLED=false: the controllers have their own process
         if settings.controllers_enabled:
             runner.start(app)
@@ -139,9 +164,30 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return JSONResponse({"db": db_ok, "litellm": litellm_ok}, status_code=200 if db_ok and litellm_ok else 503)
 
     for module in (
-        auth_routes, node_routes, keys, usage, playground, models, admin_deployments, admin_local_models, admin, admin_status,
+        auth_routes,
+        node_routes,
+        node_metrics_routes,
+        keys,
+        usage,
+        playground,
+        models,
+        admin_deployments,
+        admin_local_models,
+        admin,
+        admin_status,
+        admin_backups,
+        admin_usage,
+        admin_metrics,
+        admin_cache,
+        admin_versions,
+        admin_node_delete,
+        admin_node_identity,
+        admin_settings,
+        admin_users,
     ):
         app.include_router(module.router)
+    app.include_router(admin_versions.public_router)  # no token: the name of the node image for the installer
+    app.include_router(admin_versions.node_router)  # the node side of the same task: image report, «should I update»
 
     web_dist = Path(settings.web_dist)
     if web_dist.is_dir():

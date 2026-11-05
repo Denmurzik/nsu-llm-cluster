@@ -290,6 +290,29 @@ async def test_ensure_user_already_exists_is_ok(router, client, status):
     await client.ensure_user("u1", "u1@g.nsu.ru")
 
 
+async def test_ensure_user_with_limits_gives_them_to_the_user(router, client):
+    """SEC-1 rule 7: the user's own rpm/tpm, shared by all its keys (test_litellm_real_user_limits.py)."""
+    route = router.post("/user/new").mock(return_value=httpx.Response(200, json={"user_id": "u1"}))
+    await client.ensure_user("u1", "u1@g.nsu.ru", 60, 100000)
+    body = json.loads(route.calls.last.request.content)
+    assert (body["rpm_limit"], body["tpm_limit"]) == (60, 100000)
+
+
+async def test_ensure_user_with_limits_updates_an_existing_user(router, client):
+    router.post("/user/new").mock(
+        return_value=httpx.Response(400, json={"error": {"message": "User with id u1 already exists"}})
+    )
+    update = router.post("/user/update").mock(return_value=httpx.Response(200, json={"user_id": "u1"}))
+    await client.ensure_user("u1", "u1@g.nsu.ru", 30, None)
+    assert json.loads(update.calls.last.request.content) == {"user_id": "u1", "rpm_limit": 30}
+
+
+async def test_update_user_limits_raises_on_a_refusal(router, client):
+    router.post("/user/update").mock(return_value=httpx.Response(400, json={"error": {"message": "bad"}}))
+    with pytest.raises(LiteLLMError):
+        await client.update_user_limits("u1", 1, 2)
+
+
 async def test_ensure_user_other_error_raises(router, client):
     router.post("/user/new").mock(return_value=httpx.Response(401, json={"error": {"message": "bad key"}}))
     with pytest.raises(LiteLLMError) as exc:
@@ -643,6 +666,30 @@ async def test_update_key_models_updates_each_key_by_token_and_skips_deleted_one
     router.post("/key/update").mock(return_value=httpx.Response(500, text="x"))
     with pytest.raises(LiteLLMUnavailable):
         await client.update_key_models(["h1"], ["public"])
+
+
+async def test_update_key_limits_sends_only_the_given_limits_and_reports_a_deleted_key(router, client):
+    def answer(request):
+        token = json.loads(request.content)["key"]
+        return httpx.Response(404 if token == "gone" else 200, json={})
+
+    route = router.post("/key/update").mock(side_effect=answer)
+    assert await client.update_key_limits("h1", 30, 5000) is True
+    assert await client.update_key_limits("h2", None, 7000) is True
+    assert await client.update_key_limits("h3", 10, None) is True
+    assert await client.update_key_limits("gone", 10, 10) is False
+    assert [json.loads(c.request.content) for c in route.calls] == [
+        {"key": "h1", "rpm_limit": 30, "tpm_limit": 5000},
+        {"key": "h2", "tpm_limit": 7000},
+        {"key": "h3", "rpm_limit": 10},
+        {"key": "gone", "rpm_limit": 10, "tpm_limit": 10},
+    ]
+    router.post("/key/update").mock(return_value=httpx.Response(400, text="bad"))
+    with pytest.raises(LiteLLMError):
+        await client.update_key_limits("h1", 1, 1)
+    router.post("/key/update").mock(return_value=httpx.Response(500, text="x"))
+    with pytest.raises(LiteLLMUnavailable):
+        await client.update_key_limits("h1", 1, 1)
 
 
 async def test_fake_litellm_enforces_access_groups_like_the_gateway():

@@ -15,7 +15,7 @@ from tests.helpers.auth import csrf_headers, login
 
 pytestmark = pytest.mark.docker
 
-ADMIN = {"sub": "adm", "email": "admin@g.nsu.ru"}
+ADMIN = {"sub": "adm", "email": "admin@g.nsu.ru", "email_verified": True}
 USER = {"sub": "usr", "email": "ivan@g.nsu.ru"}
 
 

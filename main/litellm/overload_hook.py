@@ -32,6 +32,10 @@ SATURATED_RETRY_AFTER_S = 5
 COUNTER_PREFIX = "portal:gw"
 COUNTER_TTL_S = 7200
 COUNT_TIMEOUT_S = 1.0
+# per-model traffic read by portal/app/metrics/gateway_models.py
+MODEL_PREFIX = "portal:gwm"
+TTFT_BOUNDS_MS = (100, 250, 500, 1000, 2000, 3000, 5000, 10000, 20000, 30000, 60000)
+MODEL_NAME_MAX = 100  # a client picks the model name of a failed request: keep the hash fields short
 MAX_PENDING_COUNTS = 200  # writes in flight; a stalled Redis must not pile up tasks
 REDIS_URL = os.environ.get("GATEWAY_STATS_REDIS_URL", "redis://127.0.0.1:6379/0")
 _WARN_EVERY_S = 60.0
@@ -75,6 +79,33 @@ def _kind(status: int | None) -> str | None:
     return None
 
 
+def _ttft_kind(ms: float) -> str:
+    for bound in TTFT_BOUNDS_MS:
+        if ms <= bound:
+            return f"t{bound}"
+    return "tinf"
+
+
+def _model_of(kwargs: dict) -> str:
+    """The model group the client asked for (the router puts it into the metadata of the call)."""
+    meta = (kwargs.get("litellm_params") or {}).get("metadata") or {}
+    name = meta.get("model_group") or (kwargs.get("standard_logging_object") or {}).get("model_group") or kwargs.get("model")
+    return str(name or "")[:MODEL_NAME_MAX]
+
+
+def _ttft_ms(kwargs: dict, start_time) -> float | None:
+    """Time to the first token of a streamed answer; a whole answer has no such time."""
+    stream = kwargs.get("stream") or (kwargs.get("optional_params") or {}).get("stream")
+    first = kwargs.get("completion_start_time")
+    if not stream or first is None or start_time is None:
+        return None
+    try:
+        ms = (first - start_time).total_seconds() * 1000.0
+    except (TypeError, AttributeError):
+        return None
+    return ms if ms >= 0 else None
+
+
 class OverloadHook(CustomLogger):
     def __init__(self):
         super().__init__()
@@ -101,6 +132,36 @@ class OverloadHook(CustomLogger):
         except Exception as exc:  # the counters are an extra: never fail or slow the client's answer
             self._warn("gateway counters: cannot write %s: %r", key, exc)
 
+    def _model_count_later(self, model: str, fields: list[str]) -> None:
+        if not model:
+            return
+        if len(_pending) >= MAX_PENDING_COUNTS:
+            self._warn("gateway counters: %d writes still in flight, dropping the counts of %s", len(_pending), model)
+            return
+        task = asyncio.get_running_loop().create_task(self._model_count(model, fields))
+        _pending.add(task)
+        task.add_done_callback(_pending.discard)
+
+    async def _model_count(self, model: str, fields: list[str]) -> None:
+        key = f"{MODEL_PREFIX}:{int(time.time() // 60)}"
+        try:
+            pipe = _redis_client().pipeline()
+            for field in fields:
+                pipe = pipe.hincrby(key, f"{model}:{field}", 1)
+            await asyncio.wait_for(pipe.expire(key, COUNTER_TTL_S).execute(), COUNT_TIMEOUT_S)
+        except Exception as exc:  # the counters are an extra: never fail or slow the client's answer
+            self._warn("gateway counters: cannot write %s: %r", key, exc)
+
+    async def async_log_success_event(self, kwargs, response_obj, start_time, end_time):
+        try:
+            fields = ["req"]
+            ttft = _ttft_ms(kwargs, start_time)
+            if ttft is not None:
+                fields.append(_ttft_kind(ttft))
+            self._model_count_later(_model_of(kwargs), fields)
+        except Exception as exc:  # a logging callback must never break the request
+            self._warn("gateway counters: success event ignored: %r", exc)
+
     async def async_post_call_failure_hook(
         self, request_data, original_exception, user_api_key_dict, traceback_str=None
     ):
@@ -109,6 +170,7 @@ class OverloadHook(CustomLogger):
         kind = _kind(status)
         if kind is not None:
             self._count_later(kind)
+            self._model_count_later(str((request_data or {}).get("model") or "")[:MODEL_NAME_MAX], ["req", kind])
         return result
 
     def _answer(self, request_data, original_exception):

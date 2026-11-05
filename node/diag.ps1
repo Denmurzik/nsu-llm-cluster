@@ -468,9 +468,19 @@ if ($portOk[443]) {
 }
 
 # ------------------------------------------------------------------ 5. локальный брандмауэр Windows
-$subnetExample = '<подсеть класса, например 10.0.1.0/24>'
-if ($localIp -match '^(\d+\.\d+\.\d+)\.\d+$') { $subnetExample = "$($Matches[1]).0/24" }
-$remoteHint = $(if ($mainIp) { "$subnetExample,$mainIp" } else { $subnetExample })
+# 18080 (инференс) открыт только главному, 18050 (RPC split без аутентификации) главному и нодам группы split (их называет главный, run-node.ps1
+# -SyncFirewall держит правило в порядке): подсеть класса целиком не открывается, иначе любой ученик подключится к RPC соседнего ПК.
+$remoteHint = $(if ($mainIp) { $mainIp } else { '<адрес главного>' })
+# Правило пускает широкий круг (любые адреса, подсеть, LocalSubnet): для 18050 это значит, что ученики класса могут менять веса и читать KV-кэш группы
+function Test-WideRemote([string]$spec) {
+    if (-not $spec -or $spec -in @('Any', '*', 'LocalSubnet', 'Intranet', 'DefaultGateway')) { return $true }
+    foreach ($p in $spec.Split(',')) {
+        $m = [regex]::Match($p.Trim(), '^\d+\.\d+\.\d+\.\d+/(\d+)$')
+        if ($m.Success -and [int]$m.Groups[1].Value -lt 32) { return $true }
+        if ($p.Trim() -match '^\d+\.\d+\.\d+\.\d+/(\d+)\.(\d+)\.(\d+)\.(\d+)$' -and $p.Trim() -notmatch '/255\.255\.255\.255$') { return $true }
+    }
+    return $false
+}
 $rules = Get-InboundRules
 if ($null -eq $rules) {
     Write-Info 'правила брандмауэра Windows не прочитаны (нужны права администратора или модуль NetSecurity)' @('Запустите PowerShell от имени администратора и повторите.')
@@ -488,7 +498,8 @@ if ($null -eq $rules) {
         $maybe = @($portRules | Where-Object { -not (Test-RuleInProfiles $_ $activeProfiles) }) +
             @($tcpAllow | Where-Object { -not $_.Ports -or $_.Ports -eq 'Any' } |
                 Where-Object { (Test-RuleInProfiles $_ $activeProfiles) -and (-not $mainIp -or $port -ne 18080 -or (Test-IpInSpec $_.Remote $mainIp) -ne 'no') })
-        $cmd = "New-NetFirewallRule -DisplayName NSU-LLM-Node -Direction Inbound -Protocol TCP -LocalPort 18080,18050 -RemoteAddress $remoteHint -Action Allow"
+        $ruleName = $(if ($port -eq 18080) { 'NSU-LLM-Node' } else { 'NSU-LLM-Node-RPC' })
+        $cmd = "New-NetFirewallRule -DisplayName $ruleName -Direction Inbound -Protocol TCP -LocalPort $port -RemoteAddress $remoteHint -Action Allow"
         if ($allow.Count -eq 0 -and $maybe.Count -gt 0) {
             $about = ($maybe | Select-Object -First 3 | ForEach-Object {
                 if (-not (Test-RuleInProfiles $_ $activeProfiles)) { "$($_.Name) (порт $port, но только профиль $($_.Profile), а сеть сейчас: $($activeProfiles -join ', '))" }
@@ -522,10 +533,17 @@ if ($null -eq $rules) {
                     "Исправление (PowerShell от администратора): Set-NetFirewallRule -DisplayName '$($reach[0].Name)' -RemoteAddress $remoteHint")
             } else {
                 Write-Ok "брандмауэр: входящий ${port}/tcp разрешён правилом $($reach[0].Name)"
+                $wide = @($reach | Where-Object { Test-WideRemote $_.Remote })
+                if ($port -eq 18050 -and $wide.Count -gt 0) {
+                    Write-Warn "брандмауэр: 18050/tcp (RPC split, без аутентификации) открыт для '$($wide[0].Remote)' правилом $($wide[0].Name)" @(
+                        'Причина: любой ПК или ноутбук в этом круге может подключиться к RPC и менять веса и читать KV-кэш работающей split-группы',
+                        "Исправление (PowerShell от администратора): Set-NetFirewallRule -DisplayName '$($wide[0].Name)' -RemoteAddress $remoteHint   (адреса нод группы добавит run-node.ps1 -SyncFirewall, он запускается раз в минуту)")
+                }
             }
         }
     }
-    $blocks = @($rules | Where-Object { $_.Action -eq 'Block' -and $_.Protocol -in 'TCP', 'Any' -and ((Test-PortInSpec $_.Ports 18080 $false) -or (Test-PortInSpec $_.Ports 18050 $false)) })
+    # NSU-LLM-Node-Block и NSU-LLM-Node-RPC-Block ставит run-node.ps1 для Docker Desktop сам (запрет всем, кроме главного и нод группы)
+    $blocks = @($rules | Where-Object { $_.Name -notmatch '^NSU-LLM-Node(-RPC)?-Block' } | Where-Object { $_.Action -eq 'Block' -and $_.Protocol -in 'TCP', 'Any' -and ((Test-PortInSpec $_.Ports 18080 $false) -or (Test-PortInSpec $_.Ports 18050 $false)) })
     if ($blocks.Count -gt 0) {
         $names = ($blocks | ForEach-Object { $_.Name }) -join ', '
         Write-Bad "брандмауэр: есть запрещающие входящие правила для 18080 или 18050: $names" @(
@@ -550,6 +568,14 @@ function Write-WslProblem([string]$msg, [string[]]$lines) {
 }
 if ($node.Runtime -eq 'desktop') {
     Write-Info 'нода работает в Docker Desktop (запасной путь): порты 18080 и 18050 публикует Docker Desktop, mirrored-сеть WSL и правило Hyper-V firewall не нужны'
+    # Docker Desktop разрешает com.docker.backend.exe на любые порты и адреса: узкое правило для 18080/18050 этого не ограничивает, нужен запрет
+    $ddAllow = @($rules | Where-Object { $_.Action -eq 'Allow' -and "$($_.Program)" -match 'docker' })
+    $ddBlock = @($rules | Where-Object { $_.Name -match '^NSU-LLM-Node-Block' })
+    if ($ddAllow.Count -gt 0 -and $ddBlock.Count -eq 0) {
+        Write-Warn "брандмауэр: правило Docker Desktop ($($ddAllow[0].Name)) пускает любые адреса на порты ноды, запрета NSU-LLM-Node-Block нет" @(
+            'Причина: разрешающие правила складываются, узкое правило для 18080 и 18050 ничего не ограничивает; RPC без аутентификации открыт ПК сети',
+            'Исправление: запустите install-node.ps1 или run-node.ps1 -SyncFirewall от администратора: он ставит запрещающее правило для всех адресов, кроме главного и нод группы')
+    }
     if ($wsl.Installed -and $wsl.Mode -and $wsl.Mode -ne 'mirrored') {
         Write-Info "WSL работает в режиме $($wsl.Mode): для ноды в Docker Desktop это нормально"
     }
@@ -601,7 +627,9 @@ if ($node.Runtime -eq 'desktop') {
         } else {
             $hvRule = @($hv.Rules | Where-Object { (Test-PortInSpec $_.Ports 18080 $false) })
             if ($hv.DefaultInbound -eq 'Allow') {
-                Write-Ok 'Hyper-V firewall: входящие в WSL разрешены по умолчанию'
+                Write-Warn 'Hyper-V firewall: входящие в WSL разрешены по умолчанию (DefaultInboundAction=Allow)' @(
+                    'Причина: пока по умолчанию разрешено всё, правила для 18080 и 18050 ничего не ограничивают: RPC без аутентификации открыт любому ПК сети',
+                    "Исправление (PowerShell от администратора): Set-NetFirewallHyperVVMSetting -Name '$HyperVCreator' -DefaultInboundAction Block   (run-node.ps1 -SyncFirewall делает это сам)")
             } elseif ($hvRule.Count -gt 0) {
                 Write-Ok "Hyper-V firewall: входящий 18080/tcp разрешён правилом $($hvRule[0].Name)"
                 # 18050 нужен только для split: без правила обычные развёртывания работают, поэтому предупреждение
@@ -611,12 +639,12 @@ if ($node.Runtime -eq 'desktop') {
                 } else {
                     Write-Warn 'Hyper-V firewall: нет правила для входящего 18050/tcp (RPC режима split)' @(
                         'Причина: без этого правила нода в WSL не примет часть модели от других нод класса в split; обычные развёртывания работают',
-                        "Исправление (PowerShell от администратора): New-NetFirewallHyperVRule -Name llm-inference -DisplayName 'LLM inference' -Direction Inbound -VMCreatorId '$HyperVCreator' -Protocol TCP -LocalPorts 18080,18050 (или добавьте 18050 в существующее правило)")
+                        "Исправление (PowerShell от администратора): New-NetFirewallHyperVRule -Name llm-inference -DisplayName 'LLM inference' -Direction Inbound -VMCreatorId '$HyperVCreator' -Protocol TCP -LocalPorts 18050 -RemoteAddresses $remoteHint (для правила нужно другое имя, например NSU-LLM-Node-RPC; адреса нод группы добавит run-node.ps1 -SyncFirewall)")
                 }
             } else {
                 Write-WslProblem 'Hyper-V firewall: входящие в WSL запрещены, правила для 18080/tcp нет' @(
                     'Причина: Hyper-V firewall по умолчанию режет входящие в WSL, даже если правило Windows Firewall есть. run-node.ps1 это правило не создаёт',
-                    "Исправление (PowerShell от администратора): New-NetFirewallHyperVRule -Name llm-inference -DisplayName 'LLM inference' -Direction Inbound -VMCreatorId '$HyperVCreator' -Protocol TCP -LocalPorts 18080,18050")
+                    "Исправление (PowerShell от администратора): New-NetFirewallHyperVRule -Name llm-inference -DisplayName 'LLM inference' -Direction Inbound -VMCreatorId '$HyperVCreator' -Protocol TCP -LocalPorts 18080 -RemoteAddresses $remoteHint")
             }
         }
     }

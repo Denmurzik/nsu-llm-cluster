@@ -1,14 +1,19 @@
 import { useEffect, useRef, useState } from "react";
 import { api, ApiError } from "../api";
 import "../styles/tools.css";
-import { BulkNodeActions, SPLIT_WARNING } from "../components/BulkNodeActions";
+import { APPROVE_NOTE, BulkNodeActions, SPLIT_WARNING } from "../components/BulkNodeActions";
 import { CopyButton } from "../components/CopyButton";
 import { Confirm } from "../components/Modal";
 import { NodeWake } from "../components/NodeWake";
+import { BulkUpdateNodes, NodeUpdateButton, NodeVersionTag, useNodeVersions } from "../components/NodeVersions";
+import { NodeDeletedDialog, NodeDeleteMenu } from "../components/NodeDelete";
+import { NodePurge } from "../components/PurgeModels";
 import { ErrorNotice, Loading, Notice, PageHead } from "../components/ui";
 import { fmtBytes, fmtMib } from "../lib/format";
+import { versionText } from "../lib/nodeVersions";
 import { useResource } from "../lib/useResource";
-import type { JoinInfo } from "../types";
+import { hasClaims, waitsForApproval, type JoinInfo, type NodeDeleteResult, type NodeInfo } from "../types";
+import { NodeClaimsDialog } from "../components/NodeClaims";
 
 const JOIN_ROWS: { key: keyof JoinInfo & ("linux" | "linux_standalone" | "windows"); title: string; copy: string }[] = [
   { key: "linux", title: "Linux", copy: "Копировать команду Linux" },
@@ -23,10 +28,18 @@ export function AdminNodes() {
   const nodes = useResource(() => api.nodes(), [], { interval: 10000 });
   const deployments = useResource(() => api.deployments(), [], { interval: 10000 });
   const join = useResource(() => api.join(), []);
+  /** the image each node runs and whether it is outdated (portal task 2-30); the table does not wait for it */
+  const versions = useNodeVersions();
   const [error, setError] = useState<string | null>(null);
   const [pending, setPending] = useState<string | null>(null);
+  /** a node waiting for «Подтвердить»: the admin compares its name and address first */
+  const [confirmApprove, setConfirmApprove] = useState<NodeInfo | null>(null);
+  /** a known name somebody else registered: the admin compares the claims' addresses and picks one */
+  const [claimsOf, setClaimsOf] = useState<NodeInfo | null>(null);
   /** a node of a split deployment waiting for the admin to confirm its maintenance */
   const [confirmSplit, setConfirmSplit] = useState<string | null>(null);
+  /** the answer of «Удалить из кластера…»: the row is gone, the dialog with it stays */
+  const [deleted, setDeleted] = useState<NodeDeleteResult | null>(null);
   /** names ticked for the bulk actions; the main node cannot be ticked */
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const allBox = useRef<HTMLInputElement>(null);
@@ -63,6 +76,19 @@ export function AdminNodes() {
     }
   }
 
+  async function approve(node: string) {
+    setError(null);
+    setPending(node);
+    try {
+      await api.approveNode(node);
+    } catch (e) {
+      setError(e instanceof ApiError ? e.detail : "Не удалось подтвердить ноду");
+    } finally {
+      setPending(null);
+      await nodes.reload();
+    }
+  }
+
   async function setMaintenance(node: string, on: boolean) {
     setError(null);
     setPending(node);
@@ -80,7 +106,7 @@ export function AdminNodes() {
     <div className="page">
       <PageHead
         title="Ноды"
-        lead="Машины, на которых работают модели. Назначение ноды на развёртывание меняется прямо в таблице. Нода на обслуживании ничего не запускает и сохраняет назначение до возвращения в работу. Выключенный ПК класса портал будит по сети сам, кнопка «Разбудить» делает это сразу."
+        lead="Машины, на которых работают модели. Новая нода ждёт подтверждения: до кнопки «Подтвердить» она не получает модель и ключи. Назначение ноды на развёртывание меняется прямо в таблице. Нода на обслуживании ничего не запускает и сохраняет назначение до возвращения в работу. Выключенный ПК класса портал будит по сети сам, кнопка «Разбудить» делает это сразу."
       />
       {nodes.data && !nodes.data.k8s_available && (
         <Notice kind="warn">Kubernetes недоступен, показаны только standalone-ноды</Notice>
@@ -99,6 +125,14 @@ export function AdminNodes() {
             onFinished={async (failed) => {
               setSelected(new Set(failed));
               await nodes.reload();
+            }}
+          />
+          <BulkUpdateNodes
+            selected={picked.map((n) => n.name)}
+            byName={versions.byName}
+            onFinished={async (failed) => {
+              setSelected(new Set(failed));
+              await versions.reload();
             }}
           />
           <div className="table-wrap">
@@ -120,10 +154,14 @@ export function AdminNodes() {
                   <th className="num">VRAM</th>
                   <th className="num">RAM</th>
                   <th className="num">Ёмкость</th>
+                  <th className="num">Модели на диске</th>
                   <th>Состояние</th>
                   <th className="num">Экземпляры</th>
                   <th>Развёртывание</th>
+                  <th>Версия</th>
                   <th>Обслуживание</th>
+                  {/* no visible title; a .visually-hidden span here is positioned against the page and widens it */}
+                  <th className="menu-cell" aria-label="Меню действий" />
                 </tr>
               </thead>
               <tbody>
@@ -152,14 +190,48 @@ export function AdminNodes() {
                     <td className="num">{fmtMib(n.vram_mib)}</td>
                     <td className="num">{fmtMib(n.mem_mib)}</td>
                     <td className="num">{n.capacity_bytes ? fmtBytes(n.capacity_bytes) : "—"}</td>
+                    <td className="num muted">{typeof n.models_bytes === "number" ? fmtBytes(n.models_bytes) : "—"}</td>
                     <td>
-                      <span className="status">
-                        <i
-                          className={`dot ${n.maintenance ? "starting" : n.ready ? "ready" : "down"}`}
-                          aria-hidden="true"
-                        />
-                        <span>{n.maintenance ? "На обслуживании" : n.ready ? "Готова" : "Не в сети"}</span>
-                      </span>
+                      {hasClaims(n) && (
+                        <div className="stackcell">
+                          <span className="tag warn small">
+                            {n.approved === false ? "Ждёт выбора заявки" : "Попытка перерегистрации известного имени"}
+                          </span>
+                          <button type="button" className="btn sm" onClick={() => setClaimsOf(n)}>
+                            Заявки: {n.claims!.length}
+                          </button>
+                        </div>
+                      )}
+                      {waitsForApproval(n) ? (
+                        <div className="stackcell">
+                          <span className="status">
+                            <i className="dot starting" aria-hidden="true" />
+                            <span>Ожидает подтверждения</span>
+                          </span>
+                          {n.claim_ip && <span className="muted small nowrap">с адреса {n.claim_ip}</span>}
+                          <button
+                            type="button"
+                            className="btn sm"
+                            disabled={pending === n.name}
+                            onClick={() => setConfirmApprove(n)}
+                          >
+                            Подтвердить
+                          </button>
+                        </div>
+                      ) : n.approved === false ? null : (
+                        <span className="status">
+                          <i
+                            className={`dot ${n.maintenance ? "starting" : n.ready ? "ready" : "down"}`}
+                            aria-hidden="true"
+                          />
+                          <span>{n.maintenance ? "На обслуживании" : n.ready ? "Готова" : "Не в сети"}</span>
+                        </span>
+                      )}
+                      {n.legacy && (
+                        <span className="tag warn small" title="Старый образ ноды: обновите ноду, чтобы она получила свой ключ">
+                          без ключа (старый образ)
+                        </span>
+                      )}
                       <NodeWake node={n} />
                     </td>
                     <td className="num">{n.backends}</td>
@@ -188,27 +260,59 @@ export function AdminNodes() {
                         </select>
                       )}
                     </td>
+                    <td>
+                      {n.is_main ? (
+                        <span className="tag">{versions.data ? versionText(versions.data.main) : "—"}</span>
+                      ) : (
+                        <div className="stackcell">
+                          <NodeVersionTag info={versions.byName[n.name]} />
+                          <NodeUpdateButton node={n.name} info={versions.byName[n.name]} onDone={versions.reload} />
+                        </div>
+                      )}
+                    </td>
                     <td className="actions">
                       {!n.is_main && (
-                        <button
-                          type="button"
-                          className="btn quiet sm"
-                          disabled={pending === n.name}
-                          onClick={() =>
-                            !n.maintenance && n.deployment && splitNames.has(n.deployment)
-                              ? setConfirmSplit(n.name)
-                              : void setMaintenance(n.name, !n.maintenance)
-                          }
-                        >
-                          {n.maintenance ? "Вернуть в работу" : "На обслуживание"}
-                        </button>
+                        <div className="node-actions">
+                          <button
+                            type="button"
+                            className="btn quiet sm"
+                            disabled={pending === n.name}
+                            onClick={() =>
+                              !n.maintenance && n.deployment && splitNames.has(n.deployment)
+                                ? setConfirmSplit(n.name)
+                                : void setMaintenance(n.name, !n.maintenance)
+                            }
+                          >
+                            {n.maintenance ? "Вернуть в работу" : "На обслуживание"}
+                          </button>
+                          <NodePurge node={n} onDone={() => nodes.reload()} />
+                        </div>
+                      )}
+                    </td>
+                    {/* the «⋯» menu has a column of its own: next to the two buttons it would add a line to every row */}
+                    <td className="menu-cell">
+                      {!n.is_main && (
+                        <NodeDeleteMenu
+                          node={n}
+                          deployments={deps}
+                          onReset={() => nodes.reload()}
+                          onDeleted={async (result) => {
+                            setDeleted(result);
+                            setSelected((prev) => {
+                              const next = new Set(prev);
+                              next.delete(n.name);
+                              return next;
+                            });
+                            await nodes.reload();
+                          }}
+                        />
                       )}
                     </td>
                   </tr>
                 ))}
                 {nodes.data.nodes.length === 0 && (
                   <tr>
-                    <td colSpan={10} className="empty-row">
+                    <td colSpan={12} className="empty-row">
                       Нод пока нет
                     </td>
                   </tr>
@@ -219,6 +323,12 @@ export function AdminNodes() {
         </div>
       )}
       {nodes.data && !deployments.loading && <p className="hint">Ёмкость: сколько памяти ноды остаётся под модель</p>}
+      {nodes.data && !deployments.loading && (
+        <p className="hint">
+          Модели на диске: файлы моделей и кеш тензоров на диске ноды. «Очистить модели» удаляет всё, что не нужно её развёртыванию.
+          Нода без развёртывания очищается сама спустя несколько минут, после смены модели развёртывания лишнее удаляется сразу.
+        </p>
+      )}
 
       {confirmSplit && (
         <Confirm
@@ -235,12 +345,43 @@ export function AdminNodes() {
         </Confirm>
       )}
 
+      {confirmApprove && (
+        <Confirm
+          title={`Подтвердить ${confirmApprove.name}`}
+          confirmLabel="Подтвердить"
+          onCancel={() => setConfirmApprove(null)}
+          onConfirm={() => {
+            const node = confirmApprove.name;
+            setConfirmApprove(null);
+            void approve(node);
+          }}
+        >
+          <p>
+            Нода <span className="mono">{confirmApprove.name}</span> зарегистрировалась с адреса{" "}
+            <span className="mono">{confirmApprove.claim_ip ?? "неизвестно"}</span>.
+          </p>
+          <p>{APPROVE_NOTE}</p>
+        </Confirm>
+      )}
+
+      {claimsOf && (
+        <NodeClaimsDialog
+          node={(nodes.data?.nodes ?? []).find((x) => x.name === claimsOf.name) ?? claimsOf}
+          onClose={() => setClaimsOf(null)}
+          onDone={() => nodes.reload()}
+        />
+      )}
+
+      {deleted && <NodeDeletedDialog result={deleted} onClose={() => setDeleted(null)} />}
+
       {/* Shown together with the table: appearing first, it would be pushed down when the table arrives. */}
       {((nodes.data && !deployments.loading) || nodes.error) && (
         <section className="section">
           <h2>Подключение ноды</h2>
           <p className="secondary">
-            Выполните команду на машине, которую нужно добавить. Токен даёт право присоединять ноды к кластеру, не публикуйте его.
+            Выполните команду на машине, которую нужно добавить. Токен даёт право присоединять новые ноды к кластеру, не публикуйте
+            его. Нода с новым именем появится в таблице со статусом «Ожидает подтверждения»: сверьте имя и адрес и нажмите
+            «Подтвердить».
           </p>
           <ErrorNotice error={join.error} />
           {join.loading && !join.data && <Loading />}

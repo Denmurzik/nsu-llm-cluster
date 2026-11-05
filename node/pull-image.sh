@@ -3,7 +3,14 @@
 # локальное имя nsu-llm-node:<версия>-cpu|gpu, под которым его ищут run-node.* и поды кластера. Общий для Linux-ноды
 # (run-node.sh --from-main) и для WSL установщика Windows-ноды (install-node.ps1); запускается от root.
 # Использование:
-#   pull-image.sh --main HOST --image nsu-llm-node:0.1.0-cpu [--dry-run]
+#   pull-image.sh --main HOST --image nsu-llm-node:0.1.0-cpu [--digest sha256:...] [--ca FILE] [--record FILE] [--dry-run]
+#   --no-tofu: без закреплённого корня и без --ca никогда не брать корень с https://<главный>/ca.crt без проверки (шаг 3 ниже),
+#   а завершиться с ошибкой (вызывающий уже проверил корень по токену и передаёт --ca, если он есть).
+#   --digest D: тянуть не тег, а манифест с этим digest (его называет главный: /api/node-image, desired ноды; SEC-2 M2).
+#   Docker сам сверяет содержимое с digest, поэтому подменённый в реестре тег не доедет до ноды.
+#   --record FILE: после загрузки записать в FILE «<id образа> <digest в реестре главного>». run-node передаёт digest контейнеру, нода
+#   сообщает его главному, и панель видит, какая нода отстала. Строка верна, пока id совпадает с id образа на ноде (образ из архива
+#   или загруженный заново её не унаследует). Без --record ничего не пишется.
 #
 # Доверие к реестру. Реестр главного отвечает на том же адресе и с тем же сертификатом, что портал. Корневой сертификат
 # главного закрепляется ОДИН раз в /etc/docker/certs.d/<главный>/ca.crt (Docker применяет его только к этому реестру и не меняет
@@ -23,17 +30,23 @@ CERTS_DIR="${PULL_IMAGE_CERTS_DIR:-/etc/docker/certs.d}"
 MAIN=""
 IMAGE=""
 CA_ARG=""
+RECORD=""
+DIGEST=""
+NO_TOFU=0
 DRY=0
 
 die() { printf 'Ошибка: %s\n' "$*" >&2; exit 1; }
 say() { printf '%s\n' "$*"; }
-usage() { sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'; }
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --main) MAIN="${2:?}"; shift 2 ;;
     --image) IMAGE="${2:?}"; shift 2 ;;
     --ca) CA_ARG="${2:?}"; shift 2 ;;
+    --record) RECORD="${2:?}"; shift 2 ;;
+    --digest) DIGEST="${2:?}"; shift 2 ;;
+    --no-tofu) NO_TOFU=1; shift ;;
     --dry-run) DRY=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) usage >&2; die "неизвестный параметр: $1" ;;
@@ -43,7 +56,10 @@ done
 [ -n "$IMAGE" ] || { usage >&2; die "--image обязателен"; }
 [[ "$MAIN" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:[0-9]{1,5})?$ ]] || die "--main: нужен адрес главного (IP или имя, можно с портом), получено: $MAIN"
 [[ "$IMAGE" =~ ^nsu-llm-node:[A-Za-z0-9._-]+$ ]] || die "--image: нужен образ вида nsu-llm-node:0.1.0-cpu, получено: $IMAGE"
+[ -z "$DIGEST" ] || [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || die "--digest: нужен digest вида sha256:<64 hex>, получено: ${DIGEST:0:80}"
 REMOTE="$MAIN/$IMAGE"
+# с --digest тянется ровно этот манифест: <главный>/nsu-llm-node@sha256:...
+[ -z "$DIGEST" ] || REMOTE="$MAIN/${IMAGE%%:*}@$DIGEST"
 HOST_ONLY="${MAIN%%:*}"
 
 # run CMD...: при --dry-run только печатает команду
@@ -60,6 +76,7 @@ if [ "$DRY" = 1 ]; then
   run docker pull "$REMOTE"
   run docker tag "$REMOTE" "$IMAGE"
   run docker rmi "$REMOTE"
+  [ -z "$RECORD" ] || say "  [dry-run] digest образа в реестре главного записывается в $RECORD"
   exit 0
 fi
 
@@ -87,6 +104,9 @@ elif [ -n "$CA_ARG" ]; then
   pin_ca "$CA_ARG"
 else
   code="$(probe)"
+  if { [ "$code" = 000 ] || [ -z "$code" ]; } && [ "$NO_TOFU" = 1 ]; then
+    die "сертификат https://$MAIN/v2/ не проверяется системными корнями, а корень главного не закреплён и не передан (--ca); с --no-tofu он не берётся с /ca.crt без проверки. Проверьте корень по токену подключения (fetch-main-ca.sh) и передайте --ca FILE."
+  fi
   if [ "$code" = 000 ] || [ -z "$code" ]; then
     # системные корни сертификат не приняли и корень ещё не закреплён: единственный раз берём его с главного (доверие при первом использовании)
     tmp="$(mktemp)"
@@ -109,7 +129,24 @@ case "$code" in
 esac
 
 docker pull "$REMOTE" || die "docker pull $REMOTE не удался: образа нет в реестре главного (на главном: docker exec llm-main curl -s http://127.0.0.1:5000/v2/nsu-llm-node/tags/list; пополняет его install-main.sh с IMAGE_SOURCE=pull или --update) или сертификат реестра не принят"
+# digest манифеста, который отдал реестр главного (его же закрепляют поды кластера); после rmi записи о нём уже нет
+digest="$DIGEST"
+if [ -n "$RECORD" ] && [ -z "$digest" ]; then
+  digest="$(docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$REMOTE" 2>/dev/null | tr -d '\r' | grep -F "$MAIN/nsu-llm-node@" | head -n1 | sed 's/^.*@//' || true)"
+  [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || digest=""
+fi
 docker tag "$REMOTE" "$IMAGE"
 docker rmi "$REMOTE" >/dev/null 2>&1 || true
 docker image inspect "$IMAGE" >/dev/null 2>&1 || die "после docker pull образа $IMAGE нет"
+if [ -n "$RECORD" ]; then
+  id="$(docker image inspect --format '{{.Id}}' "$IMAGE" 2>/dev/null | tr -d '\r' || true)"
+  if [ -n "$digest" ] && [ -n "$id" ]; then
+    mkdir -p "$(dirname "$RECORD")"
+    printf '%s %s\n' "$id" "$digest" >"$RECORD.tmp" && mv -f "$RECORD.tmp" "$RECORD"
+    say "  digest образа в реестре главного: $digest"
+  else
+    rm -f "$RECORD"
+    printf 'Предупреждение: digest образа не определён, нода не сможет сообщить главному, какую версию получила (%s не записан).\n' "$RECORD" >&2
+  fi
+fi
 say "Образ $IMAGE загружен с главного."

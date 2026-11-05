@@ -52,6 +52,11 @@ https://@@PUBLIC_HOSTNAME@@, https://@@MAIN_ADVERTISE_IP@@ {
 @@CA_HANDLER@@
 	}
 
+	# Подпись /ca.crt ключом CA k3s (main/sign-ca.sh): по ней нода проверяет корень главного через хеш CA k3s из токена.
+	handle /ca.crt.p7s {
+@@CA_SIG_HANDLER@@
+	}
+
 	# Части загрузки своих моделей («Мои модели», портал принимает до UPLOAD_CHUNK_MIB, не больше 64 МиБ): до 80 МБ на
 	# запрос, тело идёт в портал потоком (без request_buffers), портал пишет его на диск по мере получения.
 	handle /api/admin/local-models/uploads/* {
@@ -96,19 +101,33 @@ https://@@PUBLIC_HOSTNAME@@, https://@@MAIN_ADVERTISE_IP@@ {
 	# Реестр образов для класса (CNCF registry в k3s главного, main/manifests/common-50-registry.yaml.tmpl): ноды и ПК
 	# класса берут образы ноды с главного по https://<главный>/v2/..., не с ghcr.io. Тот же сайт и тот же сертификат, что у
 	# портала: нового порта открывать не нужно, а CA главного ноды уже получают (/ca.crt). Только чтение (GET, HEAD) и только
-	# из подсетей REGISTRY_ALLOW_FROM (по умолчанию частные сети); запись разрешена лишь самому главному: install-main.sh
-	# кладёт образы прямо на 127.0.0.1:<порт>, мимо Caddy. Без лимита тела и без буферизации: слои до нескольких ГБ.
+	# из подсетей REGISTRY_ALLOW_FROM (по умолчанию частные сети). Сам реестр без пароля не отвечает (SEC-2 M2): для чтения
+	# Caddy подставляет учётку nsu-push, заголовок Authorization клиента заменяется. Записывает только registry-push.sh главного
+	# прямо на 127.0.0.1:<REGISTRY_BACKEND_PORT> с паролем. Без лимита тела и без буферизации: слои до нескольких ГБ.
 	handle /v2/* {
 		@registry_denied not client_ip @@REGISTRY_ALLOW_FROM@@
 		respond @registry_denied `{"errors":[{"code":"DENIED","message":"Реестр образов доступен только из сети класса"}]}` 403
 		@registry_write not method GET HEAD
 		respond @registry_write `{"errors":[{"code":"DENIED","message":"Реестр образов открыт только для чтения"}]}` 405
-		reverse_proxy 127.0.0.1:@@REGISTRY_PORT@@ {
+		reverse_proxy 127.0.0.1:@@REGISTRY_BACKEND_PORT@@ {
+			header_up Authorization "@@REGISTRY_AUTH@@"
 			flush_interval -1
 			transport http {
 				keepalive 4s
 			}
 		}
+	}
+
+	# API нод (/api/nodes/*: регистрация, heartbeat, метрики, desired; токен агента) только из подсетей NODE_ALLOW_FROM (по
+	# умолчанию частные сети, SEC-2 L1): у главного с публичным адресом его не видит интернет. Ноды ходят к главному напрямую,
+	# мимо фронт-прокси; за ним (TRUSTED_PROXIES) client_ip это адрес клиента из X-Forwarded-For.
+	@nodes_denied {
+		path /api/nodes /api/nodes/*
+		not client_ip @@NODE_ALLOW_FROM@@
+	}
+	handle @nodes_denied {
+		header Content-Type "application/json; charset=utf-8"
+		respond `{"detail":"API нод доступен только из сети класса (NODE_ALLOW_FROM главного)"}` 403
 	}
 
 	handle {
@@ -150,10 +169,29 @@ https://@@PUBLIC_HOSTNAME@@, https://@@MAIN_ADVERTISE_IP@@ {
 	}
 }
 
+# Реестр на чтение для самого главного (портал: версии образов нод, install-main.sh: что уже загружено): http://127.0.0.1:
+# <REGISTRY_PORT>, только GET и HEAD, пароль подставляет Caddy. Только loopback контейнера главного.
+http://127.0.0.1:@@REGISTRY_PORT@@ {
+	bind 127.0.0.1
+	@registry_write not method GET HEAD
+	respond @registry_write `{"errors":[{"code":"DENIED","message":"Реестр образов открыт только для чтения: запись через registry-push.sh"}]}` 405
+	reverse_proxy 127.0.0.1:@@REGISTRY_BACKEND_PORT@@ {
+		header_up Authorization "@@REGISTRY_AUTH@@"
+		flush_interval -1
+		transport http {
+			keepalive 4s
+		}
+	}
+}
+
 # Порт 80: корневой сертификат для установки в браузеры, остальное на https.
 http:// {
 	handle /ca.crt {
 @@CA_HANDLER@@
+	}
+
+	handle /ca.crt.p7s {
+@@CA_SIG_HANDLER@@
 	}
 
 	handle {

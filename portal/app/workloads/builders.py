@@ -15,8 +15,9 @@ from app.catalog.placement import rpc_devices
 from app.config import key_fingerprint
 from app.deployments import llama_args
 from app.localmodels.store import is_local
+from app.nodes import versions
+from app import mirror_tokens
 from app.k8s import (
-    A_BACKEND_KEY,
     A_GROUP_HASH,
     A_GROUP_MEMBERS,
     A_MAX_TOKENS,
@@ -26,6 +27,7 @@ from app.k8s import (
     CLASS_TAINT,
     L_ACCEL,
     L_DEPLOYMENT,
+    L_NODE_DEPLOYMENT,
     L_ROLE,
 )
 
@@ -38,18 +40,29 @@ NAME_LABEL = "app.kubernetes.io/name"
 HOSTNAME_LABEL = "kubernetes.io/hostname"
 GPU_RESOURCE = "nvidia.com/gpu"
 # Every pod built here runs on a node, whose kubelet may read each Secret its pods reference (k3s Node authorizer):
-# they reference only `llm-node-secrets` (main/manifests/common-10-secrets), never `llm-secrets` with main's own keys.
+# they reference only `llm-node-secrets` (main/manifests/common-10-secrets), never `llm-secrets` with main's own keys,
+# and of it only HF_TOKEN with the mirror off. Neither the shared backend key nor the mirror's own key reaches a pod
+# any more (task SEC-1): the backend key is the node's own, the mirror token names the deployment's repositories.
 NODE_SECRETS_NAME = "llm-node-secrets"
-BACKEND_KEY_SECRET_KEY = "BACKEND_API_KEY"  # key inside the `llm-node-secrets` Secret
-HF_TOKEN_SECRET_KEY = "HF_TOKEN"  # same Secret, set only with HF_MIRROR_ENABLED=false (main/render_manifests.py)
-HF_MIRROR_TOKEN_SECRET_KEY = "HF_MIRROR_TOKEN"  # the nodes' key to the mirror on main, same Secret
+HF_TOKEN_SECRET_KEY = "HF_TOKEN"  # set only with HF_MIRROR_ENABLED=false (main/render_manifests.py)
+# The node's own backend key: registrar.sh writes it to $STATE_DIR/backend/key of the node container (= the host of the
+# k3s agent, so a hostPath), derived from the node's key (app.nodes.identity.backend_key_of). Only that directory is
+# mounted, never the state directory with the node's key itself.
+BACKEND_KEY_HOST_DIR = "/var/lib/llm-node/backend"
+BACKEND_KEY_DIR = "/run/llm-backend"
+BACKEND_KEY_FILE = f"{BACKEND_KEY_DIR}/key"
 # repos of every deployment, kept by the workload controller: serve-llama.sh deletes cached shards of other repos
 MODEL_REPOS_CONFIGMAP = "llm-model-repos"
 MODEL_REPOS_KEY = "repos"
 CA_CONFIGMAP = "llm-ca"  # main's CA for https://<main>/hf (main/entrypoint.sh, render_manifests.py --ca)
 CA_DIR = "/etc/llm-ca"
 CA_BUNDLE = f"{CA_DIR}/bundle.crt"
-VLLM_CA_WRAPPER = (
+# the node's backend key from its file (waits for the node container to write it, like serve-llama.sh); then, with the
+# mirror, the CA bundle only when the optional llm-ca ConfigMap is there
+VLLM_WRAPPER = (
+    'i=0; while [ ! -s "$VLLM_API_KEY_FILE" ] && [ "$i" -lt 300 ]; do sleep 1; i=$((i+1)); done; '
+    '[ -s "$VLLM_API_KEY_FILE" ] || { echo "no backend key in $VLLM_API_KEY_FILE: the node has not registered" >&2; exit 1; }; '
+    'VLLM_API_KEY="$(cat "$VLLM_API_KEY_FILE")"; export VLLM_API_KEY; unset VLLM_API_KEY_FILE; '
     f'b="${{LLM_CA_BUNDLE:-{CA_BUNDLE}}}"; '
     'if [ -s "$b" ]; then export SSL_CERT_FILE="$b" REQUESTS_CA_BUNDLE="$b" CURL_CA_BUNDLE="$b"; fi; '
     'exec vllm serve "$@"'
@@ -168,8 +181,23 @@ def object_name(dep, kind: str) -> str:
     return f"llm-{dep.name}-{kind}"
 
 
-def _image(s, accel: str) -> str:
+def _tag_image(s, accel: str) -> str:
     return f"{s.node_image_repo}:{s.node_image_tag}-{_SUFFIX[accel]}"
+
+
+def _image(s, accel: str) -> str:
+    """The node image of the pods: `<repo>@sha256:...` while main's registry has the tag, so an image pushed under the same
+    tag becomes a new pod template and reaches the nodes by itself, and the template stays the same while it does not;
+    else the tag (versions.Registry knows the digest; the workload controller asks the registry before it builds)."""
+    digest = versions.pinned_digest(s, accel)
+    return f"{s.node_image_repo}@{digest}" if digest else _tag_image(s, accel)
+
+
+def _pull_policy(s, accel: str) -> str:
+    """IfNotPresent for a digest (it names one image) and while pinning is off; Always for the bare tag, which can move."""
+    if not s.node_image_pin or versions.pinned_digest(s, accel):
+        return "IfNotPresent"
+    return "Always"
 
 
 def _labels(dep, role: str) -> dict[str, str]:
@@ -198,7 +226,8 @@ def _daemonset(
 ) -> dict:
     labels = _labels(dep, role)
     pod_spec = {
-        "nodeSelector": {L_DEPLOYMENT: dep.name, L_ACCEL: accel},
+        # the portal's label (a kubelet cannot set it on its own Node, k8s.L_NODE_DEPLOYMENT), set only on approved nodes
+        "nodeSelector": {L_NODE_DEPLOYMENT: dep.name, L_ACCEL: accel},
         "hostNetwork": True,
         "dnsPolicy": "Default",
         "tolerations": [dict(CLASS_TOLERATION)],
@@ -299,28 +328,38 @@ def uses_mirror(dep, s) -> bool:
     )
 
 
-def _with_secrets(env: list[dict], s, key_env: str, mirror: bool) -> list[dict]:
-    """Adds the Hugging Face access and the shared backend key, both as references to the `llm-node-secrets` Secret:
-    neither value is written into the pod object.
+def _with_secrets(env: list[dict], s, key_env: str, mirror: bool, dep=None) -> list[dict]:
+    """Adds the Hugging Face access and the node's own backend key; no secret value is written into the pod object.
 
     With the mirror on main the pod downloads from `<mirror>/c/<node>` (the node name tags its transfers for the
-    progress report) with the mirror key in HF_TOKEN; otherwise from Hugging Face with the real token, if any.
-    The key reaches the server through its own environment variable (`LLAMA_API_KEY` for llama-server,
-    `VLLM_API_KEY` for vLLM): it never appears in a command line.
+    progress report) with a mirror token that opens the repositories of `dep` only (app.mirror_tokens: a node never holds
+    the mirror's own key, which would open everything the operator's HF_TOKEN sees). Otherwise from Hugging Face with the
+    real token, if any, as a reference to `llm-node-secrets`.
+    The backend key is the file `<key_env>_FILE` names (the node's own, BACKEND_KEY_FILE); the server reads it into its
+    own environment variable (`LLAMA_API_KEY` for llama-server, `VLLM_API_KEY` for vLLM), never a command line.
     """
     env = list(env)
     if mirror:
+        repos = deployment_repos(dep) if dep is not None else set()
+        token = mirror_tokens.mint(s.hf_mirror_token.get_secret_value(), mirror_tokens.ANY_CLIENT, repos)
         env += [
             {"name": "NODE_NAME", "valueFrom": {"fieldRef": {"fieldPath": "spec.nodeName"}}},
             {"name": "HF_ENDPOINT", "value": f"{s.node_hf_endpoint}/c/$(NODE_NAME)"},
-            {"name": "HF_TOKEN", "valueFrom": {"secretKeyRef": {"name": NODE_SECRETS_NAME, "key": HF_MIRROR_TOKEN_SECRET_KEY}}},
+            {"name": "HF_TOKEN", "value": token},
         ]
     elif s.hf_token.get_secret_value():
         # optional: a Secret rendered by an older main has no HF_TOKEN key, and the pod must still start
         ref = {"name": NODE_SECRETS_NAME, "key": HF_TOKEN_SECRET_KEY, "optional": True}
         env.append({"name": "HF_TOKEN", "valueFrom": {"secretKeyRef": ref}})
-    key = {"name": key_env, "valueFrom": {"secretKeyRef": {"name": NODE_SECRETS_NAME, "key": BACKEND_KEY_SECRET_KEY}}}
-    return env + [key]
+    return env + [{"name": f"{key_env}_FILE", "value": BACKEND_KEY_FILE}]
+
+
+def _backend_key_volume() -> tuple[dict, dict]:
+    """The node's backend key directory (hostPath of the node container), read-only. DirectoryOrCreate: a pod that starts
+    before the node container wrote its key waits for the file (serve-llama.sh) instead of failing to mount."""
+    mount = {"name": "backend-key", "mountPath": BACKEND_KEY_DIR, "readOnly": True}
+    volume = {"name": "backend-key", "hostPath": {"path": BACKEND_KEY_HOST_DIR, "type": "DirectoryOrCreate"}}
+    return mount, volume
 
 
 def _inference_annotations(dep, s) -> dict[str, str]:
@@ -329,10 +368,6 @@ def _inference_annotations(dep, s) -> dict[str, str]:
         A_MODEL: dep.name,
         A_MAX_TOKENS: str(dep.ctx_per_request),
     }
-    if s.backend_key_fingerprint:
-        # a secretKeyRef value is read when the container starts: a new fingerprint changes the template hash,
-        # so the pods are recreated and pick up the rotated key
-        annotations[A_BACKEND_KEY] = s.backend_key_fingerprint
     hf_token = s.hf_token.get_secret_value()
     if hf_token and not uses_mirror(dep, s):
         annotations[A_HF_TOKEN] = key_fingerprint(hf_token)  # same reason: a new token restarts the pods
@@ -390,20 +425,21 @@ def _ca_volume(mirror: bool) -> tuple[list[dict], list[dict]]:
 def replicas_daemonset(dep, accel: str, s) -> dict:
     """llama.cpp replica per node of the given accel (`cpu` or `nvidia`)."""
     mount, volume = _models_volume()
+    key_mount, key_volume = _backend_key_volume()
     ca_mounts, ca_volumes = _ca_volume(uses_mirror(dep, s))
     container = {
         "name": "llama",
         "image": _image(s, accel),
-        "imagePullPolicy": "IfNotPresent",
+        "imagePullPolicy": _pull_policy(s, accel),
         "command": ["/opt/llm/bin/serve-llama.sh"],
-        "env": _with_secrets(_llama_env(dep, s, accel), s, "LLAMA_API_KEY", uses_mirror(dep, s)),
+        "env": _with_secrets(_llama_env(dep, s, accel), s, "LLAMA_API_KEY", uses_mirror(dep, s), dep),
         "ports": [{"containerPort": s.infer_port, "hostPort": s.infer_port}],
-        "volumeMounts": [mount, *ca_mounts],
+        "volumeMounts": [mount, key_mount, *ca_mounts],
         **_http_probes(s.infer_port, startup_budget_s(dep, s)),
     }
     return _daemonset(
         dep, accel, ROLE_INFERENCE, object_name(dep, _SUFFIX[accel]), s, container,
-        {"volumes": [volume, *ca_volumes]}, _inference_annotations(dep, s),
+        {"volumes": [volume, key_volume, *ca_volumes]}, _inference_annotations(dep, s),
     )
 
 
@@ -425,25 +461,28 @@ def vllm_daemonset(dep, s) -> dict:
     if arch.startswith("gemma4"):
         args += _GEMMA4_FLAGS
     ca_mounts, ca_volumes = _ca_volume(uses_mirror(dep, s))
-    # with the mirror, a shell sets the CA bundle only when the optional llm-ca ConfigMap is there (an SSL_CERT_FILE
-    # naming a missing file would break every TLS connection of vLLM); `$0` is "vllm", the args follow as "$@"
-    command = ["/bin/sh", "-c", VLLM_CA_WRAPPER, "vllm"] if ca_mounts else ["vllm", "serve"]
+    key_mount, key_volume = _backend_key_volume()
+    # a shell reads the node's backend key from its file and, with the mirror, sets the CA bundle only when the optional
+    # llm-ca ConfigMap is there (an SSL_CERT_FILE naming a missing file would break every TLS connection of vLLM);
+    # `$0` is "vllm", the args follow as "$@"
+    command = ["/bin/sh", "-c", VLLM_WRAPPER, "vllm"]
     container = {
         "name": "vllm",
         "image": VLLM_IMAGE,
         "imagePullPolicy": "IfNotPresent",
         "command": command,
         "args": args,
-        "env": _with_secrets([], s, "VLLM_API_KEY", uses_mirror(dep, s)),
+        "env": _with_secrets([], s, "VLLM_API_KEY", uses_mirror(dep, s), dep),
         "ports": [{"containerPort": s.infer_port, "hostPort": s.infer_port}],
         "volumeMounts": [
-            {"name": "hf-cache", "mountPath": VLLM_HF_CACHE}, {"name": "shm", "mountPath": "/dev/shm"}, *ca_mounts,
+            {"name": "hf-cache", "mountPath": VLLM_HF_CACHE}, {"name": "shm", "mountPath": "/dev/shm"}, key_mount, *ca_mounts,
         ],
         **_http_probes(s.infer_port, startup_budget_s(dep, s)),
     }
     volumes = [
         {"name": "hf-cache", "hostPath": {"path": f"{MODELS_DIR}/huggingface", "type": "DirectoryOrCreate"}},
         {"name": "shm", "emptyDir": {"medium": "Memory"}},
+        key_volume,
         *ca_volumes,
     ]
     return _daemonset(
@@ -487,7 +526,7 @@ def rpc_daemonset(dep, accel: str, s, memory_limit_mib: int | None = None) -> di
     container = {
         "name": "rpc",
         "image": _image(s, accel),
-        "imagePullPolicy": "IfNotPresent",
+        "imagePullPolicy": _pull_policy(s, accel),
         "command": ["/opt/llm/bin/serve-rpc.sh"],
         "env": [{"name": k, "value": v} for k, v in env.items()],
         "ports": [{"containerPort": s.rpc_port, "hostPort": s.rpc_port}],
@@ -512,6 +551,7 @@ def split_leader(dep, index: int, group: list[RpcWorker], s, tensor_split: list[
     """
     accel = group[0].accel
     mount, volume = _models_volume()
+    key_mount, key_volume = _backend_key_volume()
     ca_mounts, ca_volumes = _ca_volume(uses_mirror(dep, s))
     rpc_servers = ",".join([f"127.0.0.1:{s.rpc_port}"] + [f"{w.ip}:{w.port}" for w in group[1:]])
     env = _llama_env(dep, s, "cpu") + [
@@ -525,19 +565,20 @@ def split_leader(dep, index: int, group: list[RpcWorker], s, tensor_split: list[
     container = {
         "name": "llama",
         "image": _image(s, accel),
-        "imagePullPolicy": "IfNotPresent",
+        "imagePullPolicy": _pull_policy(s, accel),
         "command": ["/opt/llm/bin/serve-llama.sh"],
-        "env": _with_secrets(env, s, "LLAMA_API_KEY", uses_mirror(dep, s)),
+        "env": _with_secrets(env, s, "LLAMA_API_KEY", uses_mirror(dep, s), dep),
         "ports": [{"containerPort": s.infer_port, "hostPort": s.infer_port}],
-        "volumeMounts": [mount, *ca_mounts],
+        "volumeMounts": [mount, key_mount, *ca_mounts],
         **_http_probes(s.infer_port, startup_budget_s(dep, s)),
     }
     pod_spec = {
         "affinity": {
             "nodeAffinity": {
                 "requiredDuringSchedulingIgnoredDuringExecution": {
+                    # by the Node's name, which a kubelet cannot choose for another node (a label it can set itself)
                     "nodeSelectorTerms": [
-                        {"matchExpressions": [{"key": HOSTNAME_LABEL, "operator": "In", "values": [group[0].node_name]}]}
+                        {"matchFields": [{"key": "metadata.name", "operator": "In", "values": [group[0].node_name]}]}
                     ]
                 }
             }
@@ -546,7 +587,7 @@ def split_leader(dep, index: int, group: list[RpcWorker], s, tensor_split: list[
         "dnsPolicy": "Default",
         "tolerations": [dict(CLASS_TOLERATION)],
         "containers": [container],
-        "volumes": [volume, *ca_volumes],
+        "volumes": [volume, key_volume, *ca_volumes],
     }
     if accel == "nvidia":
         pod_spec["runtimeClassName"] = "nvidia"
@@ -594,7 +635,7 @@ def wake_job(relay: str, accel: str | None, target: str, mac: str, broadcast: st
                     "containers": [
                         {
                             "name": "wake",
-                            "image": _image(s, accel if accel in _SUFFIX else "cpu"),
+                            "image": _tag_image(s, accel if accel in _SUFFIX else "cpu"),  # the name the node image has on the node
                             "imagePullPolicy": "Never",
                             "command": ["wol-send.sh", mac, broadcast],
                             "securityContext": {"allowPrivilegeEscalation": False, "privileged": False},
@@ -605,6 +646,57 @@ def wake_job(relay: str, accel: str | None, target: str, mac: str, broadcast: st
             },
         },
     }
+
+ROLE_PURGE = "purge"
+L_PURGE_NODE = "llm.nsu/purge-node"
+PURGE_DEADLINE_S = 900  # removing tens of GB from a slow disk may take minutes
+
+
+def purge_job(node: str, accel: str | None, args: list[str], s) -> dict:
+    """A one-shot Job pinned to a class node that runs models-cleanup.sh of the node image on its models volume (task
+    2-26): the volume is the node's `llm-models`, which the pods see as the hostPath /var/lib/llm-models, on WSL and
+    Docker Desktop nodes alike. It needs no pod of the deployment and no listener or token on the node. hostNetwork like
+    every pod here (no dependence on the pod network of a PC), no privilege, no service account token, no secrets;
+    Kubernetes collects the finished Job, the portal reads the `RESULT` line of its log first. `args` are the
+    arguments of the script (`--keep repo:file`, `--keep-rpc`, ...); the image is the node image the portal is
+    configured with, pulled from main's registry if the node has not got it."""
+    mount, volume = _models_volume()
+    labels = {PART_OF: "nsu-llm", L_ROLE: ROLE_PURGE, L_PURGE_NODE: node}
+    return {
+        "apiVersion": "batch/v1",
+        "kind": "Job",
+        "metadata": {"generateName": "llm-purge-", "namespace": s.k8s_namespace, "labels": labels},
+        "spec": {
+            "backoffLimit": 0,
+            "activeDeadlineSeconds": PURGE_DEADLINE_S,
+            "ttlSecondsAfterFinished": 900,
+            "template": {
+                "metadata": {"labels": labels},
+                "spec": {
+                    "nodeName": node,
+                    "hostNetwork": True,
+                    "dnsPolicy": "Default",
+                    "restartPolicy": "Never",
+                    "automountServiceAccountToken": False,
+                    "tolerations": [dict(CLASS_TOLERATION)],
+                    "containers": [
+                        {
+                            "name": "purge",
+                            "image": _image(s, accel if accel in _SUFFIX else "cpu"),
+                            "imagePullPolicy": "IfNotPresent",
+                            "command": ["/opt/llm/bin/models-cleanup.sh", *args],
+                            "env": [{"name": "LLAMA_CACHE", "value": MODELS_DIR}],
+                            "securityContext": {"allowPrivilegeEscalation": False, "privileged": False},
+                            "resources": {"requests": {"cpu": "10m", "memory": "32Mi"}, "limits": {"memory": "256Mi"}},
+                            "volumeMounts": [mount],
+                        }
+                    ],
+                    "volumes": [volume],
+                },
+            },
+        },
+    }
+
 
 # ---------- the command of llama-server, for the admin's preview (task 2-22b) ----------
 
@@ -636,7 +728,7 @@ def serve_llama_argv(env: dict[str, str], threads: str = "$THREADS") -> list[str
     ngl = env.get("NGL") or ("99" if rpc or accel == "nvidia" else "0")
     cmd = [
         "llama-server", "--host", "0.0.0.0", "--port", env.get("INFER_PORT", "18080"),
-        "--jinja", "--cache-ram", "512", "-fa", "auto",
+        "--jinja", "--metrics", "--cache-ram", "512", "-fa", "auto",
         "--ctx-size", env.get("CTX_SIZE", "8192"), "--parallel", env.get("PARALLEL_SLOTS", "1"), "--no-kv-unified",
         "-ngl", ngl, "-t", threads, "--alias", env.get("PUBLIC_MODEL_NAME") or file.removesuffix(".gguf"),
     ]

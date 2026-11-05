@@ -16,7 +16,7 @@
 set -euo pipefail
 export MSYS_NO_PATHCONV=1  # Git Bash в Windows: /run и /var/run в аргументах docker не превращать в пути Windows
 
-VERSION="0.1.0"
+VERSION="0.2.0"
 CONTAINER="llm-main"
 IMAGE="nsu-llm-main:$VERSION"
 ENV_FILE=".env"
@@ -118,6 +118,15 @@ if [ "$DRY" != 1 ]; then
   docker image inspect "$IMAGE" >/dev/null 2>&1 || die "образ $IMAGE не найден (docker build -f main/Dockerfile -t $IMAGE . или docker load)"
 fi
 
+# Digest образа главного для блока «Версии» («Состояние»): изнутри контейнера его не видно, его знает тот, кто запускает. Digest реестра
+# (RepoDigests, если образ скачан с ghcr.io), иначе id образа (собранного на месте); не определился: переменная не передаётся.
+if [ "$DRY" != 1 ]; then
+  main_digest="$(docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$IMAGE" 2>/dev/null | tr -d '\r' \
+    | sed -n 's/.*@\(sha256:[0-9a-f]\{64\}\)$/\1/p' | head -n1)"
+  [ -n "$main_digest" ] || main_digest="$(docker image inspect --format '{{.Id}}' "$IMAGE" 2>/dev/null | tr -d '\r' | head -n1)"
+  [[ "$main_digest" =~ ^sha256:[0-9a-f]{64}$ ]] && EXTRA_ENV+=(-e "MAIN_IMAGE_DIGEST=$main_digest")
+fi
+
 sha256_of() { sha256sum "$1" | awk '{print $1}'; }
 
 # Архив системных образов k3s: скачивается, если его нет или он не совпадает с sha256sum-amd64.txt релиза.
@@ -168,7 +177,9 @@ ARGS=(run -d --name "$CONTAINER" --hostname llm-main --privileged --restart unle
   --ulimit nofile=1048576:1048576
   --log-driver json-file --log-opt max-size=50m --log-opt max-file=5
   --tmpfs /run --tmpfs /var/run
-  -p 443:443 -p 80:80 -p 6443:6443
+  # только IPv4 (SEC-2 L1): по IPv6 контейнер без IPv6 получает соединение через docker-proxy с адресом шлюза bridge (172.x),
+  # и фильтры по адресу клиента (REGISTRY_ALLOW_FROM, NODE_ALLOW_FROM) приняли бы любой адрес из интернета за частный
+  -p 0.0.0.0:443:443 -p 0.0.0.0:80:80 -p 0.0.0.0:6443:6443
   -v llm-main-k3s:/var/lib/rancher/k3s -v llm-main-kubelet:/var/lib/kubelet -v llm-main-data:/var/lib/llm
   -v llm-main-hf:/var/lib/llm-hf -v llm-main-registry:/var/lib/llm-registry
   --env-file "$(host_path "$ENV_FILE")")

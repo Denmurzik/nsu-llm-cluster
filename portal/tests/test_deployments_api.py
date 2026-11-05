@@ -18,7 +18,7 @@ REPO = "org/model-GGUF"
 FILE = "model-Q4_K_M.gguf"
 BIG_REPO = "org/big-GGUF"
 BIG_FILE = "big-Q4_K_M.gguf"
-ADMIN = {"sub": "adm", "email": "admin@g.nsu.ru"}
+ADMIN = {"sub": "adm", "email": "admin@g.nsu.ru", "email_verified": True}
 USER = {"sub": "usr", "email": "ivan@g.nsu.ru"}
 SMALL = GgufMeta("llama", 32, 32, 8, 128, 4096, 32768)
 # a 31B-like model: Q4 weights ~18.7 GiB, 60 layers, 16 KV heads of 128
@@ -224,10 +224,11 @@ async def test_public_status_no_login(client, app):
     client.cookies.clear()
     r = await client.get("/api/public/status")
     assert r.status_code == 200
-    assert r.json() == {"models": [{"name": "m1", "status": "ready", "ready_backends": 1}]}
+    assert r.json() == {"login_provider": "SSO", "models": [{"name": "m1", "status": "ready", "ready_backends": 1}]}
     app.state.litellm.unavailable = True
     assert (await client.get("/api/public/status")).json() == {
-        "models": [{"name": "m1", "status": "unknown", "ready_backends": None}]
+        "login_provider": "SSO",
+        "models": [{"name": "m1", "status": "unknown", "ready_backends": None}],
     }
 
 

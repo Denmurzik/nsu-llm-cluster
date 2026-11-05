@@ -49,7 +49,7 @@ base = {
     "TRUSTED GET https://llm.nsu.test/readyz": {"code": 200},
     "POST https://llm.nsu.test/api/nodes/register": {"code": 401},
   },
-  "firewall": {"rules": [{"name": "NSU-LLM-Node", "action": "Allow", "protocol": "TCP", "ports": "18080,18050", "remote": "Any"}]},
+  "firewall": {"rules": [{"name": "NSU-LLM-Node", "action": "Allow", "protocol": "TCP", "ports": "18080,18050", "remote": "10.0.0.5"}]},
   "wsl": {"installed": True, "version": "2.3.26", "networking_mode": "mirrored", "wslconfig": "[wsl2]\nnetworkingMode=mirrored\n",
           "dns": {"llm.nsu.test": "10.0.0.5"}, "tcp": {"10.0.0.5:6443": "open"}},
   "node_runtime": "wsl",
@@ -148,8 +148,22 @@ has "регистрация: сообщение" "$out" "POST /api/nodes/registe
 run "$(stub fw0 'd["firewall"]["rules"] = []')" -Main llm.nsu.test -NonInteractive
 eq "правил нет: код 1" "$rc" 1
 has "нет правила 18080" "$out" "нет разрешающего правила для входящего 18080/tcp"
-has "команда создания правила с подсетью и главным" "$out" "-RemoteAddress 10.0.1.0/24,10.0.0.5"
+has "команда создания правила: только главный, не подсеть класса" "$out" "-LocalPort 18080 -RemoteAddress 10.0.0.5"
+has "команда создания правила RPC: своё имя, только главный" "$out" "New-NetFirewallRule -DisplayName NSU-LLM-Node-RPC -Direction Inbound -Protocol TCP -LocalPort 18050 -RemoteAddress 10.0.0.5"
+lacks "подсеть класса не предлагается" "$out" "10.0.1.0/24"
 has "18050 только предупреждение" "$out" "[ВНИМ] брандмауэр: нет разрешающего правила для входящего 18050/tcp"
+
+# 18050 открыт слишком широко (любые адреса, подсеть класса, LocalSubnet): предупреждение, код 0
+run "$(stub fwany 'd["firewall"]["rules"][0]["remote"] = "Any"')" -Main llm.nsu.test -NonInteractive
+eq "18050 для любых адресов: код 0 (предупреждение)" "$rc" 0
+has "18050 для любых адресов: предупреждение" "$out" "18050/tcp (RPC split, без аутентификации) открыт для 'Any'"
+has "18050 для любых адресов: исправление" "$out" "Set-NetFirewallRule -DisplayName 'NSU-LLM-Node' -RemoteAddress 10.0.0.5"
+run "$(stub fwnet 'd["firewall"]["rules"][0]["remote"] = "10.0.1.0/24,10.0.0.5"')" -Main llm.nsu.test -NonInteractive
+has "18050 для подсети класса: предупреждение" "$out" "открыт для '10.0.1.0/24,10.0.0.5'"
+run "$(stub fwsub 'd["firewall"]["rules"][0]["remote"] = "LocalSubnet"')" -Main llm.nsu.test -NonInteractive
+has "18050 для LocalSubnet: предупреждение" "$out" "открыт для 'LocalSubnet'"
+run "$(stub fwmain 'd["firewall"]["rules"][0]["remote"] = "10.0.0.5,10.0.1.7"')" -Main llm.nsu.test -NonInteractive
+lacks "18050 для главного и нод группы: без предупреждения" "$out" "открыт для"
 
 run "$(stub fw1 'd["firewall"]["rules"][0]["ports"] = "18080"')" -Main llm.nsu.test -NonInteractive
 eq "только 18080: код 0" "$rc" 0
@@ -217,7 +231,7 @@ run "$(stub hv50 'd["hyperv"]["rules"] = [{"name": "llm-inference", "ports": "18
 eq "Hyper-V firewall без правила для 18050: только предупреждение, код 0" "$rc" 0
 has "Hyper-V: 18080 разрешён" "$out" "Hyper-V firewall: входящий 18080/tcp разрешён правилом llm-inference"
 has "Hyper-V: 18050 предупреждение" "$out" "[ВНИМ] Hyper-V firewall: нет правила для входящего 18050/tcp"
-has "Hyper-V: 18050 исправление" "$out" "-LocalPorts 18080,18050"
+has "Hyper-V: 18050 исправление: только главный" "$out" "-LocalPorts 18050 -RemoteAddresses 10.0.0.5"
 
 run "$(stub hvallow 'd["hyperv"]["rules"] = []; d["hyperv"]["default_inbound"] = "Allow"')" -Main llm.nsu.test -NonInteractive
 eq "Hyper-V firewall по умолчанию разрешает: код 0" "$rc" 0
@@ -255,6 +269,20 @@ has "Docker Desktop: NAT нормален" "$out" "WSL работает в ре�
 lacks "Docker Desktop: без проверки Hyper-V" "$out" "Hyper-V firewall: входящие в WSL запрещены"
 lacks "Docker Desktop: без проверок изнутри WSL" "$out" "внутри WSL"
 has "Docker Desktop: без предупреждений" "$out" "предупреждений: 0"
+# Docker Desktop разрешает com.docker.backend.exe на любые порты: без запрета NSU-LLM-Node-Block узкие правила ничего не ограничивают
+DDP='d["node_runtime"] = "desktop"; d["wsl"]["networking_mode"] = "nat"; d["wsl"]["wslconfig"] = ""; d["hyperv"]["rules"] = []; d["wsl"]["dns"] = {}; d["firewall"]["rules"].append({"name": "Docker Desktop Backend", "action": "Allow", "protocol": "TCP", "ports": "Any", "remote": "Any", "program": "C:\Program Files\Docker\Docker\resources\com.docker.backend.exe"})'
+run "$(stub ddprog "$DDP")" -Main llm.nsu.test -NonInteractive
+eq "Docker Desktop с правилом программы без запрета: код 0 (предупреждение)" "$rc" 0
+has "Docker Desktop: правило программы перекрывает узкие правила" "$out" "правило Docker Desktop (Docker Desktop Backend) пускает любые адреса на порты ноды, запрета NSU-LLM-Node-Block нет"
+has "Docker Desktop: исправление называет установщик" "$out" "install-node.ps1 или run-node.ps1 -SyncFirewall"
+run "$(stub ddblock "$DDP; d['firewall']['rules'].append({'name': 'NSU-LLM-Node-Block', 'action': 'Block', 'protocol': 'TCP', 'ports': '18080', 'remote': '0.0.0.0-126.255.255.255,128.0.0.0-10.0.0.4,10.0.0.6-255.255.255.255'})")" -Main llm.nsu.test -NonInteractive
+eq "Docker Desktop с запретом NSU-LLM-Node-Block: код 0" "$rc" 0
+lacks "Docker Desktop: запрет самого установщика не называется проблемой" "$out" "запрещающие входящие правила"
+lacks "Docker Desktop: с запретом предупреждения про программу нет" "$out" "запрета NSU-LLM-Node-Block нет"
+# Hyper-V firewall: DefaultInboundAction=Allow обнуляет все правила
+run "$(stub hvallow 'd["hyperv"]["default_inbound"] = "Allow"')" -Main llm.nsu.test -NonInteractive
+has "Hyper-V по умолчанию разрешает: это предупреждение, а не «ок»" "$out" "[ВНИМ] Hyper-V firewall: входящие в WSL разрешены по умолчанию (DefaultInboundAction=Allow)"
+has "Hyper-V по умолчанию разрешает: исправление" "$out" "Set-NetFirewallHyperVVMSetting -Name '{40E0AC32-46A5-438A-A0B2-2B479E8F2E90}' -DefaultInboundAction Block"
 
 run "$(stub desktopwin10 'd["node_runtime"] = "desktop"; d["os_build"] = 19045')" -Main llm.nsu.test -NonInteractive
 eq "Docker Desktop на Windows 10: код 0" "$rc" 0

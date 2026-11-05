@@ -16,7 +16,7 @@ from tests.helpers.auth import authorize, csrf_headers, install_fake_oidc, login
 pytestmark = pytest.mark.docker
 
 USER = {"sub": "usr-1", "email": "ivan@g.nsu.ru", "preferred_username": "ivan"}
-ADMIN = {"sub": "adm-1", "email": "admin@g.nsu.ru", "preferred_username": "adm"}
+ADMIN = {"sub": "adm-1", "email": "admin@g.nsu.ru", "email_verified": True, "preferred_username": "adm"}
 BLOCKED = "Доступ заблокирован администратором"
 
 

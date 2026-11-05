@@ -38,6 +38,16 @@ def test_scrub_keeps_names_that_only_look_like_secrets():
     assert audit.scrub(details) == details
 
 
+def test_scrub_drops_the_plurals_that_hold_lists_of_key_secrets():
+    """This codebase passes lists of LiteLLM key secrets as `tokens` / `keys`; max_keys and the limits stay."""
+    details = {
+        "tokens": ["h1", "h2"], "keys": ["sk-1"], "Keys": ["sk-2"], "litellm_tokens": ["h3"], "revoked_keys": ["sk-3"],
+        "max_keys": 3, "rpm_limit": 10, "tpm_limit": 1000, "max_tokens": 256, "tokens_30d": 5,
+    }
+    assert audit.scrub(details) == {"max_keys": 3, "rpm_limit": 10, "tpm_limit": 1000, "max_tokens": 256, "tokens_30d": 5}
+    assert audit.scrub({"nested": {"tokens": ["h"], "ok": 1}}) == {"nested": {"ok": 1}}
+
+
 def test_scrub_works_through_nested_dicts_and_lists():
     details = {
         "changes": {"ctx": 4096, "extra": {"token": "t", "mode": "split"}},
@@ -63,12 +73,14 @@ def test_scrub_of_nothing_is_nothing():
     assert audit.scrub({}) == {}
 
 
-def make_request(headers: dict[str, str], peer: str | None) -> Request:
+def make_request(headers: dict[str, str], peer: str | None, app=None) -> Request:
     scope = {
         "type": "http",
         "headers": [(k.lower().encode(), v.encode()) for k, v in headers.items()],
         "client": (peer, 1234) if peer else None,
     }
+    if app is not None:
+        scope["app"] = app
     return Request(scope)
 
 
@@ -77,16 +89,41 @@ def make_request(headers: dict[str, str], peer: str | None) -> Request:
     [
         ({}, "10.1.2.3", "10.1.2.3"),
         ({}, None, None),
-        # behind Caddy on the same host the client is the first entry of X-Forwarded-For
-        ({"X-Forwarded-For": "203.0.113.7, 10.0.0.1"}, "127.0.0.1", "203.0.113.7"),
+        # behind Caddy on the same host the client is the entry Caddy appended (the last one); the first one is whatever
+        # a client wrote (finding L3)
+        ({"X-Forwarded-For": "6.6.6.6, 203.0.113.7"}, "127.0.0.1", "203.0.113.7"),
         ({"X-Forwarded-For": "203.0.113.7"}, "::1", "203.0.113.7"),
+        # uvicorn (proxy headers, trusts 127.0.0.1) has already put that entry in place of the loopback peer
+        ({"X-Forwarded-For": "6.6.6.6, 203.0.113.7"}, "203.0.113.7", "203.0.113.7"),
+        # a header a client can send through Caddy is never believed
+        ({"X-Real-IP": "1.1.1.1", "X-Forwarded-For": "203.0.113.7"}, "127.0.0.1", "203.0.113.7"),
+        ({"X-Forwarded-For": "not-an-ip"}, "127.0.0.1", "127.0.0.1"),
         ({}, "127.0.0.1", "127.0.0.1"),
         # any other peer could forge the header
         ({"X-Forwarded-For": "1.2.3.4"}, "192.168.3.50", "192.168.3.50"),
+        # a front proxy that is not in TRUSTED_PROXIES is the client as far as the portal can tell
+        ({"X-Forwarded-For": "6.6.6.6, 198.51.100.4, 10.0.0.10"}, "127.0.0.1", "10.0.0.10"),
     ],
 )
 def test_client_ip(headers, peer, expected):
     assert audit.client_ip(make_request(headers, peer)) == expected
+
+
+@pytest.mark.parametrize("peer", ["127.0.0.1", "10.0.0.10"])
+def test_client_ip_walks_past_trusted_front_proxies_only(peer):
+    from types import SimpleNamespace
+
+    from app.config import Settings
+
+    settings = Settings(trusted_proxies="10.0.0.0/24, 2001:db8::1")
+    app = SimpleNamespace(state=SimpleNamespace(settings=settings))
+    xff = {"X-Forwarded-For": "6.6.6.6, 198.51.100.4, 10.0.0.10"}
+    assert audit.client_ip(make_request(xff, peer, app)) == "198.51.100.4"  # not the 6.6.6.6 the client wrote
+    # a chain of trusted proxies
+    xff = {"X-Forwarded-For": "6.6.6.6, 198.51.100.4, 10.0.0.11, 10.0.0.10"}
+    assert audit.client_ip(make_request(xff, peer, app)) == "198.51.100.4"
+    with pytest.raises(ValueError):
+        Settings(trusted_proxies="10.0.0.10, nonsense")
 
 
 # ---- record (database) ---------------------------------------------------------------------------------

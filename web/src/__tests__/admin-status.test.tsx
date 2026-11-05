@@ -48,7 +48,8 @@ describe("admin status page", () => {
       (s.nodes[1] as { heartbeat_age_s: number | null }).heartbeat_age_s = null;
     });
     renderApp("/admin/status", "admin");
-    const row = await screen.findByRole("row", { name: /aud-204-gpu01/ });
+    const table = await screen.findByRole("table", { name: "Состояние нод" }); // the «Версии» block names the nodes too
+    const row = within(table).getByRole("row", { name: /aud-204-gpu01/ });
     expect(within(row).getByText("нет данных")).toBeInTheDocument();
   });
 

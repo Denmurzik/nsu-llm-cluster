@@ -18,6 +18,9 @@ ENV = {
     "LITELLM_SALT_KEY": "salt-secret",
     "BACKEND_API_KEY": "backend-secret",
     "HF_MIRROR_TOKEN": "hf_" + "ab" * 20,
+    "REDIS_PASSWORD": "redis-secret",
+    "HF_MIRROR_ADMIN_TOKEN": "mirror-admin-secret",
+    "REGISTRY_HTPASSWD": "nsu-push:$2a$06$aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 }
 EXPECTED = [
     "common-00-namespace.yaml",
@@ -66,6 +69,44 @@ def find(docs_by_file, kind, name):
     raise AssertionError(f"{kind}/{name} not found")
 
 
+MAIN_TOLERATION = {"key": "node-role.kubernetes.io/control-plane", "operator": "Exists", "effect": "NoSchedule"}
+
+
+def assert_main_only(spec):
+    """SEC-2 H1: a pod of main selects llm-main by the name of the Node object (a node cannot rename itself), not by the
+    kubernetes.io/hostname label its own kubelet sets, and tolerates the taint main puts on itself."""
+    assert "nodeSelector" not in spec
+    terms = spec["affinity"]["nodeAffinity"]["requiredDuringSchedulingIgnoredDuringExecution"]["nodeSelectorTerms"]
+    assert terms == [{"matchFields": [{"key": "metadata.name", "operator": "In", "values": ["llm-main"]}]}]
+    assert spec["tolerations"] == [MAIN_TOLERATION]
+
+
+def _pod_specs(by_file):
+    for name, docs in by_file.items():
+        for d in docs:
+            spec = d.get("spec") or {}
+            if d["kind"] == "CronJob":
+                yield name, d, spec["jobTemplate"]["spec"]["template"]["spec"]
+            elif "template" in spec:
+                yield name, d, spec["template"]["spec"]
+
+
+def test_every_pod_of_main_is_pinned_to_main_by_node_name(out):
+    """H1: no pod of main can land on a node that labelled itself kubernetes.io/hostname=llm-main; only the GPU device
+    plugin (a DaemonSet without secrets) runs on class nodes."""
+    by_file = all_docs(out)
+    seen = set()
+    for name, d, spec in _pod_specs(by_file):
+        if d["kind"] == "DaemonSet":
+            assert "llm-secrets" not in yaml.safe_dump(spec)
+            continue
+        assert_main_only(spec)
+        seen.add(d["metadata"]["name"])
+    assert {"postgres", "postgres-backup", "redis", "litellm", "hf-mirror", "registry"} <= seen
+    for name, docs in by_file.items():
+        assert "kubernetes.io/hostname" not in yaml.safe_dump_all(docs), name
+
+
 def test_documents_parse_and_follow_conventions(out):
     by_file = all_docs(out)
     for docs in by_file.values():
@@ -78,7 +119,7 @@ def test_documents_parse_and_follow_conventions(out):
 
     for kind, name in (("StatefulSet", "postgres"), ("Deployment", "litellm"), ("Deployment", "redis")):
         spec = find(by_file, kind, name)["spec"]["template"]["spec"]
-        assert spec["nodeSelector"] == {"kubernetes.io/hostname": "llm-main"}
+        assert_main_only(spec)
         assert spec["hostNetwork"] is True
 
     litellm = find(by_file, "Deployment", "litellm")["spec"]["template"]["spec"]["containers"][0]
@@ -157,9 +198,11 @@ def test_documents_parse_and_follow_conventions(out):
     assert dps["nodeSelector"] == {"llm.nsu/accel": "nvidia"}
     assert dps["runtimeClassName"] == "nvidia"
     # nvcr.io answers 403 from Russia: the plugin (v0.19.3, built from source) runs from the GPU node image, which
-    # every GPU node already has in its k3s images dir (run-node saves it), never pulled
+    # every GPU node already has in its k3s images dir (run-node saves it): taken from there, pulled from main only when the tag is new
     c = dps["containers"][0]
-    assert (c["image"], c["imagePullPolicy"], c["command"]) == ("nsu-llm-node:0.1.0-gpu", "Never", ["nvidia-device-plugin"])
+    assert (c["image"], c["imagePullPolicy"], c["command"]) == ("nsu-llm-node:0.2.0-gpu", "IfNotPresent", ["nvidia-device-plugin"])
+    # a missing image halts the roll-out at one node, it does not switch the plugin off everywhere
+    assert dp["spec"]["updateStrategy"] == {"type": "RollingUpdate", "rollingUpdate": {"maxUnavailable": 1}}
     env = {e["name"]: e["value"] for e in c["env"]}
     assert env == {
         "FAIL_ON_INIT_ERROR": "false", "NVIDIA_DISABLE_REQUIRE": "true", "NVIDIA_VISIBLE_DEVICES": "all",
@@ -176,7 +219,7 @@ def test_device_plugin_follows_the_node_image_or_a_mirror(tmp_path):
         c = dp["spec"]["template"]["spec"]["containers"][0]
         return c["image"], c["imagePullPolicy"]
 
-    assert plugin(NODE_IMAGE_REPO="reg.nsu.ru/nsu-llm-node", NODE_IMAGE_TAG="0.2.0") == ("reg.nsu.ru/nsu-llm-node:0.2.0-gpu", "Never")
+    assert plugin(NODE_IMAGE_REPO="reg.nsu.ru/nsu-llm-node", NODE_IMAGE_TAG="0.2.0") == ("reg.nsu.ru/nsu-llm-node:0.2.0-gpu", "IfNotPresent")
     # the official image from a mirror registry of nvcr.io (its entrypoint is the same nvidia-device-plugin)
     mirror = "mirror.nsu.ru/nvidia/k8s-device-plugin:v0.19.3"
     assert plugin(DEVICE_PLUGIN_IMAGE=mirror) == (mirror, "IfNotPresent")
@@ -191,7 +234,9 @@ def test_secret_contents(out):
     assert data["LITELLM_DATABASE_URL"] == \
         "postgresql://litellm:ll-db-secret@127.0.0.1:5432/litellm"
     for k, v in ENV.items():
-        assert data[k] == v
+        if k != "REGISTRY_HTPASSWD":  # its own Secret llm-registry-auth (common-50-registry)
+            assert data[k] == v
+    assert "REGISTRY_HTPASSWD" not in data and "REGISTRY_PASSWORD" not in data
 
 
 def test_dollar_escaping_survives_render(out):
@@ -277,7 +322,8 @@ def test_litellm_waits_for_redis(out):
     assert names == ["wait-postgres", "wait-redis"]
     wait = spec["initContainers"][1]
     assert wait["image"] == "redis:7-alpine"
-    assert "redis-cli -h 127.0.0.1 -p 6379 ping" in " ".join(wait["command"])
+    assert "redis-cli -h 127.0.0.1 -p 6379 ping | grep -qx PONG" in " ".join(wait["command"])
+    assert wait["env"] == [{"name": "REDISCLI_AUTH", "valueFrom": {"secretKeyRef": {"name": "llm-secrets", "key": "REDIS_PASSWORD"}}}]
 
 
 def test_redis_manifest(out):
@@ -297,8 +343,31 @@ def test_redis_manifest(out):
     assert args[args.index("--save") + 1] == ""
     assert args[args.index("--appendonly") + 1] == "no"
     assert args[args.index("--maxmemory-policy") + 1] == "allkeys-lru"
-    assert c["readinessProbe"]["exec"]["command"] == ["redis-cli", "-h", "127.0.0.1", "-p", "6379", "ping"]
+    ping = ["sh", "-c", "redis-cli -h 127.0.0.1 -p 6379 ping | grep -qx PONG"]
+    assert c["readinessProbe"]["exec"]["command"] == ping and c["livenessProbe"]["exec"]["command"] == ping
     assert "volumeMounts" not in c and "volumes" not in spec
+
+
+def test_redis_requires_the_password_from_the_secret(out):
+    """SEC-2 M2: requirepass from llm-secrets, never in argv; probes and clients authenticate."""
+    by_file = all_docs(out)
+    c = find(by_file, "Deployment", "redis")["spec"]["template"]["spec"]["containers"][0]
+    ref = {"secretKeyRef": {"name": "llm-secrets", "key": "REDIS_PASSWORD"}}
+    env = {e["name"]: e.get("valueFrom") for e in c["env"]}
+    assert env == {"REDIS_PASSWORD": ref, "REDISCLI_AUTH": ref}
+    assert c["command"][:2] == ["sh", "-c"] and "requirepass %s" in c["command"][2]
+    assert '"$REDIS_PASSWORD"' in c["command"][2] and "exec redis-server /tmp/redis.conf" in c["command"][2]
+    assert "redis-secret" not in yaml.safe_dump(c)
+    secret = find(by_file, "Secret", "llm-secrets")["stringData"]
+    assert secret["REDIS_PASSWORD"] == "redis-secret"
+    assert "REDIS_PASSWORD" not in find(by_file, "Secret", "llm-node-secrets")["stringData"]
+    litellm = find(by_file, "Deployment", "litellm")["spec"]["template"]["spec"]["containers"][0]
+    lenv = {e["name"]: e for e in litellm["env"]}
+    assert lenv["REDIS_PASSWORD"]["valueFrom"] == ref
+    # Kubernetes expands $(REDIS_PASSWORD): the variable is defined earlier in the same list
+    names = [e["name"] for e in litellm["env"]]
+    assert names.index("REDIS_PASSWORD") < names.index("GATEWAY_STATS_REDIS_URL")
+    assert lenv["GATEWAY_STATS_REDIS_URL"]["value"] == "redis://:$(REDIS_PASSWORD)@127.0.0.1:6379/0"
 
 
 def test_litellm_workers_and_db_pool_follow_the_setting(tmp_path):
@@ -338,11 +407,11 @@ def test_overload_hook_gets_the_redis_address_the_portal_reads_the_counters_from
     container = find(by_file, "Deployment", "litellm")["spec"]["template"]["spec"]["containers"][0]
     env = {e["name"]: e.get("value") for e in container["env"]}
     entrypoint = (MAIN / "entrypoint.sh").read_text(encoding="utf-8")
-    portal_url = re.search(r"^REDIS_URL=(\S+)$", entrypoint, re.M).group(1)
-    assert env["GATEWAY_STATS_REDIS_URL"] == portal_url
+    portal_url = re.search(r'^REDIS_URL="(\S+)"$', entrypoint, re.M).group(1)
+    assert env["GATEWAY_STATS_REDIS_URL"] == portal_url.replace("${REDIS_PASSWORD}", "$(REDIS_PASSWORD)")
     config = yaml.safe_load(find(by_file, "ConfigMap", "litellm-config")["data"]["config.yaml"])
     router = config["router_settings"]
-    assert portal_url == f"redis://{router['redis_host']}:{router['redis_port']}/0"
+    assert portal_url == f"redis://:${{REDIS_PASSWORD}}@{router['redis_host']}:{router['redis_port']}/0"
 
 
 def _litellm_pod_annotations(env, out_dir):
@@ -372,7 +441,8 @@ def test_hf_mirror_runs_on_main_from_its_own_volume(out):
     dep, cm = _mirror(out)
     assert dep["metadata"]["namespace"] == "llm" and dep["spec"]["strategy"] == {"type": "Recreate"}
     spec = dep["spec"]["template"]["spec"]
-    assert spec["nodeSelector"] == {"kubernetes.io/hostname": "llm-main"} and spec["hostNetwork"] is True
+    assert_main_only(spec)
+    assert spec["hostNetwork"] is True
     (c,) = spec["containers"]
     # the LiteLLM image is already on main (also offline, run-main --airgap): its python3 runs the stdlib script
     assert c["image"] == "ghcr.io/berriai/litellm:v1.106.6"
@@ -384,6 +454,10 @@ def test_hf_mirror_runs_on_main_from_its_own_volume(out):
         "HF_MIRROR_UPSTREAM": "https://huggingface.co", "HF_MIRROR_PREFIX": "/hf",
     }
     assert env["HF_TOKEN"]["valueFrom"]["secretKeyRef"] == {"name": "llm-secrets", "key": "HF_TOKEN", "optional": True}
+    # the limit set in the portal panel: a ConfigMap of the portal, optional (the mirror starts without it)
+    assert env["HF_MIRROR_MAX_GIB_OVERRIDE"]["valueFrom"]["configMapKeyRef"] == {
+        "name": "hf-mirror-settings", "key": "max_gib", "optional": True,
+    }
     assert env["HF_MIRROR_TOKEN"]["valueFrom"]["secretKeyRef"] == {"name": "llm-secrets", "key": "HF_MIRROR_TOKEN"}
     for probe in ("readinessProbe", "livenessProbe"):
         assert c[probe]["httpGet"] == {"host": "127.0.0.1", "port": 8090, "path": "/_mirror/health"}, probe
@@ -497,7 +571,8 @@ def test_backup_cronjob_dumps_every_database_daily_from_the_postgres_image(tmp_p
     assert spec["startingDeadlineSeconds"] == 7200
     pod = spec["jobTemplate"]["spec"]["template"]["spec"]
     assert pod["restartPolicy"] == "Never"
-    assert pod["hostNetwork"] is True and pod["nodeSelector"] == {"kubernetes.io/hostname": "llm-main"}
+    assert pod["hostNetwork"] is True
+    assert_main_only(pod)
     c = pod["containers"][0]
     # same image as the server: pg_dump of another major version refuses to dump it
     assert c["image"] == "postgres:17-alpine"
@@ -545,22 +620,22 @@ def test_bad_backup_settings_rejected(tmp_path, name, value):
     assert name in str(e.value)
 
 
-NODE_SECRET_KEYS = {"BACKEND_API_KEY", "HF_MIRROR_TOKEN", "HF_TOKEN"}
+NODE_SECRET_KEYS = {"HF_TOKEN"}
 
 
 def test_node_pods_get_a_separate_secret_without_mains_keys(tmp_path):
     """A node's kubelet may read every Secret its pods reference: the inference/rpc pods (portal builders) reference
-    llm-node-secrets, which holds only the backend key, the mirror key and, with the mirror off, the real HF token."""
+    llm-node-secrets, which holds only the real HF token with the mirror off. Not the shared backend key (each node has its
+    own, SEC-1) and not the mirror key: it opens every repository HF_TOKEN sees and signs the nodes' tokens (SEC-2 L2)."""
     node = lambda out: find(all_docs(out), "Secret", "llm-node-secrets")  # noqa: E731
     render_manifests.render(dict(ENV, HF_TOKEN="hf_real"), tmp_path / "mirror")
     sec = node(tmp_path / "mirror")
     assert sec["metadata"]["namespace"] == "llm" and sec["metadata"]["labels"] == {"app.kubernetes.io/part-of": "nsu-llm"}
     assert set(sec["stringData"]) == NODE_SECRET_KEYS
-    assert sec["stringData"]["BACKEND_API_KEY"] == ENV["BACKEND_API_KEY"]
-    assert sec["stringData"]["HF_MIRROR_TOKEN"] == ENV["HF_MIRROR_TOKEN"]
     assert sec["stringData"]["HF_TOKEN"] == ""  # the nodes download through the mirror: the real token stays on main
     for value in ("hf_real", ENV["LITELLM_MASTER_KEY"], ENV["LITELLM_SALT_KEY"], ENV["POSTGRES_PASSWORD"],
-                  ENV["LITELLM_DB_PASSWORD"], ENV["PORTAL_DB_PASSWORD"]):
+                  ENV["LITELLM_DB_PASSWORD"], ENV["PORTAL_DB_PASSWORD"], ENV["HF_MIRROR_TOKEN"], ENV["BACKEND_API_KEY"],
+                  ENV["REDIS_PASSWORD"], ENV["HF_MIRROR_ADMIN_TOKEN"]):
         assert value not in str(sec)
     for off in ("false", "False", "0", "no", "off", "f", "n"):
         render_manifests.render(dict(ENV, HF_TOKEN="hf_real", HF_MIRROR_ENABLED=off), tmp_path / off)
@@ -580,38 +655,94 @@ def test_registry_runs_on_main_localhost_only_from_its_own_volume(out):
     assert dep["metadata"]["namespace"] == "llm" and dep["spec"]["strategy"] == {"type": "Recreate"}
     assert dep["spec"]["replicas"] == 1
     spec = dep["spec"]["template"]["spec"]
-    assert spec["nodeSelector"] == {"kubernetes.io/hostname": "llm-main"} and spec["hostNetwork"] is True
+    assert_main_only(spec)
+    assert spec["hostNetwork"] is True
     (c,) = spec["containers"]
     # pinned by version and by the digest of the index (docker buildx imagetools inspect registry:2.8.3)
     assert re.fullmatch(r"registry:2\.8\.3@sha256:[0-9a-f]{64}", c["image"])
     assert c["imagePullPolicy"] == "IfNotPresent"
     env = {e["name"]: e["value"] for e in c["env"]}
-    # only the main container can reach the registry directly: the class goes through Caddy (read-only, subnet-limited)
-    assert env["REGISTRY_HTTP_ADDR"] == "127.0.0.1:5000"
+    # the registry itself listens on the backend port of main's loopback; Caddy serves reads on REGISTRY_PORT and /v2/
+    assert env["REGISTRY_HTTP_ADDR"] == "127.0.0.1:5001"
     assert env["REGISTRY_STORAGE_FILESYSTEM_ROOTDIRECTORY"] == "/var/lib/registry"
     assert env["REGISTRY_STORAGE_DELETE_ENABLED"] == "true"
-    # no credentials in the manifest: pushing is possible only from localhost
-    assert not any("PASSWORD" in k or "TOKEN" in k or "AUTH" in k for k in env)
+    # SEC-2 M2: every request needs the password (htpasswd from a Secret); no password itself in the manifest
+    assert env["REGISTRY_AUTH"] == "htpasswd" and env["REGISTRY_AUTH_HTPASSWD_PATH"] == "/auth/htpasswd"
+    assert env["REGISTRY_AUTH_HTPASSWD_REALM"]
     for probe in ("readinessProbe", "livenessProbe"):
-        assert c[probe]["httpGet"] == {"host": "127.0.0.1", "port": 5000, "path": "/v2/"}, probe
-    assert {m["name"]: m["mountPath"] for m in c["volumeMounts"]} == {"data": "/var/lib/registry"}
-    (vol,) = spec["volumes"]
+        assert c[probe]["tcpSocket"] == {"host": "127.0.0.1", "port": 5001}, probe
+    assert {m["name"]: m["mountPath"] for m in c["volumeMounts"]} == {"data": "/var/lib/registry", "auth": "/auth"}
+    data, auth = spec["volumes"]
     # /var/lib/llm-registry is the llm-main-registry volume of the main container (run-main.sh)
-    assert vol["hostPath"] == {"path": "/var/lib/llm-registry", "type": "DirectoryOrCreate"}
+    assert data["hostPath"] == {"path": "/var/lib/llm-registry", "type": "DirectoryOrCreate"}
+    assert auth["secret"] == {"secretName": "llm-registry-auth", "defaultMode": 0o400}
+    secret = find(all_docs(out), "Secret", "llm-registry-auth")
+    assert secret["metadata"]["namespace"] == "llm" and secret["stringData"] == {"htpasswd": ENV["REGISTRY_HTPASSWD"]}
     assert re.fullmatch(r"[0-9a-f]{16}", dep["spec"]["template"]["metadata"]["annotations"]["llm.nsu/config-hash"])
 
 
 def test_registry_settings_follow_the_environment(tmp_path):
-    render_manifests.render(dict(ENV, REGISTRY_PORT="5111", REGISTRY_IMAGE="registry:2.8.3"), tmp_path)
+    render_manifests.render(dict(ENV, REGISTRY_BACKEND_PORT="5111", REGISTRY_IMAGE="registry:2.8.3"), tmp_path)
     (c,) = _registry(tmp_path)["spec"]["template"]["spec"]["containers"]
     env = {e["name"]: e["value"] for e in c["env"]}
     assert c["image"] == "registry:2.8.3" and env["REGISTRY_HTTP_ADDR"] == "127.0.0.1:5111"
-    assert c["readinessProbe"]["httpGet"]["port"] == 5111 and c["ports"][0]["containerPort"] == 5111
+    assert c["readinessProbe"]["tcpSocket"]["port"] == 5111 and c["ports"][0]["containerPort"] == 5111
+
+
+def test_secrets_read_at_start_restart_their_pods_when_they_change(tmp_path):
+    def annotations(d, **env):
+        render_manifests.render(dict(ENV, **env), tmp_path / d)
+        docs = all_docs(tmp_path / d)
+        return {name: find(docs, "Deployment", name)["spec"]["template"]["metadata"]["annotations"]
+                for name in ("redis", "litellm", "hf-mirror")}
+
+    a, b, c = annotations("a"), annotations("b", REDIS_PASSWORD="other"), annotations("c", HF_MIRROR_TOKEN="hf_" + "cd" * 20)
+    assert a["redis"]["llm.nsu/redis-password"] != b["redis"]["llm.nsu/redis-password"]
+    assert a["litellm"]["llm.nsu/redis-password"] != b["litellm"]["llm.nsu/redis-password"]
+    assert a["hf-mirror"]["llm.nsu/mirror-token"] != c["hf-mirror"]["llm.nsu/mirror-token"]
+    for ann in a.values():
+        assert ENV["REDIS_PASSWORD"] not in str(ann) and ENV["HF_MIRROR_TOKEN"] not in str(ann)
+
+
+def test_registry_push_keeps_the_password_out_of_argv():
+    """review I2: ctr --user would put the password into /proc/<pid>/cmdline (visible from the host of main); the helper
+    hands it over as a header in a hosts.toml of a 0700 temp dir instead."""
+    text = (MAIN / "registry-push.sh").read_text(encoding="utf-8")
+    code = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
+    assert "--user" not in code and "-u " not in code
+    assert "--hosts-dir" in code and 'Authorization = "Basic' in code and "umask 077" in code
+
+
+def test_a_new_registry_password_restarts_the_registry(tmp_path):
+    def annotation(htpasswd, d):
+        render_manifests.render(dict(ENV, REGISTRY_HTPASSWD=htpasswd), tmp_path / d)
+        return _registry(tmp_path / d)["spec"]["template"]["metadata"]["annotations"]["llm.nsu/config-hash"]
+
+    assert annotation(ENV["REGISTRY_HTPASSWD"], "a") != annotation("nsu-push:$2a$06$" + "b" * 53, "b")
 
 
 @pytest.mark.parametrize("name,bad", [
     ("REGISTRY_PORT", "80"), ("REGISTRY_PORT", "x"), ("REGISTRY_IMAGE", "Registry:2"), ("REGISTRY_IMAGE", 'r:2"x'),
+    ("REGISTRY_BACKEND_PORT", "80"), ("REGISTRY_BACKEND_PORT", "5000"), ("REGISTRY_HTPASSWD", ""),
+    ("REGISTRY_HTPASSWD", "admin:$2a$06$" + "a" * 53), ("REGISTRY_HTPASSWD", 'nsu-push:"x'),
 ])
 def test_bad_registry_settings_are_rejected(tmp_path, name, bad):
     with pytest.raises(ValueError, match=name):
         render_manifests.render(dict(ENV, **{name: bad}), tmp_path)
+
+
+def test_a_tag_bump_keeps_the_device_plugin_startable(tmp_path):
+    """Found on the 122b bed: with imagePullPolicy Never the plugin needed the new tag in the k3s images dir of every GPU
+    node, which only a restart of the node container with a newer image provides; after NODE_IMAGE_TAG 0.1.0 -> 0.1.1 every
+    GPU pod got ErrImageNeverPull and no node advertised nvidia.com/gpu. The plugin pod must be able to pull its image."""
+
+    def plugin(tag):
+        render_manifests.render({**ENV, "NODE_IMAGE_TAG": tag}, tmp_path)
+        dp = find(all_docs(tmp_path), "DaemonSet", "nvidia-device-plugin-daemonset")
+        return dp["spec"]["template"]["spec"]["containers"][0]
+
+    before, after = plugin("0.1.0"), plugin("0.1.1")
+    assert (before["image"], after["image"]) == ("nsu-llm-node:0.2.0-gpu", "nsu-llm-node:0.1.1-gpu")
+    for c in (before, after):
+        assert c["imagePullPolicy"] != "Never"  # the image of a new tag is not on the node yet
+        assert c["imagePullPolicy"] == "IfNotPresent"  # and the one the node has is not pulled again

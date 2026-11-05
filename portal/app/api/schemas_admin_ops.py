@@ -43,6 +43,9 @@ class SystemSettingOut(BaseModel):
     value: Any  # effective: the stored override or the default
     default: Any  # what the env gives without an override
     overridden: bool
+    source: Literal["db", "env"]  # db: the panel's value, env: the default of the .env
+    group: str  # the section of the panel page
+    pending_restart: bool = False  # restart-only setting whose value is not what the running component uses yet
     min: float | None
     max: float | None
     description: str
@@ -58,6 +61,8 @@ class SystemSettingOut(BaseModel):
             value=value,
             default=default,
             overridden=row is not None,
+            source="db" if row is not None else "env",
+            group=spec.group,
             min=spec.min,
             max=spec.max,
             description=spec.description_ru,

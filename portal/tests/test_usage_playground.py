@@ -142,7 +142,7 @@ async def test_playground_requires_csrf_and_valid_body(client, fake, me):
     assert not fake.chat_calls
 
 
-async def test_playground_upstream_4xx_is_russian_with_the_original_in_parentheses(client, fake, me):
+async def test_playground_upstream_400_is_russian_with_the_original_in_parentheses(client, fake, me):
     async def refuse(api_key, payload):
         raise LiteLLMError(400, json.dumps({"error": {"message": "context length exceeded"}}))
         yield b""
@@ -158,7 +158,8 @@ async def test_playground_upstream_4xx_is_russian_with_the_original_in_parenthes
 
     fake.stream_chat = refuse_plain
     r = await chat(client, me)
-    assert r.status_code == 422 and r.json()["detail"] == "Модель вернула ошибку (not json)"
+    # other refusals than 400/413/429 do not show the gateway's text (task SEC-1, L6)
+    assert r.status_code == 422 and r.json()["detail"] == "Модель вернула ошибку"
 
 
 async def test_playground_litellm_down_503(client, fake, me):

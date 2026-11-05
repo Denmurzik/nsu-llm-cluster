@@ -6,7 +6,7 @@ import pytest
 from kubernetes_asyncio import client
 from kubernetes_asyncio.client.exceptions import ApiException
 
-from app.k8s import Endpoint, K8sClient, K8sUnavailable, NodeInfo, OwnedWorkload, PodInfo
+from app.k8s import Endpoint, JobInfo, K8sClient, K8sUnavailable, NodeInfo, OwnedWorkload, PodInfo
 from tests.fakes.k8s import FakeK8s
 
 NS = "llm"
@@ -190,7 +190,8 @@ async def test_list_nodes_maps_labels_capacity_and_ready(k8s, core):
                 "gpu1",
                 labels={
                     "llm.nsu/accel": "nvidia", "llm.nsu/vram-mib": "24576", "llm.nsu/ram-mib": "28672",
-                    "llm.nsu/deployment": "dep",
+                    # the portal's label; a llm.nsu/deployment the node set on itself is ignored (task SEC-1)
+                    "node-restriction.kubernetes.io/llm-deployment": "dep", "llm.nsu/deployment": "forged",
                 },
                 external="192.168.3.200",
             ),
@@ -334,6 +335,19 @@ async def test_put_config_map_creates_on_404_and_replaces_existing(k8s, core):
     assert kwargs["body"]["metadata"]["resourceVersion"] == "9" and kwargs["body"]["data"] == {"repos": "a/b,c/d"}
 
 
+async def test_restart_deployment_patches_the_restart_annotation_and_reports_a_missing_one(k8s, apps):
+    assert await k8s.restart_deployment("hf-mirror") is True
+    args, kwargs = apps.patch_namespaced_deployment.await_args
+    assert args == ("hf-mirror", NS)
+    annotations = kwargs["body"]["spec"]["template"]["metadata"]["annotations"]
+    assert list(annotations) == ["kubectl.kubernetes.io/restartedAt"] and annotations["kubectl.kubernetes.io/restartedAt"]
+    apps.patch_namespaced_deployment.side_effect = ApiException(status=404)
+    assert await k8s.restart_deployment("hf-mirror") is False
+    apps.patch_namespaced_deployment.side_effect = ApiException(status=403)
+    with pytest.raises(ApiException):
+        await k8s.restart_deployment("hf-mirror")
+
+
 async def test_apply_deployment_uses_deployment_api(k8s, apps):
     apps.read_namespaced_deployment.side_effect = ApiException(status=404)
     await k8s.apply(_manifest("Deployment", "llm-dep-g0"))
@@ -450,6 +464,55 @@ async def test_pod_log_tail(k8s, core):
     assert await k8s.pod_log_tail("p1") == ""
 
 
+@pytest.fixture
+def batch(apis, monkeypatch):
+    api = AsyncMock()
+    monkeypatch.setattr(client, "BatchV1Api", lambda *_a, **_k: api)
+    return api
+
+
+async def test_create_job_returns_the_name_the_cluster_gave(k8s, batch):
+    batch.create_namespaced_job.return_value = client.V1Job(metadata=client.V1ObjectMeta(name="llm-purge-x7k2"))
+    assert await k8s.create_job({"kind": "Job", "metadata": {"generateName": "llm-purge-"}}) == "llm-purge-x7k2"
+    assert batch.create_namespaced_job.await_args.args[0] == NS
+
+
+async def test_read_job_reports_its_pods_and_none_once_collected(k8s, batch):
+    batch.read_namespaced_job_status.return_value = client.V1Job(
+        metadata=client.V1ObjectMeta(name="j1"), status=client.V1JobStatus(active=1, failed=2)
+    )
+    assert await k8s.read_job("j1") == JobInfo("j1", 1, 0, 2)
+    killed = client.V1JobStatus(
+        conditions=[
+            client.V1JobCondition(type="Complete", status="False"),
+            client.V1JobCondition(type="Failed", status="True", reason="DeadlineExceeded"),
+        ]
+    )
+    batch.read_namespaced_job_status.return_value = client.V1Job(metadata=client.V1ObjectMeta(name="j1"), status=killed)
+    assert await k8s.read_job("j1") == JobInfo("j1", 0, 0, 0, "Failed", "DeadlineExceeded")
+    batch.read_namespaced_job_status.return_value = client.V1Job(metadata=client.V1ObjectMeta(name="j1"), status=None)
+    assert await k8s.read_job("j1") == JobInfo("j1", 0, 0, 0)
+    batch.read_namespaced_job_status.side_effect = ApiException(status=404)
+    assert await k8s.read_job("j1") is None
+    batch.read_namespaced_job_status.side_effect = ApiException(status=500)
+    with pytest.raises(ApiException):
+        await k8s.read_job("j1")
+
+
+async def test_job_log_reads_the_pod_of_the_job(k8s, core):
+    core.list_namespaced_pod.return_value = client.V1PodList(items=[client.V1Pod(metadata=client.V1ObjectMeta(name="j1-abc"))])
+    log = "removed x 1\nRESULT {}\n"
+    core.read_namespaced_pod_log.return_value = log
+    assert await k8s.job_log("j1", lines=20) == log
+    assert core.list_namespaced_pod.await_args.kwargs["label_selector"] == "job-name=j1"
+    args, kwargs = core.read_namespaced_pod_log.await_args
+    assert args[:2] == ("j1-abc", NS) and kwargs["tail_lines"] == 20
+    core.read_namespaced_pod_log.side_effect = ApiException(status=400)  # the container has not started
+    assert await k8s.job_log("j1") == ""
+    core.list_namespaced_pod.return_value = client.V1PodList(items=[])
+    assert await k8s.job_log("j1") == ""
+
+
 async def test_read_token_file(k8s, tmp_path):
     f = tmp_path / "agent-token"
     f.write_text("K10abc::node:xyz\n")
@@ -530,10 +593,10 @@ async def test_fake_k8s_behaviour():
     assert len(await fake.list_pods("dep")) == 3
     assert await fake.pod_log_tail("p1", lines=2) == "b\nc"
 
-    await fake.patch_node_labels("n1", {"llm.nsu/deployment": "dep", "llm.nsu/vram-mib": "100"})
+    await fake.patch_node_labels("n1", {"node-restriction.kubernetes.io/llm-deployment": "dep", "llm.nsu/vram-mib": "100"})
     node = (await fake.list_nodes())[0]
     assert (node.deployment, node.vram_mib) == ("dep", 100)
-    await fake.patch_node_labels("n1", {"llm.nsu/deployment": None})
+    await fake.patch_node_labels("n1", {"node-restriction.kubernetes.io/llm-deployment": None})
     assert (await fake.list_nodes())[0].deployment is None
 
     manifest = _manifest()

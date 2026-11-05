@@ -1,8 +1,11 @@
+import { Link } from "react-router-dom";
 import { api } from "../api";
 import { ErrorNotice, Loading, Notice, PageHead } from "../components/ui";
+import { NodeLoad } from "../components/NodeLoad";
 import { NodeWake } from "../components/NodeWake";
 import { StatusLabel, backendsText } from "../components/Status";
 import { fmtBytes, fmtDateTime, fmtInt, fmtMib } from "../lib/format";
+import { fetchVersions, shortDigest, versionText, type VersionsResponse } from "../lib/nodeVersions";
 import { useResource } from "../lib/useResource";
 import type { AdminStatus as StatusData, StatusNode } from "../types";
 
@@ -79,14 +82,119 @@ function Backups({ backups }: { backups: StatusData["backups"] }) {
         {backups.last_size_bytes !== null ? `, ${fmtBytes(backups.last_size_bytes)}` : ""}
       </span>
       <span className="muted small">Хранится наборов: {backups.count}</span>
+      <Link to="/admin/backups" className="small">
+        Все копии и восстановление
+      </Link>
       {stale && <Notice kind="warn">Последней копии больше полутора суток: проверьте задание postgres-backup</Notice>}
     </div>
   );
 }
 
+/** «Версии»: this main, the tags of the node image in its registry, and the nodes grouped by the image they run. */
+function Versions({ versions }: { versions: VersionsResponse }) {
+  const { main, registry, groups } = versions;
+  return (
+    <section className="section" data-testid="versions">
+      <h2>Версии</h2>
+      {!registry.available && (
+        <Notice kind="warn">
+          Реестр образов главного не отвечает{registry.error ? ` (${registry.error})` : ""}: сравнить ноды с ним нельзя
+        </Notice>
+      )}
+      <div className="table-wrap">
+        <table className="data" aria-label="Версия главного">
+          <tbody>
+            <tr>
+              <th scope="row">Главный сервер</th>
+              <td>
+                <div className="stackcell">
+                  <span className="mono">{versionText(main)}</span>
+                  {main.digest && <span className="muted small mono">{shortDigest(main.digest)}</span>}
+                </div>
+              </td>
+            </tr>
+            <tr>
+              <th scope="row">Автообновление нод</th>
+              <td>{versions.auto_update ? "Включено: нода заменяет контейнер сама, когда ничего не обслуживает" : "Выключено: ноды обновляются кнопкой «Обновить» на странице «Ноды»"}</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>Образы нод в реестре главного</h3>
+      <div className="table-wrap">
+        <table className="data" aria-label="Образы в реестре">
+          <thead>
+            <tr>
+              <th>Тег</th>
+              <th>Версия</th>
+              <th>Сборка</th>
+              <th>Образ</th>
+            </tr>
+          </thead>
+          <tbody>
+            {registry.tags.map((t) => (
+              <tr key={t.tag}>
+                <td>
+                  <span className="mono">{t.tag}</span> {t.current && <span className="tag">для нод</span>}
+                </td>
+                <td className="mono">{t.version ?? "—"}</td>
+                <td className="mono">{t.revision ? t.revision.slice(0, 7) : "—"}</td>
+                <td className="mono muted">{shortDigest(t.digest) || "—"}</td>
+              </tr>
+            ))}
+            {registry.tags.length === 0 && (
+              <tr>
+                <td colSpan={4} className="empty-row">
+                  {registry.available ? "В реестре главного нет образов нод" : "Реестр недоступен"}
+                </td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+
+      <h3>Ноды по версиям</h3>
+      <div className="table-wrap">
+        <table className="data" aria-label="Ноды по версиям">
+          <thead>
+            <tr>
+              <th>Версия</th>
+              <th className="num">Нод</th>
+              <th>Ноды</th>
+            </tr>
+          </thead>
+          <tbody>
+            {groups.map((g) => (
+              <tr key={`${g.digest ?? ""}|${g.revision ?? ""}|${g.version ?? ""}`}>
+                <td>
+                  <span className="mono">{versionText(g)}</span>{" "}
+                  {g.outdated === true && <span className="tag warn">устарела</span>}
+                </td>
+                <td className="num">{g.count}</td>
+                <td className="mono small">{g.nodes.join(", ")}</td>
+              </tr>
+            ))}
+            {groups.length === 0 && (
+              <tr>
+                <td colSpan={3} className="empty-row">
+                  Нод пока нет
+                </td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  );
+}
+
 export function AdminStatus() {
   const status = useResource(() => api.adminStatus(), [], { interval: 10000 });
+  const versions = useResource(fetchVersions, [], { interval: 10000 });
   const data = status.data;
+  // the load of the nodes is its own request: a failure of it never hides the status
+  const live = useResource(() => api.metricsLive(), [], { interval: 10000 });
 
   return (
     <div className="page">
@@ -153,6 +261,11 @@ export function AdminStatus() {
           </section>
 
           <section className="section">
+            <h2>Нагрузка нод</h2>
+            <NodeLoad nodes={data.nodes} live={live.data} failed={live.error !== null} />
+          </section>
+
+          <section className="section">
             <h2>Развёртывания</h2>
             <div className="table-wrap">
               <table className="data" aria-label="Состояние развёртываний">
@@ -216,6 +329,14 @@ export function AdminStatus() {
               В разделение моделей главный сервер не входит, даже если на нём есть GPU.
             </p>
           </section>
+
+          {versions.data && <Versions versions={versions.data} />}
+          {versions.error && !versions.data && (
+            <section className="section">
+              <h2>Версии</h2>
+              <Notice kind="warn">Не удалось получить версии: {versions.error.message}</Notice>
+            </section>
+          )}
         </>
       )}
     </div>

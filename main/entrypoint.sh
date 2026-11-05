@@ -65,7 +65,8 @@ done
 : "${REGISTRY_PORT:=5000}"
 [[ "$REGISTRY_PORT" =~ ^[0-9]{4,5}$ ]] && [ "$((10#$REGISTRY_PORT))" -ge 1024 ] && [ "$((10#$REGISTRY_PORT))" -le 65535 ] \
   || die "REGISTRY_PORT должна быть целым числом от 1024 до 65535, получено: $REGISTRY_PORT"
-: "${REGISTRY_ALLOW_FROM:=10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,127.0.0.0/8,::1}"
+# по умолчанию частные IPv4, их IPv4-mapped формы в IPv6 (::ffff:a.b.c.d в hex) и loopback; публичный IPv6 только явно
+: "${REGISTRY_ALLOW_FROM:=10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,127.0.0.0/8,::1,::ffff:a00:0/104,::ffff:ac10:0/108,::ffff:c0a8:0/112,::ffff:7f00:0/104}"
 registry_allow=""
 IFS=',' read -ra _cidrs <<<"${REGISTRY_ALLOW_FROM//[[:space:]]/}"
 for c in "${_cidrs[@]}"; do
@@ -74,7 +75,26 @@ for c in "${_cidrs[@]}"; do
   registry_allow+="${registry_allow:+ }$c"
 done
 [ -n "$registry_allow" ] || die "REGISTRY_ALLOW_FROM не может быть пустым: перечислите подсети класса и администраторов"
-export REGISTRY_PORT
+# Сам реестр слушает 127.0.0.1:REGISTRY_BACKEND_PORT и отвечает только с паролем (htpasswd, учётка nsu-push, SEC-2 M2). На
+# 127.0.0.1:REGISTRY_PORT Caddy отдаёт его только на чтение (GET, HEAD) с подставленным паролем: этим адресом пользуются
+# портал и install-main.sh. Записывает в реестр только registry-push.sh (пароль из secrets.env).
+: "${REGISTRY_BACKEND_PORT:=5001}"
+[[ "$REGISTRY_BACKEND_PORT" =~ ^[0-9]{4,5}$ ]] && [ "$((10#$REGISTRY_BACKEND_PORT))" -ge 1024 ] && [ "$((10#$REGISTRY_BACKEND_PORT))" -le 65535 ] \
+  || die "REGISTRY_BACKEND_PORT должна быть целым числом от 1024 до 65535, получено: $REGISTRY_BACKEND_PORT"
+[ "$((10#$REGISTRY_BACKEND_PORT))" != "$((10#$REGISTRY_PORT))" ] \
+  || die "REGISTRY_BACKEND_PORT и REGISTRY_PORT должны различаться (сейчас обе $REGISTRY_PORT)"
+export REGISTRY_PORT REGISTRY_BACKEND_PORT
+# API нод (/api/nodes/*) Caddy принимает только из этих подсетей (по умолчанию частные сети, SEC-2 L1).
+# не задана: те же подсети, что REGISTRY_ALLOW_FROM (установка с классом в публичной подсети уже перечислила его там)
+: "${NODE_ALLOW_FROM:=$REGISTRY_ALLOW_FROM}"
+node_allow=""
+IFS=',' read -ra _cidrs <<<"${NODE_ALLOW_FROM//[[:space:]]/}"
+for c in "${_cidrs[@]}"; do
+  [[ "$c" =~ ^([0-9]{1,3}(\.[0-9]{1,3}){3}(/[0-9]{1,2})?|[0-9A-Fa-f]*:[0-9A-Fa-f:]*(/[0-9]{1,3})?)$ ]] \
+    || die "NODE_ALLOW_FROM: нужен список адресов или подсетей через запятую (10.1.0.0/16,192.168.5.7), получено: $NODE_ALLOW_FROM"
+  node_allow+="${node_allow:+ }$c"
+done
+[ -n "$node_allow" ] || die "NODE_ALLOW_FROM не может быть пустым: перечислите подсети класса"
 if [ -n "${TLS_CERT:-}" ]; then
   for f in tls.crt tls.key; do
     [ -f "$CERTS_DIR/$f" ] || die "TLS_CERT задана, но файл $CERTS_DIR/$f не найден: смонтируйте каталог с сертификатом в $CERTS_DIR."
@@ -83,11 +103,16 @@ fi
 
 # ------------------------------------------------------------------ секреты
 SECRET_NAMES=(LITELLM_MASTER_KEY LITELLM_SALT_KEY POSTGRES_PASSWORD LITELLM_DB_PASSWORD PORTAL_DB_PASSWORD CLUSTER_TOKEN AGENT_TOKEN BACKEND_API_KEY
-  HF_MIRROR_TOKEN)
+  HF_MIRROR_TOKEN REDIS_PASSWORD REGISTRY_PASSWORD HF_MIRROR_ADMIN_TOKEN)
 PG_DATA_GLOB="${PG_DATA_GLOB:-/var/lib/rancher/k3s/storage/pvc-*_llm_data-postgres-*}"
 K3S_TOKEN_FILE=/var/lib/rancher/k3s/server/token
 
 declare -A stored=()
+# NODE_LEGACY_TOKEN по умолчанию (SEC-2 L3): новая установка не принимает серверный токен k3s от нод (false); установка,
+# созданная до этой версии (secrets.env уже есть, а записи NODE_LEGACY_TOKEN_DEFAULT в нём нет), сохраняет прежнее
+# поведение (true: её ноды могли подключиться с серверным токеном). Решение записывается в secrets.env один раз.
+legacy_default=false
+[ ! -f "$SECRETS_FILE" ] || legacy_default=true
 if [ -f "$SECRETS_FILE" ]; then
   while IFS='=' read -r k v; do
     if [ -n "$k" ]; then stored["$k"]="$v"; fi
@@ -120,6 +145,22 @@ locked_reason() {
   esac
 }
 
+# HF_MIRROR_TOKEN (SEC-2 L2): до этой версии он лежал в llm-node-secrets и в desired standalone-нод, то есть известен всем
+# нодам класса; теперь он открывает все репозитории и подписывает токены нод (nsm1), поэтому на такой установке он один раз
+# заменяется новым (метка HF_MIRROR_TOKEN_MAIN_ONLY в secrets.env). sha256 прежнего значения остаётся в secrets.env
+# (HF_MIRROR_TOKEN_LEAKED): главный не стартует ни с ним, ни с ним же из .env, пока его не уберут или не заменят.
+sha_of() { printf '%s' "$1" | sha256sum | cut -c1-64; }
+leaked="${stored[HF_MIRROR_TOKEN_LEAKED]:-}"
+if [ -n "${stored[HF_MIRROR_TOKEN]:-}" ] && [ -z "${stored[HF_MIRROR_TOKEN_MAIN_ONLY]:-}" ]; then
+  leaked="$(sha_of "${stored[HF_MIRROR_TOKEN]}")"
+  unset 'stored[HF_MIRROR_TOKEN]'
+  [ -n "${HF_MIRROR_TOKEN:-}" ] \
+    || echo "HF_MIRROR_TOKEN заменён новым: прежний был у всех нод класса (llm-node-secrets); ноды получают от портала токены только на свои модели" >&2
+fi
+if [ -n "$leaked" ] && [ -n "${HF_MIRROR_TOKEN:-}" ] && [ "$(sha_of "$HF_MIRROR_TOKEN")" = "$leaked" ]; then
+  die "HF_MIRROR_TOKEN в .env — прежнее значение, которое версии до SEC-2 раздавали всем нодам: с ним нода сама выпустит себе токен на любую модель. Уберите строку HF_MIRROR_TOKEN из .env (главный создаст новый ключ) или задайте новое значение: HF_MIRROR_TOKEN=hf_\$(openssl rand -hex 20)"
+fi
+
 content=""
 for name in "${SECRET_NAMES[@]}"; do
   value="${!name:-}"
@@ -141,11 +182,37 @@ done
 [ "$AGENT_TOKEN" != "$CLUSTER_TOKEN" ] \
   || die "AGENT_TOKEN совпадает с CLUSTER_TOKEN, а токен агента должен быть отдельным. Уберите AGENT_TOKEN из .env (главный создаст его сам)."
 
+case "${stored[NODE_LEGACY_TOKEN_DEFAULT]:-}" in
+  true|false) legacy_default="${stored[NODE_LEGACY_TOKEN_DEFAULT]}" ;;
+esac
+content+="NODE_LEGACY_TOKEN_DEFAULT=$legacy_default"$'\n'
+content+="HF_MIRROR_TOKEN_MAIN_ONLY=1"$'\n'
+[ -z "$leaked" ] || content+="HF_MIRROR_TOKEN_LEAKED=$leaked"$'\n'
+
 mkdir -p "$DATA_DIR"
 if [ ! -f "$SECRETS_FILE" ] || [ "$(cat "$SECRETS_FILE")" != "${content%$'\n'}" ]; then
   printf '%s' "$content" >"$SECRETS_FILE.tmp"
   mv "$SECRETS_FILE.tmp" "$SECRETS_FILE"
 fi
+
+# ------------------------------------------------------------------ учётка записи в реестр
+# bcrypt-хеш REGISTRY_PASSWORD (caddy hash-password, пароль через stdin) для Secret llm-registry-auth. Хеш с солью пересчитывается
+# только при смене пароля (рядом лежит sha256 пароля): иначе каждый старт менял бы манифест и перезапускал реестр. Стоимость 6:
+# реестр проверяет хеш на каждый запрос, а пароль из 48 hex перебором не подобрать и при малой стоимости.
+REGISTRY_USER=nsu-push
+htpasswd_file="$DATA_DIR/registry.htpasswd"
+pw_sum="$(printf '%s' "$REGISTRY_PASSWORD" | sha256sum | cut -c1-64)"
+if [ ! -s "$htpasswd_file" ] || [ "$(cat "$htpasswd_file.sum" 2>/dev/null)" != "$pw_sum" ]; then
+  pw_hash="$(printf '%s\n' "$REGISTRY_PASSWORD" | caddy hash-password --bcrypt-cost 6 2>/dev/null)" \
+    || die "не удалось получить хеш пароля реестра (caddy hash-password)"
+  [[ "$pw_hash" =~ ^\$2[aby]\$[0-9]{2}\$[./A-Za-z0-9]{53}$ ]] || die "caddy hash-password вернул не bcrypt-хеш"
+  printf '%s:%s\n' "$REGISTRY_USER" "$pw_hash" >"$htpasswd_file.tmp"
+  mv "$htpasswd_file.tmp" "$htpasswd_file"
+  printf '%s' "$pw_sum" >"$htpasswd_file.sum"
+fi
+REGISTRY_HTPASSWD="$(head -n1 "$htpasswd_file")"
+export REGISTRY_HTPASSWD
+registry_auth="Basic $(printf '%s:%s' "$REGISTRY_USER" "$REGISTRY_PASSWORD" | base64 -w0)"
 
 # ------------------------------------------------------------------ локальные адреса мимо прокси
 # httpx и urllib берут прокси из окружения: с прокси в .env запросы портала к LiteLLM, зеркалу и Redis на 127.0.0.1
@@ -173,6 +240,15 @@ elif [ -z "${TLS_CERT:-}" ]; then
 else
   ca_handler=$'\t\trespond 404'
 fi
+# /ca.crt.p7s: подпись /ca.crt ключом CA сервера k3s (sign-ca.sh, в фоне ниже). Нода проверяет CA k3s по хешу из токена
+# K10<sha256>::node:..., а по нему эту подпись (node/rootfs/opt/llm/bin/fetch-main-ca.sh), и не верит первому ответу /ca.crt
+# (SEC-2 M1). Нет /ca.crt (публичный сертификат без ca.crt): нет и подписи.
+CA_SIG_DIR="$DATA_DIR/ca-sign"
+if [ "$ca_handler" = $'\t\trespond 404' ]; then
+  ca_sig_handler=$'\t\trespond 404'
+else
+  ca_sig_handler=$'\t\troot * '"$CA_SIG_DIR"$'\n\t\trewrite * /ca.crt.p7s'$'\n\t\theader Content-Type application/pkcs7-signature'$'\n\t\tfile_server'
+fi
 if [ -n "${TLS_CERT:-}" ]; then
   global_tls=""
   site_tls=$'\ttls '"$CERTS_DIR/tls.crt $CERTS_DIR/tls.key"
@@ -187,20 +263,29 @@ caddyfile="${caddyfile//@@GLOBAL_TLS@@/$global_tls}"
 caddyfile="${caddyfile//@@TRUSTED_PROXIES@@/$trusted}"
 caddyfile="${caddyfile//@@SITE_TLS@@/$site_tls}"
 caddyfile="${caddyfile//@@CA_HANDLER@@/$ca_handler}"
+caddyfile="${caddyfile//@@CA_SIG_HANDLER@@/$ca_sig_handler}"
 caddyfile="${caddyfile//@@PUBLIC_HOSTNAME@@/$PUBLIC_HOSTNAME}"
 caddyfile="${caddyfile//@@MAIN_ADVERTISE_IP@@/$MAIN_ADVERTISE_IP}"
 caddyfile="${caddyfile//@@HF_MIRROR_PORT@@/$HF_MIRROR_PORT}"
 caddyfile="${caddyfile//@@REGISTRY_PORT@@/$REGISTRY_PORT}"
 caddyfile="${caddyfile//@@REGISTRY_ALLOW_FROM@@/$registry_allow}"
+caddyfile="${caddyfile//@@REGISTRY_BACKEND_PORT@@/$REGISTRY_BACKEND_PORT}"
+caddyfile="${caddyfile//@@NODE_ALLOW_FROM@@/$node_allow}"
+caddyfile="${caddyfile//@@REGISTRY_AUTH@@/$registry_auth}"
 printf '%s\n' "$caddyfile" >"$RUN_DIR/Caddyfile"
+# адрес записи в реестр для registry-push.sh (пароль он берёт из secrets.env)
+printf 'REGISTRY_BACKEND_PORT=%s\nREGISTRY_USER=%s\n' "$REGISTRY_BACKEND_PORT" "$REGISTRY_USER" >"$RUN_DIR/registry.env"
 
 # ------------------------------------------------------------------ окружение портала
 # Значения экранируются printf %q: файл читается командой `. portal.env` (supervisord.conf).
 DATABASE_URL="postgresql+asyncpg://portal:${PORTAL_DB_PASSWORD}@127.0.0.1:5432/portal"
-: "${OIDC_ISSUER:=https://sso-ng.nsu.ru/auth/realms/NSU}"
-: "${OIDC_CLIENT_ID:=double.fresh.nsuts.ru}"
+# Провайдера входа выбирает оператор: значений по умолчанию нет. Без OIDC_ISSUER и OIDC_CLIENT_ID главный запускается, но войти
+# в портал нельзя (кнопка «Войти» отвечает понятной ошибкой), поэтому здесь громкая строка в журнал, а не остановка.
+for v in OIDC_ISSUER OIDC_CLIENT_ID; do
+  [ -n "${!v:-}" ] || echo "ПРЕДУПРЕЖДЕНИЕ: не задана переменная $v: войти в портал нельзя, пока её нет в .env (install-main.sh спрашивает её; пример для NSU ID в .env.example)." >&2
+done
 : "${NODE_IMAGE_REPO:=nsu-llm-node}"
-: "${NODE_IMAGE_TAG:=0.1.0}"
+: "${NODE_IMAGE_TAG:=0.2.0}"
 : "${INFER_PORT:=18080}"
 : "${RPC_PORT:=18050}"
 : "${MAX_KEYS_PER_USER:=5}"
@@ -215,22 +300,28 @@ DATABASE_URL="postgresql+asyncpg://portal:${PORTAL_DB_PASSWORD}@127.0.0.1:5432/p
 if [ -n "${TLS_CERT:-}" ]; then MAIN_OWN_CERT=true; fi
 WEB_DIST=/opt/llm/web
 MIGRATIONS_DIR=/opt/llm/portal
-REDIS_URL=redis://127.0.0.1:6379/0
+# requirepass Redis (REDIS_PASSWORD, common-25-redis): тот же адрес у LiteLLM (GATEWAY_STATS_REDIS_URL в common-30-litellm)
+REDIS_URL="redis://:${REDIS_PASSWORD}@127.0.0.1:6379/0"
 
-portal_vars=(DATABASE_URL LITELLM_MASTER_KEY AGENT_TOKEN CLUSTER_TOKEN NODE_LEGACY_TOKEN OIDC_ISSUER OIDC_CLIENT_ID OIDC_CLIENT_SECRET OIDC_REDIRECT_URI OIDC_POST_LOGOUT_REDIRECT_URI
+portal_vars=(DATABASE_URL LITELLM_MASTER_KEY AGENT_TOKEN CLUSTER_TOKEN NODE_LEGACY_TOKEN OIDC_ISSUER OIDC_CLIENT_ID OIDC_CLIENT_SECRET LOGIN_PROVIDER_NAME OIDC_REDIRECT_URI OIDC_POST_LOGOUT_REDIRECT_URI
   BACKEND_API_KEY PUBLIC_HOSTNAME MAIN_ADVERTISE_IP MAIN_OWN_CERT ADMIN_EMAILS ADMIN_REQUIRE_EMAIL_VERIFIED NODE_IMAGE_REPO NODE_IMAGE_TAG INFER_PORT RPC_PORT HF_TOKEN
   MAX_KEYS_PER_USER KEY_RPM_LIMIT KEY_TPM_LIMIT DEFAULT_MODEL_NAME DEFAULT_MODEL_REPO DEFAULT_MODEL_FILE
   DEFAULT_CTX_PER_REQUEST DEFAULT_PARALLEL WEB_DIST MIGRATIONS_DIR REDIS_URL PORTAL_WORKERS LITELLM_WORKERS QUEUE_FACTOR
   DB_POOL_SIZE DB_MAX_OVERFLOW SESSION_TTL_HOURS LITELLM_STREAM_CONNECTIONS BACKEND_RECENT_WINDOW_S HF_ENDPOINT STATUS_CACHE_TTL_S NODE_NOTREADY_GRACE_S
   SPLIT_REGROUP_GRACE_S SCHEDULE_DRAIN_S GPU_COMPUTE_RESERVE_MIB CONTROLLER_INTERVAL_S STANDALONE_TTL_S STANDALONE_PURGE_S BACKUP_DIR MAIN_GPU HTTP_PROXY HTTPS_PROXY NO_PROXY http_proxy https_proxy no_proxy
-  HF_MIRROR_TOKEN HF_MIRROR_MAX_GIB HF_MIRROR_PORT HF_MIRROR_ENABLED HF_MIRROR_URL MODEL_LOAD_MBPS RPC_CACHE_MAX_GIB
+  HF_MIRROR_TOKEN HF_MIRROR_ADMIN_TOKEN HF_MIRROR_MAX_GIB HF_MIRROR_PORT HF_MIRROR_ENABLED HF_MIRROR_URL MODEL_LOAD_MBPS RPC_CACHE_MAX_GIB
   HF_MIRROR_DATA_DIR LOCAL_MODELS_MAX_GIB UPLOAD_CHUNK_MIB LOCAL_MODELS_SCAN_S LOCAL_MODELS_SETTLE_S
-  WOL_ENABLED WOL_DELAY_S WOL_RETRY_S WOL_MAX_TRIES WOL_UNICAST WOL_BROADCAST_OVERRIDE WOL_VIA_NODE WOL_VIA_NODE_AFTER)
+  WOL_ENABLED WOL_DELAY_S WOL_RETRY_S WOL_MAX_TRIES WOL_UNICAST WOL_BROADCAST_OVERRIDE WOL_VIA_NODE WOL_VIA_NODE_AFTER
+  NODE_IMAGE_PIN NODE_AUTO_UPDATE NODE_UPDATE_RETRY_S REGISTRY_PORT REGISTRY_URL NSU_LLM_VERSION NSU_LLM_REVISION MAIN_IMAGE_DIGEST MODEL_CACHE_IDLE_S
+  SETTINGS_CACHE_TTL_S NODE_APPROVAL_REQUIRED ADMIN_SUBS OIDC_ALLOWED_DOMAINS OIDC_REQUIRED_CLAIM SESSION_MAX_DAYS TRUSTED_PROXIES
+  KEY_CREATE_PER_HOUR PLAYGROUND_MAX_INFLIGHT PLAYGROUND_BODY_BUDGET_MIB NODE_KEY_MIGRATION_DAYS)
 : >"$RUN_DIR/portal.env"
 # При NODE_LEGACY_TOKEN=false портал не принимает серверный токен k3s, поэтому и не получает его: так он остаётся только у k3s.
 # Значения false/0/no/off/f/n (без учёта регистра) читаются так же, как их читает pydantic в настройках портала.
+# Не задана в .env: значение по умолчанию этой установки (legacy_default выше: false на новой, true на созданной до неё).
+: "${NODE_LEGACY_TOKEN:=${legacy_default:-false}}"
 legacy_token=1
-case "${NODE_LEGACY_TOKEN:-}" in
+case "$NODE_LEGACY_TOKEN" in
   [Ff][Aa][Ll][Ss][Ee]|0|[Nn][Oo]|[Oo][Ff][Ff]|[Ff]|[Nn]) legacy_token=0 ;;
 esac
 for v in "${portal_vars[@]}"; do
@@ -267,6 +358,24 @@ env -i PATH="$PATH" HOME="${HOME:-/root}" HOSTNAME="${HOSTNAME:-llm-main}" super
 if [ "$ca_pending" = 1 ]; then
   ( umask 077; until [ -s "$ca_src" ]; do sleep 2; done; render_ca || echo "Ошибка: ConfigMap llm-ca не записан" >&2 ) &
 fi
+# Подпись /ca.crt ключом CA k3s: появляется, когда есть оба (CA k3s создаётся при первом старте k3s), и обновляется при смене
+# любого из них (sign-ca.sh сам ничего не делает, пока входы не изменились).
+if [ -n "$ca_src" ]; then
+  # каждые 2 с, пока подписи нет (нода, которую ставят сразу после главного, иначе ждала бы до 30 с), затем раз в 30 с
+  ( while :; do "$MAIN_DIR/sign-ca.sh" "$ca_src" "$CA_SIG_DIR" >/dev/null || true
+      if [ -s "$CA_SIG_DIR/ca.crt.p7s" ]; then sleep 30; else sleep 2; fi; done ) &
+fi
+
+# Поды главного выбирают ноду по имени объекта Node (matchFields metadata.name: его не присвоить себе чужой ноде, а метку
+# kubernetes.io/hostname kubelet ставит себе сам) и терпят этот taint; поды портала (только ПК класса) его не терпят.
+# Системные поды k3s (coredns, local-path-provisioner) его уже терпят. Новый кластер получает taint при регистрации
+# llm-main (--node-taint), кластер, созданный до этой версии, здесь, как только ответит API k3s.
+MAIN_TAINT="node-role.kubernetes.io/control-plane=true:NoSchedule"
+( for _ in $(seq 1 360); do
+    if k3s kubectl taint node llm-main "$MAIN_TAINT" --overwrite >/dev/null 2>&1; then exit 0; fi
+    sleep 5
+  done
+  echo "Ошибка: taint $MAIN_TAINT не поставлен на llm-main за 30 минут: k3s kubectl taint node llm-main $MAIN_TAINT" >&2 ) &
 
 # Адрес API для подов и туннелей нод: LAN-адрес при работающем hairpin, иначе адрес контейнера
 # (см. api-advertise-ip.py; проверка не дольше 8 с). Адрес для нод (--tls-san, --node-external-ip) в любом случае LAN-адрес.
@@ -283,6 +392,7 @@ if [ -f "$K3S_TOKEN_FILE" ]; then rm -f /var/lib/rancher/k3s/server/cred/passwd;
 # портал («Подключение ноды») и run-main (agent-token.sh).
 K3S_TOKEN="$CLUSTER_TOKEN" K3S_AGENT_TOKEN="$AGENT_TOKEN" exec k3s server \
   --node-name llm-main \
+  --node-taint "$MAIN_TAINT" \
   --cluster-cidr 100.64.0.0/16 \
   --service-cidr 100.65.0.0/16 \
   --cluster-dns 100.65.0.10 \
@@ -293,4 +403,4 @@ K3S_TOKEN="$CLUSTER_TOKEN" K3S_AGENT_TOKEN="$AGENT_TOKEN" exec k3s server \
   --kube-apiserver-arg kubelet-preferred-address-types=Hostname,InternalIP,ExternalIP \
   --egress-selector-mode cluster \
   --disable traefik,servicelb,metrics-server \
-  --write-kubeconfig-mode 0644
+  --write-kubeconfig-mode 0600

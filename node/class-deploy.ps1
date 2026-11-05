@@ -13,6 +13,13 @@
 # задание, с профилем и DPAPI, без «двойного прыжка»); вывод идёт в C:\ProgramData\NSU-LLM-stage\run.log и показывается по ходу.
 # -RunMode session — прежний запуск прямо в сессии WinRM.
 #
+# Пароль администратора и токен агента уходят на ПК как SecureString (PSRP шифрует их ключом сеанса независимо от транспорта), а не
+# строкой в аргументах; на ПК они только в файле параметров под DPAPI LocalMachine (доступ SYSTEM и Administrators, файл удаляется при
+# чтении). Один пароль на весь класс означает, что администратор одного ПК получает его из LSA и входит на все остальные: поэтому
+# -Laps берёт у каждого ПК свой пароль из Windows LAPS (Get-LapsADPassword), а без LAPS заведите на ПК отдельную учётную запись с
+# уникальным паролем. Сервер WinRM по HTTP с TrustedHosts не проверяется (его мог занять другой ПК): для проверки сервера -UseSSL
+# (HTTPS с сертификатом) или Kerberos (домен, ПК по имени). LocalAccountTokenFilterPolicy=1 не нужен и не рекомендуется.
+#
 # Перед любой записью каталог раздачи на ПК закрывается (node\secure-dir.ps1: владелец Administrators, Users только чтение):
 # права C:\ProgramData по умолчанию позволяют любому пользователю заранее создать его и подменить скрипты.
 #
@@ -27,6 +34,7 @@ param(
     [string]$Main = '',
     [string]$Token = '',
     [string]$AllowFrom = '',
+    [string]$CaSha256 = '',
     [string]$ImageTarCpu = '',
     [string]$ImageTarGpu = '',
     [ValidateSet('', 'main', 'tar')][string]$ImageSource = '',
@@ -41,6 +49,8 @@ param(
     [string]$Proxy = '',
     [switch]$KeepStage,
     [switch]$UseSSL,
+    [switch]$Laps,
+    [switch]$AcceptCa,
     [switch]$InsecureTls,
     [switch]$NonInteractive,
     [switch]$Yes,
@@ -57,7 +67,7 @@ if ($PSVersionTable.PSEdition -ne 'Core') {
 }
 
 $NodeDir = $(if ($ScriptsFrom) { $ScriptsFrom } else { $PSScriptRoot })   # откуда раздаются install-node.ps1 и соседи
-$NodeFiles = @('install-node.ps1', 'run-node.ps1', 'node-boot.ps1', 'wsl-setup.sh', 'pull-image.sh')   # то, что install-node.ps1 берёт рядом с собой
+$NodeFiles = @('install-node.ps1', 'run-node.ps1', 'node-boot.ps1', 'wsl-setup.sh', 'pull-image.sh', 'IMAGE_VERSION')   # то, что install-node.ps1 берёт рядом с собой
 $HelperFiles = @('secure-dir.ps1', 'class-run.ps1')   # общие помощники: из -ScriptsFrom, иначе рядом с этим скриптом
 $Modes = @('k3s', 'standalone')
 $Accels = @('auto', 'cpu', 'nvidia')
@@ -213,18 +223,40 @@ function Read-Inventory([string]$path) {
         if ($seenN[$name]) { Fail "$path`: имя $name повторяется" 'Имена нод должны быть уникальны.' }
         if ($seenA[$addr]) { Fail "$path`: адрес $addr повторяется" 'Адреса должны быть уникальны.' }
         $seenN[$name] = $true; $seenA[$addr] = $true
-        [void]$out.Add([pscustomobject]@{ Name = $name; Address = $addr; Mode = $mode; Accel = $acc; Docker = $dk; ImageLoaded = $false; Session = $null; Info = $null; Status = ''; Detail = ''; Code = $null; Seconds = 0; Index = $n; Log = ''; Output = ''; Streamed = 0 })
+        [void]$out.Add([pscustomobject]@{ Name = $name; Address = $addr; Mode = $mode; Accel = $acc; Docker = $dk; ImageLoaded = $false; Session = $null; Info = $null; Cred = $null; Status = ''; Detail = ''; Code = $null; Seconds = 0; Index = $n; Log = ''; Output = ''; Streamed = 0 })
     }
     return @($out)
 }
 
 # ------------------------------------------------------------------ ответы (один файл на весь класс)
-# Версия образа — $Version из install-node.ps1, который раздаётся: образ другой версии установщик не примет.
+# Версия образа: её называет главный (GET /api/node-image: NODE_IMAGE_TAG), установщик на ПК берёт образ оттуда; архив другой версии он
+# не примет и скачает образ с главного. Главный не отвечает (или не задан): запасная версия скриптов, node\IMAGE_VERSION
+# (раздаётся вместе с install-node.ps1). Ответ запоминается на время запуска.
+$CurlExe = $(if ($env:NSU_LLM_CURL) { $env:NSU_LLM_CURL } else { 'curl.exe' })   # NSU_LLM_CURL: только для тестов
+$script:MainForVersion = ''
+$script:MainTagCache = @{}
+function Get-MainTag([string]$m) {
+    if (-not $m) { return '' }
+    if ($script:MainTagCache.ContainsKey($m)) { return $script:MainTagCache[$m] }
+    $v = ''
+    $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    try {
+        # -k: ответ публичный и проверяется регулярным выражением; CA частный и ещё не закреплён
+        $body = (& $CurlExe -sk --noproxy '*' --connect-timeout 3 -m 6 "https://$m/api/node-image" 2>$null) -join ''
+        if ($LASTEXITCODE -eq 0 -and $body) { $t = "$(($body | ConvertFrom-Json).tag)"; if ($t -match '^\d+\.\d+\.\d+(-[0-9A-Za-z.]+)?$') { $v = $t } }
+    }
+    catch { }
+    finally { $ErrorActionPreference = $prev }
+    $script:MainTagCache[$m] = $v
+    return $v
+}
 function Get-NodeVersion {
-    $f = Join-Path $NodeDir 'install-node.ps1'
+    $v = Get-MainTag $script:MainForVersion
+    if ($v) { return $v }
+    $f = Join-Path $NodeDir 'IMAGE_VERSION'
     if (-not (Test-Path -LiteralPath $f)) { return '' }
-    $m = Select-String -LiteralPath $f -Pattern "^\s*\`$Version\s*=\s*'([^']+)'" | Select-Object -First 1
-    return $(if ($m) { $m.Matches[0].Groups[1].Value } else { '' })
+    $v = "$(Get-Content -LiteralPath $f -TotalCount 1 -ErrorAction SilentlyContinue)".Trim()
+    return $(if ($v -match '^\d+\.\d+\.\d+(-[0-9A-Za-z.]+)?$') { $v } else { '' })
 }
 function Get-TarPattern([string]$tag) { $v = Get-NodeVersion; return $(if ($v) { "nsu-llm-node-$v-$tag.tar*" } else { "nsu-llm-node-*-$tag.tar*" }) }
 function Find-ImageTar([string]$tag, [string[]]$dirs) {
@@ -239,12 +271,17 @@ function Resolve-MainIp([string]$m) {
     if (Test-Ipv4 $m) { return $m }
     try { return ([Net.Dns]::GetHostAddresses($m) | Where-Object { $_.AddressFamily -eq 'InterNetwork' } | Select-Object -First 1).IPAddressToString } catch { return '' }
 }
-function Get-DefaultAllow($nodes, [string]$main) {
-    $l = New-Object System.Collections.ArrayList
-    foreach ($n in $nodes) { if (Test-Ipv4 $n.Address) { $c = ($n.Address -replace '\.\d+$', '.0/24'); if (-not $l.Contains($c)) { [void]$l.Add($c) } } }
-    $mi = Resolve-MainIp $main
-    if ($mi -and -not $l.Contains($mi)) { [void]$l.Add($mi) }
-    return ($l -join ',')
+# 18080 (инференс) открыт только главному; на 18050 (RPC split) пускают главного и ноды группы split, их называет главный. Подсеть
+# класса не открывается: ученик на соседнем ПК иначе подключился бы к RPC без аутентификации.
+function Get-DefaultAllow($nodes, [string]$main) { return (Resolve-MainIp $main) }
+# Сохранённый список прежней версии: подсеть /24, в которую входит ПК класса
+function Test-LegacyAllow([string]$list, $nodes) {
+    foreach ($e in ($list -split ',')) {
+        if ($e -notmatch '^(\d+\.\d+\.\d+)\.\d+/(\d+)$' -or [int]$matches[2] -ge 32) { continue }
+        $net = $matches[1]
+        if (@($nodes | Where-Object { (Test-Ipv4 $_.Address) -and $_.Address.StartsWith("$net.") }).Count -gt 0) { return $true }
+    }
+    return $false
 }
 function Get-SavedToken($saved) {
     $enc = Get-Prop $saved 'AgentTokenProtected'
@@ -261,8 +298,17 @@ function Resolve-Answers([string]$path, $nodes, [string]$act) {
     $needFull = $act -in @('install', 'update')
     $r = [ordered]@{}
     $r.Main = $(if ($Main) { $Main } elseif (Get-Prop $saved 'Main') { [string]$saved.Main } else { '' })
+    $script:MainForVersion = $r.Main
     $r.Token = $(if ($Token) { $Token } elseif ($env:NSU_LLM_AGENT_TOKEN) { $env:NSU_LLM_AGENT_TOKEN } else { Get-SavedToken $saved })
     $r.AllowFrom = $(if ($AllowFrom) { $AllowFrom } elseif (Get-Prop $saved 'AllowFrom') { [string]$saved.AllowFrom } else { '' })
+    if ($r.AllowFrom -and -not $AllowFrom -and (Test-LegacyAllow $r.AllowFrom $nodes)) {
+        Warn "сохранённый AllowFrom ($($r.AllowFrom)) открывал порты всей подсети класса: теперь 18080 открыт только главному, 18050 главному и нодам группы split. Свой список: -AllowFrom."
+        $r.AllowFrom = ''
+    }
+    $r.CaSha256 = $(if ($CaSha256) { $CaSha256 } elseif ($env:NSU_LLM_CA_SHA256) { $env:NSU_LLM_CA_SHA256 } elseif (Get-Prop $saved 'CaSha256') { [string]$saved.CaSha256 } else { '' })
+    $r.CaSha256 = ($r.CaSha256 -replace '[:\s]', '').ToLowerInvariant()
+    if ($r.CaSha256 -and $r.CaSha256 -notmatch '^[0-9a-f]{64}$') { Fail 'Недопустимый -CaSha256: нужны 64 шестнадцатеричные цифры' 'Отпечаток SHA-256 корня CA главного: страница «Подключение ноды» портала.' }
+    $r.AcceptCa = [bool]($AcceptCa -or (Get-Prop $saved 'AcceptCa'))
     $dirs = @($NodeDir, (Split-Path -Parent $NodeDir), (Get-Location).Path, (Split-Path -Parent $path))
     # Источник образа: архив (-ImageTarCpu/-ImageTarGpu или nsu-llm-node-*.tar.gz рядом) или главный сервер (реестр https://<главный>/v2/):
     # без архива ПК класса скачивают образ с главного сами (умолчание); -ImageSource main игнорирует архивы, -ImageSource tar требует их.
@@ -275,14 +321,16 @@ function Resolve-Answers([string]$path, $nodes, [string]$act) {
 
     $needMain = $needFull -or ($act -eq 'uninstall')
     if ($needMain -and -not $r.Main -and $ask) { $r.Main = Read-Answer 'Адрес главного сервера (IP или имя)' }
+    $script:MainForVersion = $r.Main
     if ($needMain -and -not $r.Token -and $ask) { $r.Token = Read-Answer 'Токен агента (портал, «Подключение ноды»; ввод скрыт)' -Secret }
     if ($needFull) {
         if (-not $r.Main) { Fail 'Не задан адрес главного сервера' 'Параметр -Main или запуск без -NonInteractive; пример: -Main 10.0.0.5' }
         if (-not $r.Token) { Fail 'Не задан токен агента' 'Параметр -Token, переменная NSU_LLM_AGENT_TOKEN или запуск без -NonInteractive (токен: портал, «Подключение ноды»).' }
         $defAllow = Get-DefaultAllow $nodes $r.Main
-        if (-not $r.AllowFrom) { $r.AllowFrom = $(if ($ask) { Read-Answer 'С каких адресов пускать на 18080/18050 (через запятую)' $defAllow } else { $defAllow }) }
+        if (-not $r.AllowFrom -and -not $defAllow) { Fail "Адрес главного $($r.Main) не разрешается в IPv4: брандмауэру нечего разрешить" 'Укажите -AllowFrom <адрес главного> (через запятую можно несколько адресов).' }
+        if (-not $r.AllowFrom) { $r.AllowFrom = $(if ($ask) { Read-Answer 'С каких адресов пускать на 18080 (инференс; через запятую; на 18050 пускают главного и ноды группы split)' $defAllow } else { $defAllow }) }
         $r.AllowFrom = $r.AllowFrom.Replace(' ', '')
-        if ($r.AllowFrom -notmatch '^[0-9./]+(,[0-9./]+)*$') { Fail "Недопустимый список адресов: $($r.AllowFrom)" 'Пример: 192.168.3.0/24,10.0.0.5' }
+        if ($r.AllowFrom -notmatch '^[0-9./]+(,[0-9./]+)*$') { Fail "Недопустимый список адресов: $($r.AllowFrom)" 'Пример: 10.0.0.5 или 10.0.0.5,192.168.3.7' }
         $needCpu = @($nodes | Where-Object { $_.Accel -ne 'nvidia' }).Count -gt 0
         $needGpu = @($nodes | Where-Object { $_.Accel -ne 'cpu' }).Count -gt 0
         foreach ($t in @(@('ImageTarCpu', $needCpu, 'cpu'), @('ImageTarGpu', $needGpu, 'gpu'))) {
@@ -297,7 +345,7 @@ function Resolve-Answers([string]$path, $nodes, [string]$act) {
     if ($r.Token) { Add-Secret $r.Token }
     # Сохраняем, чтобы повторный запуск шёл без вопросов (токен — под DPAPI текущего пользователя).
     if ($needFull -and -not $DryRun) {
-        $save = [ordered]@{ Main = $r.Main; AllowFrom = $r.AllowFrom; ImageTarCpu = $r.ImageTarCpu; ImageTarGpu = $r.ImageTarGpu; ImageSource = $r.ImageSource; InsecureTls = $r.InsecureTls
+        $save = [ordered]@{ Main = $r.Main; AllowFrom = $r.AllowFrom; CaSha256 = $r.CaSha256; AcceptCa = $r.AcceptCa; ImageTarCpu = $r.ImageTarCpu; ImageTarGpu = $r.ImageTarGpu; ImageSource = $r.ImageSource; InsecureTls = $r.InsecureTls
             AgentTokenProtected = $(if ($r.Token) { Protect-UserText $r.Token } else { '' }) }
         $dir = Split-Path -Parent $path; if ($dir -and -not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
         [pscustomobject]$save | ConvertTo-Json | Set-Content -Encoding UTF8 -Path $path
@@ -324,8 +372,13 @@ function Show-WinRmAdvice($failed, [bool]$trustNeeded, [string]$trustValue) {
     Say ''
     Say 'Как включить WinRM. На каждом таком ПК, PowerShell от администратора (один раз; можно по GPO или через psexec):'
     Say '  Enable-PSRemoting -Force -SkipNetworkProfileCheck'
-    Say 'Если ПК в рабочей группе и вход под локальной учёткой (не встроенным Administrator), там же:'
-    Say '  New-ItemProperty -Path HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System -Name LocalAccountTokenFilterPolicy -Value 1 -PropertyType DWord -Force'
+    Say 'Если ПК в рабочей группе: входите встроенной учётной записью Administrator (включить: net user Administrator /active:yes и задать пароль) или доменной.'
+    Say '  Локальную учётную запись, которая не встроенный Administrator, WinRM по сети не пускает (фильтр токена UAC). Рекомендуемая в интернете'
+    Say '  LocalAccountTokenFilterPolicy=1 снимает фильтр для всех локальных администраторов и открывает вход по хешу пароля на всех ПК, где задан'
+    Say '  одинаковый пароль, поэтому здесь она не рекомендуется.'
+    Say 'Канал: WinRM по HTTP не проверяет сервер. Лучше WinRM по HTTPS на ПК (New-SelfSignedCertificate или сертификат вашего CA, затем'
+    Say '  winrm quickconfig -transport:https) и -UseSSL здесь, либо Kerberos (ПК и администратор в домене, ПК по имени, не по IP).'
+    Say 'Пароль: один пароль администратора на весь класс опасен (достали из LSA одного ПК, вошли на все); -Laps берёт у каждого ПК свой из Windows LAPS.'
     Say 'Если порт 5985 закрыт и после этого, проверьте брандмауэр: Get-NetFirewallRule -Name WINRM-HTTP-In-TCP* | Select Name,Profile,Enabled,RemoteAddress'
     if ($trustNeeded) {
         Say 'На этом ПК (администратора), PowerShell от администратора, чтобы разрешить вход по IP и в рабочей группе:'
@@ -333,17 +386,37 @@ function Show-WinRmAdvice($failed, [bool]$trustNeeded, [string]$trustValue) {
     }
 }
 # Открывает сессии ко всем ПК. Недоступным ставит Status='НЕДОСТУПЕН' и причину.
+# Учётная запись для ПК: своя (LAPS, -Laps) или общая.
+function Get-NodeCred($node, [pscredential]$cred) { if ($node.Cred) { return $node.Cred }; return $cred }
+# -Laps: у каждого ПК свой пароль локального администратора в Windows LAPS; один пароль на весь класс означает, что
+# взлом одного ПК открывает все остальные.
+function Resolve-LapsCredentials($nodes) {
+    if (-not (Get-Command Get-LapsADPassword -ErrorAction SilentlyContinue)) {
+        Fail '-Laps: нет командлета Get-LapsADPassword (модуль LAPS: Windows 11 22H2 и новее или RSAT; ПК администратора в домене)' 'Установите RSAT или уберите -Laps и заведите на ПК класса отдельную учётную запись с уникальным паролем.'
+    }
+    foreach ($n in $nodes) {
+        try {
+            $r = Get-LapsADPassword -Identity $n.Name -AsPlainText -ErrorAction Stop
+            if (-not $r -or -not $r.Password) { throw 'пароль не выдан' }
+            Add-Secret ([string]$r.Password)
+            $n.Cred = New-Object pscredential("$($n.Name)\$(if ($r.Account) { $r.Account } else { 'Administrator' })", (New-SecureText ([string]$r.Password)))
+        }
+        catch { $n.Status = 'НЕДОСТУПЕН'; $n.Detail = "пароль LAPS не получен: $(("$($_.Exception.Message)" -split "`r?`n")[0])" }
+    }
+}
 function Connect-Nodes($nodes, [pscredential]$cred) {
     $port = $(if ($UseSSL) { 5986 } else { 5985 })
     $open = Test-Ports @($nodes | ForEach-Object { $_.Address }) $port
     # Профиль пользователя загружается: install-node.ps1 пишет %USERPROFILE%\.wslconfig, WSL и DPAPI живут в профиле.
     $sessOpt = New-PSSessionOption -OpenTimeout 20000 -OperationTimeout 120000
     foreach ($n in $nodes) {
+        if ($n.Status -eq 'НЕДОСТУПЕН') { continue }
+        $nc = Get-NodeCred $n $cred
         if (-not $open[$n.Address]) { $n.Status = 'НЕДОСТУПЕН'; $n.Detail = "порт $port закрыт или ПК выключен"; continue }
-        try { Test-WSMan -ComputerName $n.Address -Credential $cred -Authentication Default -UseSSL:$UseSSL -ErrorAction Stop | Out-Null }
+        try { Test-WSMan -ComputerName $n.Address -Credential $nc -Authentication Default -UseSSL:$UseSSL -ErrorAction Stop | Out-Null }
         catch { $n.Status = 'НЕДОСТУПЕН'; $n.Detail = "WinRM не отвечает: $(("$($_.Exception.Message)" -split "`r?`n")[0])"; continue }
         try {
-            $n.Session = New-PSSession -ComputerName $n.Address -Credential $cred -SessionOption $sessOpt -UseSSL:$UseSSL -ErrorAction Stop
+            $n.Session = New-PSSession -ComputerName $n.Address -Credential $nc -SessionOption $sessOpt -UseSSL:$UseSSL -ErrorAction Stop
         }
         catch { $n.Status = 'НЕДОСТУПЕН'; $n.Detail = "вход не удался: $(("$($_.Exception.Message)" -split "`r?`n")[0]) (учётная запись, LocalAccountTokenFilterPolicy)" }
     }
@@ -398,7 +471,15 @@ $BlockRun = {
         return [pscustomobject]@{ Kind = 'run'; Code = 127; Output = "ОШИБКА: нет $($p.StageDir)\install-node.ps1: файлы не раздавались (-CopyMode none?)" }
     }
     $a = @{}
-    foreach ($k in $p.Args.Keys) { $a[$k] = $p.Args[$k] }
+    # Токен и пароль пришли как SecureString (зашифрованы ключом сеанса PSRP): открытым текстом они только здесь, в памяти ПК, и дальше
+    # в файле параметров под DPAPI LocalMachine.
+    foreach ($k in $p.Args.Keys) {
+        $v = $p.Args[$k]
+        if ($v -is [Security.SecureString]) { $v = (New-Object Net.NetworkCredential('', $v)).Password }
+        $a[$k] = $v
+    }
+    $taskPw = $p.TaskPassword
+    if ($taskPw -is [Security.SecureString]) { $taskPw = (New-Object Net.NetworkCredential('', $taskPw)).Password }
     # Прокси: установщик с -Proxy сам настраивает wsl, apt, Docker и NO_PROXY; старому — хотя бы переменные окружения.
     $envProxy = ''
     if ($p.Proxy) {
@@ -406,38 +487,53 @@ $BlockRun = {
         if ($decl) { $a['Proxy'] = $p.Proxy } else { $envProxy = $p.Proxy; $env:HTTP_PROXY = $p.Proxy; $env:HTTPS_PROXY = $p.Proxy }
     }
     $log = Join-Path $p.StageDir 'run.log'; $done = Join-Path $p.StageDir 'run.done'; $mark = Join-Path $p.StageDir 'image-loaded.json'
-    Remove-Item -LiteralPath $log, $done -Force -ErrorAction SilentlyContinue
+    $actFile = Join-Path $p.StageDir 'run.action'
+    $runner = Join-Path $p.StageDir 'class-run.ps1'; $pf = Join-Path $p.StageDir 'run-params.bin'
+    $want = $(if ($p.Action -eq 'uninstall') { 'uninstall' } else { 'install' })   # install и update — один и тот же установщик
+    # Прошлый запуск ещё идёт (связь с ПК администратора оборвалась, а задача на ПК продолжается): тот же вид запуска не начинается
+    # заново, а подключается к идущему и показывает его журнал с начала. Другое действие на ПК с идущим запуском — ошибка.
+    $attach = $false
+    $old = $null
+    if ($p.RunMode -eq 'task') {
+        $tn = $p.TaskName; $tp = $p.TaskPath
+        try { $old = Get-ScheduledTask -TaskPath $tp -TaskName $tn -ErrorAction Stop } catch { }
+        if ($old -and "$($old.State)" -eq 'Running') {
+            $has = ''; try { $has = ([IO.File]::ReadAllText($actFile)).Trim() } catch { }
+            if ($p.Action -ne 'status' -and $has -eq $want) { $attach = $true }
+            else {
+                return [pscustomobject]@{ Kind = 'run'; Code = 1; Output = "ОШИБКА: на ПК ещё идёт прошлый запуск (задача $tp$tn$(if ($has) { ", $has" }))`nКак исправить: дождитесь его конца (журнал $log) или остановите: Stop-ScheduledTask -TaskPath '$tp' -TaskName $tn" }
+            }
+        }
+    }
+    if (-not $attach) { Remove-Item -LiteralPath $log, $done -Force -ErrorAction SilentlyContinue }
     $enc = New-Object Text.UTF8Encoding $false
     $code = 0; $extra = ''
     if ($p.RunMode -eq 'task') {
-        $tn = $p.TaskName; $tp = $p.TaskPath
-        $old = $null; try { $old = Get-ScheduledTask -TaskPath $tp -TaskName $tn -ErrorAction Stop } catch { }
-        if ($old -and "$($old.State)" -eq 'Running') {
-            return [pscustomobject]@{ Kind = 'run'; Code = 1; Output = "ОШИБКА: на ПК ещё идёт прошлый запуск (задача $tp$tn)`nКак исправить: дождитесь его конца (журнал $log) или остановите: Stop-ScheduledTask -TaskPath '$tp' -TaskName $tn" }
-        }
-        if ($old) { Unregister-ScheduledTask -TaskPath $tp -TaskName $tn -Confirm:$false }
-        $runner = Join-Path $p.StageDir 'class-run.ps1'
-        Write-SecureFile -Path $runner -Bytes ((New-Object Text.UTF8Encoding $true).GetPreamble() + (New-Object Text.UTF8Encoding $false).GetBytes($p.Runner))
-        $pf = Join-Path $p.StageDir 'run-params.bin'
-        Add-Type -AssemblyName System.Security
-        $json = [pscustomobject]@{ Script = $script; Args = $a; EnvProxy = $envProxy } | ConvertTo-Json -Depth 4
-        # Файл с первого байта доступен только SYSTEM и Administrators (Write-SecureFile -AdminOnly), содержимое под DPAPI LocalMachine.
-        try { Write-SecureFile -Path $pf -AdminOnly -Bytes ([Security.Cryptography.ProtectedData]::Protect($enc.GetBytes($json), $null, [Security.Cryptography.DataProtectionScope]::LocalMachine)) }
-        catch { return [pscustomobject]@{ Kind = 'run'; Code = 1; Output = "ОШИБКА: не удалось записать параметры запуска: $($_.Exception.Message)" } }
-        $json = $null
-        $user = [string]$p.TaskUser
-        if ($user -like '.\*') { $user = "$env:COMPUTERNAME\" + $user.Substring(2) }
-        $arg = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$runner`" -Params `"$pf`" -Log `"$log`" -Done `"$done`""
-        $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $arg
-        $set = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::FromSeconds($p.TimeoutSec + 1800)) -MultipleInstances IgnoreNew
-        try {
-            Register-ScheduledTask -TaskName $tn -TaskPath $tp -Action $action -Settings $set -User $user -Password $p.TaskPassword -RunLevel Highest `
-                -Description 'NSU LLM: разовый запуск install-node.ps1 из class-deploy.ps1' -ErrorAction Stop | Out-Null
-            Start-ScheduledTask -TaskPath $tp -TaskName $tn -ErrorAction Stop
-        }
-        catch {
-            Remove-Item -LiteralPath $pf -Force -ErrorAction SilentlyContinue
-            return [pscustomobject]@{ Kind = 'run'; Code = 1; Output = "ОШИБКА: не удалось создать или запустить задачу $tp$tn от $user`: $($_.Exception.Message)`nКак исправить: проверьте пароль учётки и право «Вход в качестве пакетного задания» (у Администраторов оно есть, если GPO его не забирает) или запустите с -RunMode session" }
+        if ($attach) { [pscustomobject]@{ Kind = 'line'; Text = "Прошлый запуск на ПК ещё идёт (задача $tp$tn): показываю его журнал, новые параметры не применялись" } }
+        else {
+            if ($old) { Unregister-ScheduledTask -TaskPath $tp -TaskName $tn -Confirm:$false }
+            Write-SecureFile -Path $runner -Bytes ((New-Object Text.UTF8Encoding $true).GetPreamble() + (New-Object Text.UTF8Encoding $false).GetBytes($p.Runner))
+            Add-Type -AssemblyName System.Security
+            $json = [pscustomobject]@{ Script = $script; Args = $a; EnvProxy = $envProxy } | ConvertTo-Json -Depth 4
+            # Файл с первого байта доступен только SYSTEM и Administrators (Write-SecureFile -AdminOnly), содержимое под DPAPI LocalMachine.
+            try { Write-SecureFile -Path $pf -AdminOnly -Bytes ([Security.Cryptography.ProtectedData]::Protect($enc.GetBytes($json), $null, [Security.Cryptography.DataProtectionScope]::LocalMachine)) }
+            catch { return [pscustomobject]@{ Kind = 'run'; Code = 1; Output = "ОШИБКА: не удалось записать параметры запуска: $($_.Exception.Message)" } }
+            $json = $null
+            [IO.File]::WriteAllText($actFile, $want)
+            $user = [string]$p.TaskUser
+            if ($user -like '.\*') { $user = "$env:COMPUTERNAME\" + $user.Substring(2) }
+            $arg = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$runner`" -Params `"$pf`" -Log `"$log`" -Done `"$done`""
+            $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $arg
+            $set = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::FromSeconds($p.TimeoutSec + 1800)) -MultipleInstances IgnoreNew
+            try {
+                Register-ScheduledTask -TaskName $tn -TaskPath $tp -Action $action -Settings $set -User $user -Password $taskPw -RunLevel Highest `
+                    -Description 'NSU LLM: разовый запуск install-node.ps1 из class-deploy.ps1' -ErrorAction Stop | Out-Null
+                Start-ScheduledTask -TaskPath $tp -TaskName $tn -ErrorAction Stop
+            }
+            catch {
+                Remove-Item -LiteralPath $pf -Force -ErrorAction SilentlyContinue
+                return [pscustomobject]@{ Kind = 'run'; Code = 1; Output = "ОШИБКА: не удалось создать или запустить задачу $tp$tn от $user`: $($_.Exception.Message)`nКак исправить: проверьте пароль учётки и право «Вход в качестве пакетного задания» (у Администраторов оно есть, если GPO его не забирает) или запустите с -RunMode session" }
+            }
         }
         # Новые строки run.log -> {Kind=line}; неполная последняя строка ждёт следующего чтения.
         $dec = $enc.GetDecoder(); $st = @{ Pos = [long]0; Buf = '' }
@@ -494,7 +590,8 @@ $BlockRun = {
     $out = $(if (Test-Path -LiteralPath $log) { [IO.File]::ReadAllText($log, $enc) } else { '' })
     # Метка загруженного образа: после успеха с архивом — какой архив загружен (следующий запуск его не копирует и не передаёт);
     # если без архива установщик образа не нашёл (просит -ImageTar) — метка снимается, и следующий запуск скопирует архив.
-    if ($code -eq 0 -and $p.ImageMark) { [IO.File]::WriteAllText($mark, [string]$p.ImageMark, $enc) }
+    if ($attach) { }   # шёл прошлый запуск, с какими образами — неизвестно: метка не меняется (нет образа — установщик попросит архив, и метка снимется)
+    elseif ($code -eq 0 -and $p.ImageMark) { [IO.File]::WriteAllText($mark, [string]$p.ImageMark, $enc) }
     elseif ($code -ne 0 -and -not $a.ContainsKey('ImageTar') -and $out -match 'укажите -ImageTar') { Remove-Item -LiteralPath $mark -Force -ErrorAction SilentlyContinue }
     # Раздача после успеха: uninstall — всё; install/update — всё, кроме run.log и метки образа (архив остаётся только с -KeepStage).
     if ($code -eq 0 -and $p.Cleanup -eq 'all') { Remove-Item -LiteralPath $p.StageDir -Recurse -Force -ErrorAction SilentlyContinue }
@@ -589,7 +686,7 @@ function Get-LocalFiles($answers, $node) {
     $files = New-Object System.Collections.ArrayList
     foreach ($f in $NodeFiles) {
         $p = Join-Path $NodeDir $f
-        if (-not (Test-Path -LiteralPath $p)) { Fail "Нет файла $p" 'Запускайте class-deploy.ps1 из папки node репозитория: рядом должны лежать install-node.ps1, run-node.ps1, node-boot.ps1, wsl-setup.sh, pull-image.sh.' }
+        if (-not (Test-Path -LiteralPath $p)) { Fail "Нет файла $p" 'Запускайте class-deploy.ps1 из папки node репозитория: рядом должны лежать install-node.ps1, run-node.ps1, node-boot.ps1, wsl-setup.sh, pull-image.sh, IMAGE_VERSION.' }
         [void]$files.Add([pscustomobject]@{ Path = $p; Name = $f; Image = $false })
     }
     foreach ($f in $HelperFiles) { [void]$files.Add([pscustomobject]@{ Path = (Get-HelperPath $f); Name = $f; Image = $false }) }
@@ -644,7 +741,7 @@ function Copy-ToNode($node, $files, [pscredential]$cred) {
     $drive = $null
     Protect-NodeStage $node
     if ($mode -in @('auto', 'smb')) {
-        $drive = Open-NodeShare $node $cred
+        $drive = Open-NodeShare $node (Get-NodeCred $node $cred)
         if ($drive) { $mode = 'smb' }
         elseif ($mode -eq 'smb') { Fail "Админ-ресурс \\$($node.Address)\C$ недоступен" 'Включите «Общий доступ к файлам и принтерам» в брандмауэре ПК и проверьте учётку, либо используйте -CopyMode winrm.' }
         else { $mode = 'winrm' }
@@ -679,9 +776,11 @@ function Get-RunArgs([string]$act, $answers, $node, [pscredential]$cred) {
     $a = [ordered]@{}
     switch ($act) {
         { $_ -in @('install', 'update') } {
-            $a.Main = $answers.Main; $a.Token = $answers.Token; $a.Mode = $node.Mode; $a.Accel = $node.Accel; $a.Docker = $node.Docker; $a.Name = $node.Name
+            $a.Main = $answers.Main; $a.Token = (New-SecureText $answers.Token); $a.Mode = $node.Mode; $a.Accel = $node.Accel; $a.Docker = $node.Docker; $a.Name = $node.Name
             $a.AllowFrom = $answers.AllowFrom; $a.NonInteractive = $true; $a.Yes = $true
-            $a.TaskPassword = $cred.GetNetworkCredential().Password
+            $a.TaskPassword = $cred.Password   # SecureString: на ПК уходит зашифрованным ключом сеанса, не строкой
+            if ($answers.CaSha256) { $a.CaSha256 = $answers.CaSha256 }
+            if ($answers.AcceptCa) { $a.AcceptCa = $true }
             $tar = Get-ImageFor $answers $node
             if ($tar -and -not $node.ImageLoaded) { $a.ImageTar = (Join-Path $StageDir (Split-Path -Leaf $tar)) }
             if ($answers.ImageSource -eq 'main') { $a.ImageSource = 'main' }
@@ -691,7 +790,7 @@ function Get-RunArgs([string]$act, $answers, $node, [pscredential]$cred) {
         'uninstall' {
             $a.Uninstall = $true; $a.NonInteractive = $true; $a.Yes = $true; $a.Name = $node.Name
             if ($answers.Main) { $a.Main = $answers.Main }
-            if ($answers.Token) { $a.Token = $answers.Token }
+            if ($answers.Token) { $a.Token = (New-SecureText $answers.Token) }
             if ($answers.InsecureTls) { $a.InsecureTls = $true }
         }
         'status' { $a.Status = $true; $a.Name = $node.Name }
@@ -800,8 +899,16 @@ function Invoke-Main {
 
     # --- ответы и учётка
     $answers = Resolve-Answers $Answers $nodes $act
-    $cred = Resolve-Credential
-    Add-Secret ($cred.GetNetworkCredential().Password)
+    $cred = $(if ($Laps -and -not $Credential -and -not $env:NSU_LLM_ADMIN_PASSWORD) { $null } else { Resolve-Credential })
+    if ($cred) { Add-Secret ($cred.GetNetworkCredential().Password) }
+    if ($Laps) { Resolve-LapsCredentials $nodes }
+    elseif (-not $UseSSL -and $act -in @('install', 'update', 'uninstall')) {
+        Warn 'WinRM по HTTP: сервер на ПК не проверяется (при TrustedHosts и по IP это так), поэтому ПК, занявший чужой адрес, получит пароль и токен. Они защищены от подслушивания, но не от подмены сервера: -UseSSL (HTTPS с сертификатом) или Kerberos (домен, ПК по имени).'
+    }
+    # Исходная атака остаётся при общем пароле: он нужен задаче автозапуска (вход без пользователя) и лежит в LSA каждого ПК.
+    if (-not $Laps -and $act -in @('install', 'update') -and @($nodes).Count -gt 1) {
+        Warn "один и тот же пароль администратора будет сохранён в LSA каждого из $(@($nodes).Count) ПК (задача автозапуска NSU-LLM-Node входит по паролю): администратор одного ПК достанет его оттуда и войдёт на все остальные. Снимает это только свой пароль на каждом ПК: -Laps (Windows LAPS, нужен домен) или отдельная локальная учётная запись с уникальным паролем; gMSA задаче с WSL не подходит (дистрибутив принадлежит конкретному пользователю). docs\deploy-class.md, «Один пароль на весь класс опасен»."
+    }
 
     # --- TrustedHosts: без домена и по IP Kerberos недоступен, WinRM по HTTP пускает только доверенные адреса
     $trustNeeded = (-not $UseSSL) -and (-not (Test-DomainJoined) -or @($nodes | Where-Object { Test-Ipv4 $_.Address }).Count -gt 0)
@@ -867,10 +974,12 @@ function Invoke-Main {
     }
     foreach ($n in @($live | Where-Object { $_.Session })) {
         if ($act -ne 'status' -and -not $n.Info.IsAdmin) {
-            $n.Status = 'ПРОПУЩЕН'; $n.Detail = "учётная запись $($cred.UserName) не администратор ПК: добавьте её в группу «Администраторы»"; $n.Session = $null; continue
+            $n.Status = 'ПРОПУЩЕН'; $n.Detail = "учётная запись $((Get-NodeCred $n $cred).UserName) не администратор ПК: добавьте её в группу «Администраторы»"; $n.Session = $null; continue
         }
         if ($act -in @('install', 'update')) {
-            if ($n.Info.Build -lt 22621) { $n.Status = 'ПРОПУЩЕН'; $n.Detail = "Windows сборки $($n.Info.Build): нужен Windows 11 22H2 (22621) или новее"; $n.Session = $null; continue }
+            # Docker CE в WSL с mirrored-сетью требует Windows 11 22H2 (22621); запасной путь docker=desktop (Docker Desktop) работает и на Windows 10
+            if ($n.Info.Build -lt 22621 -and $n.Docker -ne 'desktop') { $n.Status = 'ПРОПУЩЕН'; $n.Detail = "Windows сборки $($n.Info.Build): нужен Windows 11 22H2 (22621) или новее; на Windows 10 укажите в списке ПК docker=desktop (нужен установленный Docker Desktop)"; $n.Session = $null; continue }
+            if ($n.Info.Build -lt 22621) { Warn "$($n.Name): Windows сборки $($n.Info.Build), нода пойдёт через Docker Desktop (docker=desktop): она держится, только пока в Windows вошёл пользователь (автовход решает администратор)" }
             $n.ImageLoaded = Test-ImageLoaded $answers $n
             $tar = Get-ImageFor $answers $n
             if ($tar) {
@@ -890,13 +999,13 @@ function Invoke-Main {
         Say ''
         Say "План ($act):"
         foreach ($n in $todo) {
-            $ra = Get-RunArgs $act $answers $n $cred
+            $ra = Get-RunArgs $act $answers $n (Get-NodeCred $n $cred)
             $upd = $(if ($act -eq 'update' -and -not $n.Info.Installed) { ' (нода ещё не установлена: будет полная установка)' } else { '' })
             if ($act -in @('install', 'update') -and (Test-OldDriver $n)) { $upd += " (драйвер старее ${MinDriver}: cpu, сейчас $($n.Info.Driver))" }
             if ($n.ImageLoaded) { $upd += ' (образ уже загружен, архив не копируется)' }
             Say ("  {0,-8} {1,-16} install-node.ps1 {2}{3}" -f $n.Name, $n.Address, (Format-RunArgs $ra), $upd)
         }
-        Say $(if ($RunMode -eq 'task') { "Запуск на ПК: разовая задача планировщика $DeployTaskPath$DeployTask от $($cred.UserName), вывод в $StageDir\run.log." } else { 'Запуск на ПК: внутри сессии WinRM (-RunMode session).' })
+        Say $(if ($RunMode -eq 'task') { "Запуск на ПК: разовая задача планировщика $DeployTaskPath$DeployTask от $(if ($cred) { $cred.UserName } else { 'учётной записи LAPS каждого ПК' }), вывод в $StageDir\run.log." } else { 'Запуск на ПК: внутри сессии WinRM (-RunMode session).' })
         if ($Proxy) { Say "Прокси для установщика: $(Get-MaskedUrl $Proxy)" }
         if ($act -in @('install', 'update') -and $CopyMode -ne 'none') {
             $totalImg = ($todo | ForEach-Object { Get-MissingImageBytes $answers $_ } | Measure-Object -Sum).Sum
@@ -932,19 +1041,20 @@ function Invoke-Main {
     $script:done = 0; $total = $todo.Count
     $t0 = @{}; foreach ($n in $todo) { $t0[$n.Name] = Get-Date }
     $cleanup = $(if ($act -eq 'uninstall') { 'all' } elseif ($act -eq 'status') { 'none' } elseif ($KeepStage) { 'keep-image' } else { 'stage' })
-    $taskPw = $cred.GetNetworkCredential().Password
     # В режиме task ПК сам ограничивает время (TimeoutMin); здесь — запас на случай, если сессия WinRM повисла.
     $localLimit = $(if ($RunMode -eq 'task') { $TimeoutMin + 3 } else { $TimeoutMin })
     Invoke-OnNodes $todo $BlockRun {
         param($n)
-        $ra = Get-RunArgs $act $answers $n $cred
+        $nc = Get-NodeCred $n $cred
+        $ra = Get-RunArgs $act $answers $n $nc
         @{ Op = 'run'; Action = $act; StageDir = $StageDir; Args = $ra; Cleanup = $cleanup; RunMode = $RunMode; Proxy = $Proxy
-            TaskName = $DeployTask; TaskPath = $DeployTaskPath; TaskUser = $cred.UserName; TaskPassword = $taskPw; TimeoutSec = [int]($TimeoutMin * 60)
+            TaskName = $DeployTask; TaskPath = $DeployTaskPath; TaskUser = $nc.UserName; TaskPassword = $nc.Password; TimeoutSec = [int]($TimeoutMin * 60)
             Runner = $script:RunnerText; SecureDir = $script:SecureDirText; ImageMark = $(if ($ra.Contains('ImageTar')) { Get-ImageMark $answers $n } else { '' }) }
     } $Throttle {
         param($n, $res, $err)
         $n.Seconds = [int]((Get-Date) - $t0[$n.Name]).TotalSeconds
         Set-RunResult $n $act $res $err
+        if (-not $res -and $RunMode -eq 'task') { $n.Detail = "$($n.Detail) (если связь оборвалась, установка на ПК продолжается в задаче планировщика: повторите ту же команду, она покажет её ход)" }
         $tail = $(if (-not $res -and $n.Session) { Get-RemoteTail $n } else { '' })
         if ($n.Streamed -gt 0) { Write-NodeLog $n "итог: $($n.Status), код $($n.Code): $($n.Detail)" }
         else { Write-NodeLog $n ($(if ($n.Output) { $n.Output } else { $n.Detail })) }

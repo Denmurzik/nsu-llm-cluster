@@ -8,9 +8,15 @@ metadata:
 # Основа: deployments/static/nvidia-device-plugin.yml релиза v0.19.3 плюс runtimeClassName
 # и nodeSelector (на CPU-узле без GPU под ушёл бы в CrashLoop).
 # nvcr.io из РФ отвечает 403: плагин v0.19.3 собран из исходников в GPU-образ ноды (node/Dockerfile, стадия
-# device-plugin), а этот образ уже лежит в каталоге образов k3s каждой GPU-ноды (run-node: airgap/node.tar), поэтому
-# под не скачивает ничего (imagePullPolicy Never). DEVICE_PLUGIN_IMAGE в .env главного: официальный образ из
-# зеркала реестра, тогда IfNotPresent. Переменные NVIDIA_* такие же, как в официальном образе.
+# device-plugin). Этот образ уже лежит в каталоге образов k3s каждой GPU-ноды (run-node: airgap/node.tar), и imagePullPolicy
+# IfNotPresent берёт его оттуда без трафика. Не Never: после повышения NODE_IMAGE_TAG (или перезапуска ноды, чей контейнер
+# ещё работает на старом образе) тега в каталоге ноды нет, под с Never получал ErrImageNeverPull, нода не объявляла
+# nvidia.com/gpu и ни один GPU-под не планировался. С IfNotPresent новый тег нода скачивает с реестра главного через зеркало
+# k3s (registries.yaml, node/rootfs/opt/llm/bin/entrypoint.sh); слои те же, что нужны подам инференса. Образы нового тега
+# кладёт в реестр главного install-main.sh --update (docs/release.md, «Обновление нод»). maxUnavailable 1: если тега в
+# реестре нет, обновление останавливается на одной ноде, а не выключает плагин везде.
+# DEVICE_PLUGIN_IMAGE в .env главного: официальный образ из зеркала реестра. Переменные NVIDIA_* такие же, как в
+# официальном образе.
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -24,6 +30,8 @@ spec:
       name: nvidia-device-plugin-ds
   updateStrategy:
     type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
   template:
     metadata:
       labels:
