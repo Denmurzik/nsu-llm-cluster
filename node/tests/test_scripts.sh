@@ -1017,6 +1017,15 @@ done
 exit 0
 EOS
 chmod +x "$TMP/regbin/curl"
+# fake fetch-main-ca.sh (the registrar calls it since SEC-2): only its exit-code contract, the CA served by the fake curl
+# (0 saved, 4 main serves no /ca.crt, 1 anything else); the real one is tested by its own cases below
+cat > "$TMP/regbin/fetch-main-ca.sh" <<'EOS'
+#!/usr/bin/env bash
+while [ $# -gt 0 ]; do case "$1" in --main) M="$2"; shift 2 ;; --out) OUT="$2"; shift 2 ;; *) shift ;; esac; done
+code="$(curl -sS -k -o "$OUT" -w '%{http_code}' "https://$M/ca.crt")"
+case "$code" in 200) exit 0 ;; 404) rm -f "$OUT"; exit 4 ;; *) rm -f "$OUT"; exit 1 ;; esac
+EOS
+chmod +x "$TMP/regbin/fetch-main-ca.sh"
 # fake serve-llama.sh: records what the registrar's child sees
 cat > "$TMP/fakeserve/serve-llama.sh" <<'EOS'
 #!/usr/bin/env bash

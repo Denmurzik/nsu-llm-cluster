@@ -1,14 +1,14 @@
 {
   "version": "0.2.0",
-  "created": "2026-11-05T01:21:28Z",
-  "git_commit": "c5bcf6b2fe1f2cde41bd9464c56fff69d52e0528",
+  "created": "2026-11-05T02:14:32Z",
+  "git_commit": "18bcb9fce302a8b232997eba9cf4e290a45cbfb9",
   "ghcr_owner": "denmurzik",
   "llama_cpp": "b12033",
   "k3s": "v1.36.5+k3s1",
   "moving_tags": false,
   "images": {
-    "main": {"ref": "ghcr.io/denmurzik/nsu-llm-main:0.2.0", "digest": "sha256:6e626374e79b95e44a2a54be1bc27e0de74f2f4e41b402025730647fe9eff159", "size_bytes": 679296849},
-    "node-cpu": {"ref": "ghcr.io/denmurzik/nsu-llm-node:0.2.0-cpu", "digest": "sha256:bb9286a6fff88879eed438b47ecbc9a626657f1c98c96aeb394f2ff2cf4d9758", "size_bytes": 325865707},
-    "node-gpu": {"ref": "ghcr.io/denmurzik/nsu-llm-node:0.2.0-gpu", "digest": "sha256:1aec4454698fa271fec95a8e85ae63868d2a5fd8f2cacd56f97adb36d5e36531", "size_bytes": 6412108293}
+    "main": {"ref": "ghcr.io/denmurzik/nsu-llm-main:0.2.0", "digest": "sha256:e153209e47dab340564a7624ea166669880d6f02a97ace2bc3f792f5d8ad0690", "size_bytes": 679296849},
+    "node-cpu": {"ref": "ghcr.io/denmurzik/nsu-llm-node:0.2.0-cpu", "digest": "sha256:2620dd19b22b735af68f7c91948704f62560f05b03cda7dc8425c44541205283", "size_bytes": 325865782},
+    "node-gpu": {"ref": "ghcr.io/denmurzik/nsu-llm-node:0.2.0-gpu", "digest": "sha256:64a99b1dcb6c404778ccef7f44b9fc95493410333de1f781c01605dac31a6e51", "size_bytes": 6412108368}
   }
 }

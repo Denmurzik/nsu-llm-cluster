@@ -660,12 +660,12 @@ OIDC_CLIENT_SECRET=s
 ADMIN_EMAILS=a@g.nsu.ru
 IMAGE_SOURCE=pull
 GHCR_OWNER=nsu
-IMAGE_REF=ghcr.io/mirror/main-copy:0.1.0
+IMAGE_REF=ghcr.io/mirror/main-copy:0.2.0
 NODE_IMAGE_SOURCE=ghcr.io/mirror/node-copy
 EOF
 out="$(inst --yes --answers "$E/answers.env" </dev/null)"; rc=$?
-[ "$rc" = 0 ] && log_has "docker pull ghcr.io/mirror/main-copy:0.1.0" && log_has "docker tag ghcr.io/mirror/main-copy:0.1.0 nsu-llm-main:0.2.0" \
-  && log_has "images pull --platform linux/amd64 ghcr.io/mirror/node-copy:0.1.0-gpu" && ! grep -q '^GHCR_OWNER=\|^IMAGE_REF=' "$ENVF"
+[ "$rc" = 0 ] && log_has "docker pull ghcr.io/mirror/main-copy:0.2.0" && log_has "docker tag ghcr.io/mirror/main-copy:0.2.0 nsu-llm-main:0.2.0" \
+  && log_has "images pull --platform linux/amd64 ghcr.io/mirror/node-copy:0.2.0-gpu" && ! grep -q '^GHCR_OWNER=\|^IMAGE_REF=' "$ENVF"
 check "--yes: IMAGE_REF and NODE_IMAGE_SOURCE override the defaults; installer keys never leak into .env" $? "rc=$rc
 $out
 $(cat "$FAKE_LOG")"
@@ -801,29 +801,29 @@ fi
 
 # ------------------------------------------------------------------ 8. --update VERSION
 new_env update
-export FAKE_GHCR=401 FAKE_SEED_VER=0.2.0
+export FAKE_GHCR=401 FAKE_SEED_VER=0.3.0
 touch "$FAKE_STATE/container" "$FAKE_STATE/image"
 printf "$IDP_KV"'OIDC_CLIENT_SECRET=s\nADMIN_EMAILS=a@g.nsu.ru\nGHCR_OWNER=nsu\nMAIN_ADVERTISE_IP=10.20.0.5\n' >"$E/answers.env"
-out="$(inst --update 0.2.0 --yes --answers "$E/answers.env" </dev/null)"; rc=$?
-[ "$rc" = 0 ] && log_has "docker pull ghcr.io/nsu/nsu-llm-main:0.2.0" && log_has "docker tag ghcr.io/nsu/nsu-llm-main:0.2.0 nsu-llm-main:0.2.0" \
-  && log_has "registry-push.sh 127.0.0.1:5000/nsu-llm-node:0.2.0-cpu" \
-  && log_has "registry-push.sh 127.0.0.1:5000/nsu-llm-node:0.2.0-gpu"
-check "--update 0.2.0: main image of that version pulled and tagged, both node images pushed to the registry" $? "rc=$rc
+out="$(inst --update 0.3.0 --yes --answers "$E/answers.env" </dev/null)"; rc=$?
+[ "$rc" = 0 ] && log_has "docker pull ghcr.io/nsu/nsu-llm-main:0.3.0" && log_has "docker tag ghcr.io/nsu/nsu-llm-main:0.3.0 nsu-llm-main:0.3.0" \
+  && log_has "registry-push.sh 127.0.0.1:5000/nsu-llm-node:0.3.0-cpu" \
+  && log_has "registry-push.sh 127.0.0.1:5000/nsu-llm-node:0.3.0-gpu"
+check "--update 0.3.0: main image of that version pulled and tagged, both node images pushed to the registry" $? "rc=$rc
 $out
 $(cat "$FAKE_LOG")"
 ! log_has "docker rm" && ! log_has "docker run" && ! log_has "docker restart" && ! log_has "docker stop" && ! log_has "docker kill" && ! log_has "docker build" && [ ! -f "$ENVF" ]
 check "--update never restarts or recreates main and does not rewrite .env" $? "$(cat "$FAKE_LOG")"
-grep -q 'git checkout v0.2.0' <<<"$out" && grep -q 'ещё работает на прежней версии' <<<"$out"
+grep -q 'git checkout v0.3.0' <<<"$out" && grep -q 'ещё работает на прежней версии' <<<"$out"
 check "--update says that restarting main is a separate step and how to do it" $? "$out"
-out="$(inst --update 0.2.0 --dry-run --yes --answers "$E/answers.env" </dev/null)"; rc=$?
-[ "$rc" = 0 ] && grep -q 'docker pull ghcr.io/nsu/nsu-llm-main:0.2.0' <<<"$out" && grep -q 'registry-push.sh 127.0.0.1:5000/' <<<"$out"
+out="$(inst --update 0.3.0 --dry-run --yes --answers "$E/answers.env" </dev/null)"; rc=$?
+[ "$rc" = 0 ] && grep -q 'docker pull ghcr.io/nsu/nsu-llm-main:0.3.0' <<<"$out" && grep -q 'registry-push.sh 127.0.0.1:5000/' <<<"$out"
 check "--update --dry-run prints the steps" $? "rc=$rc
 $out"
 # --update runs against the main that is still up: one from before SEC-2 has no registry-push.sh and a registry without a
 # password on 127.0.0.1:<port>, so the push goes there as before
 : >"$FAKE_LOG"
-out="$(FAKE_NO_PUSH_HELPER=1 inst --update 0.2.0 --yes --answers "$E/answers.env" </dev/null)"; rc=$?
-[ "$rc" = 0 ] && log_has "docker exec llm-main k3s ctr -n k8s.io images push --plain-http --platform linux/amd64 127.0.0.1:5000/nsu-llm-node:0.2.0-cpu" \
+out="$(FAKE_NO_PUSH_HELPER=1 inst --update 0.3.0 --yes --answers "$E/answers.env" </dev/null)"; rc=$?
+[ "$rc" = 0 ] && log_has "docker exec llm-main k3s ctr -n k8s.io images push --plain-http --platform linux/amd64 127.0.0.1:5000/nsu-llm-node:0.3.0-cpu" \
   && ! log_has "docker exec llm-main /opt/llm/main/registry-push.sh"
 check "--update against a main from before SEC-2 (no registry-push.sh): pushes without a password as that main expects" $? "rc=$rc
 $out
@@ -835,11 +835,11 @@ ADMIN_EMAILS=a@g.nsu.ru
 GHCR_OWNER=nsu
 MAIN_ADVERTISE_IP=10.20.0.5
 ' >"$E/answers.env"
-out="$(inst --update 0.2.0 --yes --answers "$E/answers.env" </dev/null)"; rc=$?
+out="$(inst --update 0.3.0 --yes --answers "$E/answers.env" </dev/null)"; rc=$?
 [ "$rc" != 0 ] && grep -q 'главный не установлен' <<<"$out" && ! log_has "docker pull"
 check "--update without an installed main: error, nothing pulled" $? "rc=$rc
 $out"
-for bad in 0.2 latest v0.2.0; do
+for bad in 0.2 latest v0.3.0; do
   out="$(inst --update "$bad" --yes </dev/null)"; rc=$?
   [ "$rc" != 0 ] && grep -q -- '--update: нужна версия' <<<"$out"
   check "--update $bad: a malformed version is refused" $? "rc=$rc
@@ -853,25 +853,25 @@ MAIN_ADVERTISE_IP=10.20.0.5
 ' >"$E/answers.env"
 touch "$FAKE_STATE/container"
 export FAKE_RUNNING=false
-out="$(inst --update 0.2.0 --yes --answers "$E/answers.env" </dev/null)"; rc=$?
+out="$(inst --update 0.3.0 --yes --answers "$E/answers.env" </dev/null)"; rc=$?
 [ "$rc" != 0 ] && grep -q 'не запущен' <<<"$out" && ! log_has "images pull"
 check "--update with a stopped main: error before seeding" $? "rc=$rc
 $out"
 unset FAKE_RUNNING FAKE_GHCR FAKE_SEED_VER
 
 # ------------------------------------------------------------------ 9. the restart after --update uses the pulled image whatever the first source was
-# (the checkout of these scripts is version 0.1.0, so --update 0.1.0 stands for "update, then check out that version")
+# (the checkout of these scripts is version 0.2.0, so --update 0.2.0 stands for "update, then check out that version")
 for src in build load pull; do
   new_env "upd-$src"
-  export FAKE_GHCR=401 FAKE_SEED_VER=0.1.0
+  export FAKE_GHCR=401 FAKE_SEED_VER=0.2.0
   echo tar >"$E/work/img.tar"
   printf "$IDP_KV"'OIDC_CLIENT_SECRET=s\nADMIN_EMAILS=a@g.nsu.ru\nIMAGE_SOURCE=%s\nGHCR_OWNER=nsu\nIMAGE_TAR=%s\n' "$src" "$E/work/img.tar" >"$E/answers.env"
   out="$(inst --yes --answers "$E/answers.env" </dev/null)"; rc=$?
   [ "$rc" = 0 ]; check "$src install: the first install works" $? "rc=$rc $out"
   : >"$FAKE_LOG"
-  out="$(inst --update 0.1.0 --yes </dev/null)"; rc=$?
-  grep -q "^IMAGE_SOURCE=$src\$" "$CONF" && grep -q '^PENDING_IMAGE_VERSION=0.1.0$' "$CONF" && grep -q 'PENDING_IMAGE_VERSION' <<<"$out" && ! log_has "docker rm" && ! log_has "docker run"
-  check "$src install: --update 0.1.0 records the pending version, keeps IMAGE_SOURCE=$src, does not touch the container" $? "rc=$rc
+  out="$(inst --update 0.2.0 --yes </dev/null)"; rc=$?
+  grep -q "^IMAGE_SOURCE=$src\$" "$CONF" && grep -q '^PENDING_IMAGE_VERSION=0.2.0$' "$CONF" && grep -q 'PENDING_IMAGE_VERSION' <<<"$out" && ! log_has "docker rm" && ! log_has "docker run"
+  check "$src install: --update 0.2.0 records the pending version, keeps IMAGE_SOURCE=$src, does not touch the container" $? "rc=$rc
 $(cat "$CONF")
 $out"
   : >"$FAKE_LOG"; rm -f "$FAKE_STATE/polls"
@@ -891,33 +891,33 @@ done
 new_env upd-other
 printf "$IDP_KV"'OIDC_CLIENT_SECRET=s\nADMIN_EMAILS=a@g.nsu.ru\nIMAGE_SOURCE=keep\nGHCR_OWNER=nsu\n' >"$E/answers.env"
 FAKE_IMAGE=1 inst --yes --answers "$E/answers.env" </dev/null >/dev/null
-updout="$(FAKE_SEED_VER=0.2.0 inst --update 0.2.0 --yes </dev/null)"
+updout="$(FAKE_SEED_VER=0.3.0 inst --update 0.3.0 --yes </dev/null)"
 : >"$FAKE_LOG"
 out="$(FAKE_IMAGE=1 inst --yes </dev/null)"; rc=$?
-grep -q 'git checkout v0.2.0' <<<"$out" && log_has "docker run -d" && grep -q '^PENDING_IMAGE_VERSION=0.2.0$' "$CONF"
+grep -q 'git checkout v0.3.0' <<<"$out" && log_has "docker run -d" && grep -q '^PENDING_IMAGE_VERSION=0.3.0$' "$CONF"
 check "a restart from a checkout of another version warns to check out the pulled one and keeps the pending mark" $? "rc=$rc $updout $out"
 
 # a version that is already in the registry is not downloaded again; a digest that differs from release/<version>.json is
 new_env seed-skip
 printf "$IDP_KV"'OIDC_CLIENT_SECRET=s\nADMIN_EMAILS=a@g.nsu.ru\nIMAGE_SOURCE=pull\nGHCR_OWNER=nsu\n' >"$E/answers.env"
-export FAKE_GHCR=401 FAKE_REGISTRY_TAGS="0.1.0-cpu 0.1.0-gpu" FAKE_REGISTRY_DIGEST=sha256:aaaa
+export FAKE_GHCR=401 FAKE_REGISTRY_TAGS="0.2.0-cpu 0.2.0-gpu" FAKE_REGISTRY_DIGEST=sha256:aaaa
 out="$(inst --yes --answers "$E/answers.env" </dev/null)"; rc=$?
 [ "$rc" = 0 ] && ! log_has "images pull" && ! log_has "registry-push.sh 127.0.0.1" && grep -q 'в реестре уже есть nsu-llm-node:0.2.0-cpu (sha256:aaaa)' <<<"$out" && log_has "docker pull ghcr.io/nsu/nsu-llm-main:0.2.0"
 check "pull: both node images already in the registry are skipped (the main image is still pulled); no ctr pull or push" $? "rc=$rc
 $out
 $(cat "$FAKE_LOG")"
 mkdir -p "$E/rel"
-printf '{"images": {\n    "main": {"ref": "x", "digest": "sha256:cccc", "size_bytes": 1},\n    "node-cpu": {"ref": "x", "digest": "sha256:aaaa", "size_bytes": 1},\n    "node-gpu": {"ref": "x", "digest": "sha256:bbbb", "size_bytes": 1}\n  }\n}\n' >"$E/rel/0.1.0.json"
+printf '{"images": {\n    "main": {"ref": "x", "digest": "sha256:cccc", "size_bytes": 1},\n    "node-cpu": {"ref": "x", "digest": "sha256:aaaa", "size_bytes": 1},\n    "node-gpu": {"ref": "x", "digest": "sha256:bbbb", "size_bytes": 1}\n  }\n}\n' >"$E/rel/0.2.0.json"
 : >"$FAKE_LOG"
 out="$(INST_RELEASE_DIR="$E/rel" inst --yes </dev/null)"; rc=$?
 [ "$rc" = 0 ] && ! log_has "images pull --platform linux/amd64 ghcr.io/nsu/nsu-llm-node:" && ! log_has "nsu-llm-node@sha256:aaaa" && log_has "images pull --platform linux/amd64 ghcr.io/nsu/nsu-llm-node@sha256:bbbb" \
-  && grep -q 'расходится с release/0.1.0.json' <<<"$out"
+  && grep -q 'расходится с release/0.2.0.json' <<<"$out"
 check "a registry digest that equals release/<version>.json is skipped, one that differs is downloaded again (by the release digest) with a warning" $? "rc=$rc
 $out
 $(cat "$FAKE_LOG")"
 # SEC-2 M3: with release/<version>.json the main image is pulled by its digest, not by the tag a ghcr.io owner could overwrite
 log_has "docker pull ghcr.io/nsu/nsu-llm-main@sha256:cccc" && ! log_has "docker pull ghcr.io/nsu/nsu-llm-main:0.2.0" \
-  && log_has "docker tag ghcr.io/nsu/nsu-llm-main@sha256:cccc nsu-llm-main:0.2.0" && grep -q 'совпал с release/0.1.0.json: sha256:cccc' <<<"$out"
+  && log_has "docker tag ghcr.io/nsu/nsu-llm-main@sha256:cccc nsu-llm-main:0.2.0" && grep -q 'совпал с release/0.2.0.json: sha256:cccc' <<<"$out"
 check "release/<version>.json: the main image is pulled by its digest and tagged nsu-llm-main:<version>" $? "$(cat "$FAKE_LOG")"
 : >"$FAKE_LOG"
 out="$(FAKE_REGISTRY_TAGS="" INST_RELEASE_DIR="$E/rel" inst --yes </dev/null)"; rc=$?
@@ -927,7 +927,7 @@ check "release/<version>.json: node images are pulled into main by their digests
 $(cat "$FAKE_LOG")"
 : >"$FAKE_LOG"
 out="$(inst --yes </dev/null)"; rc=$?
-[ "$rc" = 0 ] && log_has "docker pull ghcr.io/nsu/nsu-llm-main:0.2.0" && grep -q 'нет release/0.1.0.json: digest образа главного не с чем сверить' <<<"$out"
+[ "$rc" = 0 ] && log_has "docker pull ghcr.io/nsu/nsu-llm-main:0.2.0" && grep -q 'нет release/0.2.0.json: digest образа главного не с чем сверить' <<<"$out"
 check "without release/<version>.json: pulled by the tag with a warning that the digest is not verified" $? "rc=$rc
 $out"
 unset FAKE_REGISTRY_TAGS FAKE_REGISTRY_DIGEST FAKE_GHCR FAKE_SEED_VER
@@ -938,8 +938,8 @@ load_env() {
   new_env "$1"
   mkdir -p "$E/pkg"
   echo main-image-tar >"$E/pkg/nsu-llm-main.tar"
-  printf 'CPU-IMAGE-BYTES' | gzip -c >"$E/pkg/nsu-llm-node-0.1.0-cpu.tar.gz"
-  printf 'GPU-IMAGE-BYTES' | gzip -c >"$E/pkg/nsu-llm-node-0.1.0-gpu.tar.gz"
+  printf 'CPU-IMAGE-BYTES' | gzip -c >"$E/pkg/nsu-llm-node-0.2.0-cpu.tar.gz"
+  printf 'GPU-IMAGE-BYTES' | gzip -c >"$E/pkg/nsu-llm-node-0.2.0-gpu.tar.gz"
   printf "$IDP_KV"'OIDC_CLIENT_SECRET=s\nADMIN_EMAILS=a@g.nsu.ru\nIMAGE_SOURCE=load\nIMAGE_TAR=%s\n' "$E/pkg/nsu-llm-main.tar" >"$E/answers.env"
 }
 
@@ -968,16 +968,16 @@ l_list="$(grep -n 'tags/list' "$FAKE_LOG" | head -n1 | cut -d: -f1)"
 [ -n "$l_run" ] && [ -n "$l_imp" ] && [ -n "$l_tag" ] && [ -n "$l_push" ] && [ -n "$l_list" ] \
   && [ "$l_run" -lt "$l_imp" ] && [ "$l_imp" -lt "$l_tag" ] && [ "$l_tag" -lt "$l_push" ] && [ "$l_push" -lt "$l_list" ]
 check "load: the registry is fed only after main is up: import, tag, push, then the tag list is verified" $? "$(cat "$FAKE_LOG")"
-grep -q 'реестр главного: nsu-llm-node:0.2.0-cpu и 0.1.0-gpu' <<<"$out" && grep -qF 'run-node.sh --main 10.20.0.5 --token K10cafe::node:agent-tok-1 --from-main' <<<"$out"
+grep -q 'реестр главного: nsu-llm-node:0.2.0-cpu и 0.2.0-gpu' <<<"$out" && grep -qF 'run-node.sh --main 10.20.0.5 --token K10cafe::node:agent-tok-1 --from-main' <<<"$out"
 check "load: the result says both images are in the registry and offers run-node.sh --from-main" $? "$out"
-grep -q "^NODE_IMAGE_TAR_CPU=$E/pkg/nsu-llm-node-0.1.0-cpu.tar.gz\$" "$CONF" && grep -q "^NODE_IMAGE_TAR_GPU=$E/pkg/nsu-llm-node-0.1.0-gpu.tar.gz\$" "$CONF" \
+grep -q "^NODE_IMAGE_TAR_CPU=$E/pkg/nsu-llm-node-0.2.0-cpu.tar.gz\$" "$CONF" && grep -q "^NODE_IMAGE_TAR_GPU=$E/pkg/nsu-llm-node-0.2.0-gpu.tar.gz\$" "$CONF" \
   && ! grep -q 'NODE_IMAGE_TAR' "$ENVF"
 check "load: the archives are saved for the next run and never leak into .env" $? "$(cat "$CONF")
 $(cat "$ENVF")"
 
 # re-run: the node images already in the registry are not imported again
 : >"$FAKE_LOG"
-out="$(FAKE_REGISTRY_TAGS="0.1.0-cpu 0.1.0-gpu" inst --yes </dev/null)"; rc=$?
+out="$(FAKE_REGISTRY_TAGS="0.2.0-cpu 0.2.0-gpu" inst --yes </dev/null)"; rc=$?
 [ "$rc" = 0 ] && ! log_has "images import" && ! log_has "registry-push.sh 127.0.0.1" && grep -q 'в реестре уже есть nsu-llm-node:0.2.0-gpu' <<<"$out" && log_has "docker load -i"
 check "load: the re-run takes the saved archives, imports nothing that the registry already has" $? "rc=$rc
 $out
@@ -1003,7 +1003,7 @@ $(cat "$FAKE_LOG")"
 grep -q '^NODE_IMAGE_TAR_GPU=$' "$CONF" && ! grep -q 'NODE_IMAGE_TAR_GPU=.' "$CONF"
 check "load: an explicit empty NODE_IMAGE_TAR_GPU is saved in install-main.env" $? "$(cat "$CONF")"
 : >"$FAKE_LOG"
-out="$(FAKE_REGISTRY_TAGS="0.1.0-cpu" inst --yes </dev/null)"; rc=$?
+out="$(FAKE_REGISTRY_TAGS="0.2.0-cpu" inst --yes </dev/null)"; rc=$?
 [ "$rc" = 0 ] && ! log_has "nsu-llm-node:0.2.0-gpu 127.0.0.1" && grep -q 'nsu-llm-node:0.2.0-gpu в реестр не кладётся' <<<"$out"
 check "load: the re-run keeps skipping the gpu image although its archive is next to IMAGE_TAR" $? "rc=$rc
 $out
@@ -1030,9 +1030,9 @@ $out"
 
 # a broken archive and an archive with another image name stop the install with a hint
 load_env load-broken
-echo 'not a gzip' >"$E/pkg/nsu-llm-node-0.1.0-cpu.tar.gz"
+echo 'not a gzip' >"$E/pkg/nsu-llm-node-0.2.0-cpu.tar.gz"
 out="$(inst --yes --answers "$E/answers.env" </dev/null)"; rc=$?
-[ "$rc" != 0 ] && grep -qF 'nsu-llm-node-0.1.0-cpu.tar.gz в k3s главного (gunzip | ctr images import)' <<<"$out" && ! log_has "registry-push.sh 127.0.0.1"
+[ "$rc" != 0 ] && grep -qF 'nsu-llm-node-0.2.0-cpu.tar.gz в k3s главного (gunzip | ctr images import)' <<<"$out" && ! log_has "registry-push.sh 127.0.0.1"
 check "load: a corrupt archive stops before anything is pushed, with the docker save command in the message" $? "rc=$rc
 $out
 $(cat "$FAKE_LOG")"
@@ -1051,9 +1051,9 @@ $out"
 load_env load-ask
 rm -f "$E/answers.env"
 # answers: hostname, IP, secret, admins, proxies, cert mode, airgap, image source 3 (load), main archive, cpu archive (Enter: default), gpu archive, confirm
-answers=$'llm.nsu.ru\n\nhttps://idp.example.org/realms/main\nnsu-llm\n\nsec-load\nadmin@g.nsu.ru\n\n\n1\nn\n3\n'"$E/pkg/nsu-llm-main.tar"$'\n\n'"$E/elsewhere-gpu.tar.gz"$'\n'"$E/pkg/nsu-llm-node-0.1.0-gpu.tar.gz"$'\ny\n'
+answers=$'llm.nsu.ru\n\nhttps://idp.example.org/realms/main\nnsu-llm\n\nsec-load\nadmin@g.nsu.ru\n\n\n1\nn\n3\n'"$E/pkg/nsu-llm-main.tar"$'\n\n'"$E/elsewhere-gpu.tar.gz"$'\n'"$E/pkg/nsu-llm-node-0.2.0-gpu.tar.gz"$'\ny\n'
 out="$(inst <<<"$answers")"; rc=$?
-[ "$rc" = 0 ] && grep -qF "Архив образа ноды cpu для реестра главного" <<<"$out" && grep -qF "[$E/pkg/nsu-llm-node-0.1.0-cpu.tar.gz]" <<<"$out" \
+[ "$rc" = 0 ] && grep -qF "Архив образа ноды cpu для реестра главного" <<<"$out" && grep -qF "[$E/pkg/nsu-llm-node-0.2.0-cpu.tar.gz]" <<<"$out" \
   && grep -qF "elsewhere-gpu.tar.gz не найден" <<<"$out" && [ "$(cat "$FAKE_STATE/import-stdin")" = "CPU-IMAGE-BYTESGPU-IMAGE-BYTES" ]
 check "load, interactive: both archives are asked with the files next to the main archive as defaults; a missing file is explained and asked again" $? "rc=$rc
 $out"
@@ -1061,7 +1061,7 @@ $out"
 # --dry-run: the commands are printed, nothing is imported
 load_env load-dry
 out="$(inst --yes --dry-run --answers "$E/answers.env" </dev/null)"; rc=$?
-[ "$rc" = 0 ] && grep -qF "gunzip -c $E/pkg/nsu-llm-node-0.1.0-cpu.tar.gz | docker exec -i llm-main k3s ctr -n k8s.io images import --no-unpack -" <<<"$out" \
+[ "$rc" = 0 ] && grep -qF "gunzip -c $E/pkg/nsu-llm-node-0.2.0-cpu.tar.gz | docker exec -i llm-main k3s ctr -n k8s.io images import --no-unpack -" <<<"$out" \
   && grep -q '/opt/llm/main/registry-push.sh 127.0.0.1:5000/nsu-llm-node:0.2.0-gpu' <<<"$out" \
   && ! log_has "docker exec" && ! log_has "docker load" && ! log_has "docker run -d"
 check "load: --dry-run prints the import, tag and push of the node archives and runs none of them" $? "rc=$rc
@@ -1072,8 +1072,8 @@ $(cat "$FAKE_LOG")"
 load_env load-update
 inst --yes --answers "$E/answers.env" </dev/null >/dev/null
 : >"$FAKE_LOG"
-out="$(FAKE_GHCR=401 FAKE_SEED_VER=0.2.0 INST_OWNER=nsu inst --update 0.2.0 --yes </dev/null)"; rc=$?
-[ "$rc" = 0 ] && log_has "images pull --platform linux/amd64 ghcr.io/nsu/nsu-llm-node:0.2.0-cpu" && ! log_has "images import"
+out="$(FAKE_GHCR=401 FAKE_SEED_VER=0.3.0 INST_OWNER=nsu inst --update 0.3.0 --yes </dev/null)"; rc=$?
+[ "$rc" = 0 ] && log_has "images pull --platform linux/amd64 ghcr.io/nsu/nsu-llm-node:0.3.0-cpu" && ! log_has "images import"
 check "load: --update still pulls the new node images from ghcr.io, the saved archives are not used" $? "rc=$rc
 $out
 $(cat "$FAKE_LOG")"

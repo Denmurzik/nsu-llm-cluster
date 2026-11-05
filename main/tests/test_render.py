@@ -742,7 +742,7 @@ def test_a_tag_bump_keeps_the_device_plugin_startable(tmp_path):
         return dp["spec"]["template"]["spec"]["containers"][0]
 
     before, after = plugin("0.1.0"), plugin("0.1.1")
-    assert (before["image"], after["image"]) == ("nsu-llm-node:0.2.0-gpu", "nsu-llm-node:0.1.1-gpu")
+    assert (before["image"], after["image"]) == ("nsu-llm-node:0.1.0-gpu", "nsu-llm-node:0.1.1-gpu")
     for c in (before, after):
         assert c["imagePullPolicy"] != "Never"  # the image of a new tag is not on the node yet
         assert c["imagePullPolicy"] == "IfNotPresent"  # and the one the node has is not pulled again

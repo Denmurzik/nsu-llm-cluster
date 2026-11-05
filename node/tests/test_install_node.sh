@@ -368,10 +368,10 @@ EOS
   lacks "wol: answered н keeps the button" "$out" "PBUTTONACTION"
 
   # fresh machine: no distro, online install; offline source uses --from-file
-  out="$(FAKE_DISTROS='' FAKE_RUNNING='' full -ImageTar 'C:\img\nsu-llm-node-0.1.0-gpu.tar.gz')"
+  out="$(FAKE_DISTROS='' FAKE_RUNNING='' full -ImageTar 'C:\img\nsu-llm-node-0.2.0-gpu.tar.gz')"
   contains "fresh distro install" "$out" "wsl --install Ubuntu-24.04 --name NSU-LLM --location"
   contains "fresh distro without launching the OOBE" "$out" "--no-launch"
-  contains "image tar loaded into the distro" "$out" "docker load -i /mnt/c/img/nsu-llm-node-0.1.0-gpu.tar.gz"
+  contains "image tar loaded into the distro" "$out" "docker load -i /mnt/c/img/nsu-llm-node-0.2.0-gpu.tar.gz"
   out="$(FAKE_DISTROS='' FAKE_RUNNING='' full -DistroSource 'C:\img\ubuntu-24.04.wsl' -ImageTar 'C:\img\n.tar')"
   contains "offline distro install" "$out" "[dry-run] wsl --install --from-file C:\\img\\ubuntu-24.04.wsl --name NSU-LLM"
   # no archive and no image: the image comes from main (registry https://<main>/v2/), pulled inside the distro after Docker is set up
@@ -397,14 +397,14 @@ EOS
   rm -rf "$IDIR"
 
   # the tag comes from main (GET /api/node-image = NODE_IMAGE_TAG), not from a constant of the scripts (found on the 122b bed: main ran
-  # 0.1.1, install-node pulled 0.1.1-gpu and run-node then checked the GPU with 0.1.0-gpu)
+  # 0.1.1, install-node pulled 0.1.1-gpu and run-node then checked the GPU with 0.2.0-gpu)
   NI='{"tag":"0.1.1","cpu":"nsu-llm-node:0.1.1-cpu","nvidia":"nsu-llm-node:0.1.1-gpu"}'
   out="$(FAKE_NODE_IMAGE="$NI" FAKE_DISTROS='' FAKE_RUNNING='' full)"; rc=$?
   [ $rc -eq 0 ] && pass "main names another tag: dry run succeeds" || { fail "main names another tag: dry run succeeds (rc=$rc)"; echo "$out" | sed 's/^/    | /'; }
   contains "main's tag: the pull is for the image main names" "$out" "pull-image.sh --main 10.9.0.5 --image nsu-llm-node:0.1.1-gpu"
   contains "main's tag: the plan says so" "$out" "скачать образ ноды nsu-llm-node:0.1.1-gpu с главного"
   contains "main's tag: run-node starts that very image" "$out" "nsu-llm-node:0.1.1-gpu"
-  lacks "main's tag: no stale 0.1.0 image anywhere in the plan" "$out" "nsu-llm-node:0.2.0"
+  lacks "main's tag: no stale 0.2.0 image anywhere in the plan" "$out" "nsu-llm-node:0.2.0"
   contains "the installer asked main without a token" "$(cat "$TMP/fake.log")" "https://10.9.0.5/api/node-image"
   lacks "the token is not sent to the public endpoint" "$(grep 'api/node-image' "$TMP/fake.log")" "SECRETTOKEN7"
   lacks "main names no digest: the pull is by tag, as before" "$out" "--digest"
@@ -426,7 +426,7 @@ EOS
   [ $rc -ne 0 ] && pass "-ImageSource tar without an archive fails" || fail "-ImageSource tar without an archive fails"
   contains "-ImageSource tar: the fix names -ImageTar" "$out" "-ImageTar"
   # -ImageSource main pulls even when the image is already there (refresh after an update of main) and ignores archives
-  out="$(full -ImageSource main -ImageTar 'C:\img\nsu-llm-node-0.1.0-gpu.tar.gz')"
+  out="$(full -ImageSource main -ImageTar 'C:\img\nsu-llm-node-0.2.0-gpu.tar.gz')"
   contains "-ImageSource main pulls although the image exists" "$out" "pull-image.sh --main 10.9.0.5 --image nsu-llm-node:0.2.0-gpu"
   lacks "-ImageSource main ignores the archive" "$out" "docker load"
   contains "-ImageSource main is saved with the answers" "$out" "ImageSource=main"
@@ -534,8 +534,8 @@ EOS
   contains "secured dir: owner Administrators, protected DACL" "$out" "владелец Administrators, SYSTEM и Administrators полный доступ, Users чтение, без наследования от ProgramData"
   # dry run lists the saved answers with absolute paths and the node address (task mode loses nothing)
   contains "saved answers keep the node address" "$out" "NodeIp=10.1.2.3"
-  out="$(FAKE_DISTROS='' FAKE_RUNNING='' full -ImageTar 'rel\nsu-llm-node-0.1.0-gpu.tar.gz' -DistroSource 'rel\ubuntu.wsl')"
-  contains "ImageTar saved absolute" "$out" "ImageTar=$(cygpath -w "$PWD")\\rel\\nsu-llm-node-0.1.0-gpu.tar.gz"
+  out="$(FAKE_DISTROS='' FAKE_RUNNING='' full -ImageTar 'rel\nsu-llm-node-0.2.0-gpu.tar.gz' -DistroSource 'rel\ubuntu.wsl')"
+  contains "ImageTar saved absolute" "$out" "ImageTar=$(cygpath -w "$PWD")\\rel\\nsu-llm-node-0.2.0-gpu.tar.gz"
   contains "DistroSource saved absolute" "$out" "DistroSource=$(cygpath -w "$PWD")\\rel\\ubuntu.wsl"
 
   # ---------------------------------------------------------------- secure-dir.ps1 (shared with class-deploy): unit checks as a normal user
@@ -692,38 +692,38 @@ EOS
   rm -rf "$IDIR"
 
   # wsl\ is created admin-only BEFORE wsl --install --location (otherwise ext4.vhdx would inherit Users read)
-  out="$(FAKE_DISTROS='' FAKE_RUNNING='' full -ImageTar 'C:\img\nsu-llm-node-0.1.0-gpu.tar.gz')"
+  out="$(FAKE_DISTROS='' FAKE_RUNNING='' full -ImageTar 'C:\img\nsu-llm-node-0.2.0-gpu.tar.gz')"
   mk="$(echo "$out" | grep -n 'New-SecureDir .*wsl -NoUsers' | head -1 | cut -d: -f1)"; wi="$(echo "$out" | grep -n 'dry-run\] wsl --install Ubuntu' | head -1 | cut -d: -f1)"
   [ -n "$mk" ] && [ -n "$wi" ] && [ "$mk" -lt "$wi" ] && pass "wsl dir created admin-only before wsl --install" || fail "wsl dir created admin-only before wsl --install ($mk, $wi)"
 
   # Find-ImageTar looks only next to the script, and only at archives an administrator controls
   NC="$TMP/nodecopy"; mkdir -p "$NC/node"
   cp "$NODE"/install-node.ps1 "$NODE"/run-node.ps1 "$NODE"/node-boot.ps1 "$NODE"/wsl-setup.sh "$NODE"/pull-image.sh "$NODE"/secure-dir.ps1 "$NODE"/class-run.ps1 "$NODE"/IMAGE_VERSION "$NC/node/"
-  echo img > "$NC/nsu-llm-node-0.1.0-gpu.tar.gz"                     # the parent (C:\ProgramData from the stage): not searched
-  echo img > "$NC/node/nsu-llm-node-0.1.0-gpu.tar.gz"
-  icacls "$(cygpath -w "$NC/node/nsu-llm-node-0.1.0-gpu.tar.gz")" /grant '*S-1-1-0:(M)' >/dev/null
+  echo img > "$NC/nsu-llm-node-0.2.0-gpu.tar.gz"                     # the parent (C:\ProgramData from the stage): not searched
+  echo img > "$NC/node/nsu-llm-node-0.2.0-gpu.tar.gz"
+  icacls "$(cygpath -w "$NC/node/nsu-llm-node-0.2.0-gpu.tar.gz")" /grant '*S-1-1-0:(M)' >/dev/null
   NCI="$(cygpath -w "$NC/node/install-node.ps1")"
   ncrun() { PATH="$FB:$PATH" FAKE_LOG="$(cygpath -w "$TMP/fake.log")" "$PS" -NoProfile -ExecutionPolicy Bypass -File "$NCI" \
       -InstallDir "$(cygpath -w "$IDIR")" -WslConfigPath "$(cygpath -w "$TMP/wslconfig")" -DryRun -NonInteractive -Main 10.9.0.5 -Token T -NodeIp 10.1.2.3 -Name pc01 -MemoryGB 28 -TaskPassword pw "$@" 2>&1; }
   out="$(FAKE_DISTROS='' FAKE_RUNNING='' ncrun)"
   contains "image tar writable by others is skipped" "$out" "пропущен: его создал или может менять не администратор"
-  lacks "image tar in the parent dir is never used" "$out" "nodecopy/nsu-llm-node-0.1.0-gpu.tar.gz"
+  lacks "image tar in the parent dir is never used" "$out" "nodecopy/nsu-llm-node-0.2.0-gpu.tar.gz"
   lacks "no untrusted image loaded" "$out" "docker load"
-  icacls "$(cygpath -w "$NC/node/nsu-llm-node-0.1.0-gpu.tar.gz")" /remove:g '*S-1-1-0' >/dev/null
+  icacls "$(cygpath -w "$NC/node/nsu-llm-node-0.2.0-gpu.tar.gz")" /remove:g '*S-1-1-0' >/dev/null
   out="$(FAKE_DISTROS='' FAKE_RUNNING='' ncrun)"
   contains "trusted image tar next to the script is used" "$out" "docker load -i /mnt/"
-  icacls "$(cygpath -w "$NC/node/nsu-llm-node-0.1.0-gpu.tar.gz")" /grant '*S-1-1-0:(M)' >/dev/null
+  icacls "$(cygpath -w "$NC/node/nsu-llm-node-0.2.0-gpu.tar.gz")" /grant '*S-1-1-0:(M)' >/dev/null
   fsout="$(NSU_LLM_TEST_FS=exFAT FAKE_DISTROS='' FAKE_RUNNING='' ncrun)"
   contains "image tar on FAT/exFAT: says to copy it to NTFS" "$fsout" "скопируйте архив на NTFS-диск (например, C:\\)"
-  contains "trusted image tar: the one next to the script" "$out" "nodecopy/node/nsu-llm-node-0.1.0-gpu.tar.gz"
+  contains "trusted image tar: the one next to the script" "$out" "nodecopy/node/nsu-llm-node-0.2.0-gpu.tar.gz"
   # an archive of another version than main's image (NODE_IMAGE_TAG): docker load would give the wrong name, so main's image is pulled
-  icacls "$(cygpath -w "$NC/node/nsu-llm-node-0.1.0-gpu.tar.gz")" /remove:g '*S-1-1-0' >/dev/null
+  icacls "$(cygpath -w "$NC/node/nsu-llm-node-0.2.0-gpu.tar.gz")" /remove:g '*S-1-1-0' >/dev/null
   out="$(FAKE_NODE_IMAGE='{"tag":"0.1.1","cpu":"nsu-llm-node:0.1.1-cpu","nvidia":"nsu-llm-node:0.1.1-gpu"}' FAKE_DISTROS='' FAKE_RUNNING='' ncrun)"; rc=$?
   [ $rc -eq 0 ] && pass "archive of another version: the dry run succeeds" || { fail "archive of another version: the dry run succeeds (rc=$rc)"; echo "$out" | sed 's/^/    | /'; }
   contains "archive of another version: says it is not used" "$out" "архив не используется, образ nsu-llm-node:0.1.1-gpu будет скачан с главного"
   contains "archive of another version: main's image is pulled" "$out" "pull-image.sh --main 10.9.0.5 --image nsu-llm-node:0.1.1-gpu"
   lacks "archive of another version: nothing is loaded" "$out" "docker load"
-  out="$(FAKE_NODE_IMAGE='{"tag":"0.1.1","cpu":"nsu-llm-node:0.1.1-cpu","nvidia":"nsu-llm-node:0.1.1-gpu"}' FAKE_DISTROS='' FAKE_RUNNING='' ncrun -ImageTar "$(cygpath -w "$NC/node/nsu-llm-node-0.1.0-gpu.tar.gz")")"; rc=$?
+  out="$(FAKE_NODE_IMAGE='{"tag":"0.1.1","cpu":"nsu-llm-node:0.1.1-cpu","nvidia":"nsu-llm-node:0.1.1-gpu"}' FAKE_DISTROS='' FAKE_RUNNING='' ncrun -ImageTar "$(cygpath -w "$NC/node/nsu-llm-node-0.2.0-gpu.tar.gz")")"; rc=$?
   [ $rc -ne 0 ] && pass "archive of another version named with -ImageTar: an error" || fail "archive of another version named with -ImageTar: an error"
   contains "archive of another version named with -ImageTar: names the file that is needed" "$out" "nsu-llm-node-0.1.1-gpu.tar.gz"
   out="$(FAKE_NODE_IMAGE='{"tag":"0.2.0","cpu":"nsu-llm-node:0.2.0-cpu","nvidia":"nsu-llm-node:0.2.0-gpu"}' FAKE_DISTROS='' FAKE_RUNNING='' ncrun)"
@@ -845,8 +845,8 @@ EOS
   contains "desktop: power still set" "$out" "powercfg /hibernate off"
   contains "desktop: engine checked" "$(cat "$TMP/fake.log")" "docker info"
   # image archive goes to the Windows docker
-  out="$(FAKE_DISTROS="$DD" FAKE_IMAGES='' inst -DryRun -NonInteractive -Main 10.9.0.5 -Token T -NodeIp 10.1.2.3 -Name pc01 -ImageTar 'C:\img\nsu-llm-node-0.1.0-gpu.tar.gz')"
-  contains "desktop: image loaded by the Windows docker" "$out" "[dry-run] docker load -i C:\\img\\nsu-llm-node-0.1.0-gpu.tar.gz"
+  out="$(FAKE_DISTROS="$DD" FAKE_IMAGES='' inst -DryRun -NonInteractive -Main 10.9.0.5 -Token T -NodeIp 10.1.2.3 -Name pc01 -ImageTar 'C:\img\nsu-llm-node-0.2.0-gpu.tar.gz')"
+  contains "desktop: image loaded by the Windows docker" "$out" "[dry-run] docker load -i C:\\img\\nsu-llm-node-0.2.0-gpu.tar.gz"
   # Docker Desktop: the Windows docker pulls itself, only when Windows already trusts the certificate of main; the installer never fetches or writes a CA there
   out="$(FAKE_DISTROS="$DD" FAKE_IMAGES='' inst -DryRun -NonInteractive -Main 10.9.0.5 -Token T -NodeIp 10.1.2.3 -Name pc01)"
   contains "desktop: the image is pulled from main" "$out" "[dry-run] docker pull 10.9.0.5/nsu-llm-node:0.2.0-gpu"
@@ -988,7 +988,7 @@ EOS
 
   # ---------------------------------------------------------------- the saved image tar was deleted after install (class-deploy)
   mkdir -p "$IDIR"
-  printf '{"Main":"10.9.0.5","Mode":"k3s","Name":"pc01","ImageTar":"C:\\\\staged\\\\gone\\\\nsu-llm-node-0.1.0-gpu.tar.gz"}' > "$IDIR/install.json"
+  printf '{"Main":"10.9.0.5","Mode":"k3s","Name":"pc01","ImageTar":"C:\\\\staged\\\\gone\\\\nsu-llm-node-0.2.0-gpu.tar.gz"}' > "$IDIR/install.json"
   out="$(CLUSTER_TOKEN=T inst -DryRun -NonInteractive -NodeIp 10.1.2.3 -TaskPassword pw)"; rc=$?
   [ $rc -eq 0 ] && pass "gone tar + loaded image: re-run succeeds" || { fail "gone tar + loaded image: re-run succeeds (rc=$rc)"; echo "$out" | sed 's/^/    | /'; }
   contains "gone tar + loaded image: tar skipped" "$out" "уже загружен"

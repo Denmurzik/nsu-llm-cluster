@@ -20,8 +20,8 @@ from app.workloads.builders import (
     vllm_daemonset,
 )
 
-S = Settings(node_image_tag="0.1.0", hf_mirror_enabled=False)  # nodes download from Hugging Face directly
-M = Settings(node_image_tag="0.1.0", public_hostname="llm.example")  # through the mirror on main (the default)
+S = Settings(node_image_tag="0.2.0", hf_mirror_enabled=False)  # nodes download from Hugging Face directly
+M = Settings(node_image_tag="0.2.0", public_hostname="llm.example")  # through the mirror on main (the default)
 
 
 def direct(**kw):
@@ -369,11 +369,11 @@ def test_template_hash_ignores_ctx_for_rpc_and_tracks_image():
     d = dep(mode="split")
     rpc = lambda x, s=S: annotations(rpc_daemonset(x, "cpu", s))["llm.nsu/spec-hash"]  # noqa: E731
     assert rpc(d) == rpc(dep(mode="split", ctx_per_request=4096, parallel=4, repo="other/repo"))
-    assert rpc(d) != rpc(d, Settings(node_image_tag="0.2.0"))
+    assert rpc(d) != rpc(d, Settings(node_image_tag="0.3.0"))
     rep = lambda x, s=S: annotations(replicas_daemonset(x, "cpu", s))["llm.nsu/spec-hash"]  # noqa: E731
     assert rep(d) == rep(dep(mode="split"))
     assert rep(d) != rep(dep(mode="split", ctx_per_request=4096))
-    assert rep(d) != rep(d, Settings(node_image_tag="0.2.0"))
+    assert rep(d) != rep(d, Settings(node_image_tag="0.3.0"))
     m = replicas_daemonset(d, "cpu", S)
     assert template_hash(m) == annotations(m)["llm.nsu/spec-hash"]  # the hash does not include itself
 
@@ -502,7 +502,7 @@ def all_env(manifest):
 
 
 def test_inference_pods_download_through_the_mirror_on_main():
-    with_token = Settings(node_image_tag="0.1.0", public_hostname="llm.example", hf_token="hf_real", hf_mirror_token="mirror-key")
+    with_token = Settings(node_image_tag="0.2.0", public_hostname="llm.example", hf_token="hf_real", hf_mirror_token="mirror-key")
     for m in (
         replicas_daemonset(dep(), "cpu", with_token),
         replicas_daemonset(dep(), "nvidia", with_token),
@@ -534,7 +534,7 @@ def test_own_model_files_always_come_from_the_mirror_on_main():
     with the mirror key, and llama.cpp gets the repository as it is (--hf-repo local/<name> --hf-file <file>)."""
     own = dict(repo="local/qwen3-235b", file="Qwen3-235B-A22B-Q2_K-00001-of-00002.gguf")
     off = Settings(
-        node_image_tag="0.1.0", public_hostname="llm.example", hf_mirror_enabled=False, hf_token="hf_real",
+        node_image_tag="0.2.0", public_hostname="llm.example", hf_mirror_enabled=False, hf_token="hf_real",
         hf_mirror_token="mirror-key",
     )
     for m in (replicas_daemonset(dep(**own), "cpu", off), split_leader(dep(mode="split", **own), 0, group("a", "b"), off)):
@@ -633,7 +633,7 @@ def test_the_vllm_wrapper_sets_the_ca_bundle_only_when_the_configmap_is_there(tm
 def test_node_pods_reference_only_the_node_secret():
     """A kubelet may read every Secret its pods reference (k3s Node authorizer): no pod built here (all run on nodes)
     names `llm-secrets`, which holds the LiteLLM master key, the salt, the database passwords and the real HF token."""
-    for s in (S, M, direct(hf_token="hf_real"), Settings(node_image_tag="0.1.0", backend_api_key="k", hf_token="hf_real")):
+    for s in (S, M, direct(hf_token="hf_real"), Settings(node_image_tag="0.2.0", backend_api_key="k", hf_token="hf_real")):
         for m in (
             replicas_daemonset(dep(), "cpu", s),
             replicas_daemonset(dep(), "nvidia", s),
@@ -680,8 +680,8 @@ def offer(registry, tag, digest, settings=S):
 
 
 def test_pods_run_the_image_main_registry_reports_by_its_digest(registry):
-    offer(registry, "0.1.0-cpu", DIGEST)
-    offer(registry, "0.1.0-gpu", DIGEST_2)
+    offer(registry, "0.2.0-cpu", DIGEST)
+    offer(registry, "0.2.0-gpu", DIGEST_2)
     c = container(replicas_daemonset(dep(), "cpu", S))
     assert c["image"] == f"nsu-llm-node@{DIGEST}" and c["imagePullPolicy"] == "IfNotPresent"
     assert container(replicas_daemonset(dep(), "nvidia", S))["image"] == f"nsu-llm-node@{DIGEST_2}"
@@ -693,13 +693,13 @@ def test_pods_run_the_image_main_registry_reports_by_its_digest(registry):
 
 def test_the_repository_of_the_settings_stays_in_the_pinned_name(registry):
     # k3s asks main's registry for ghcr.io/<owner>/nsu-llm-node and for the bare name alike (entrypoint.sh of the node)
-    mirrored = Settings(node_image_repo="ghcr.io/nsu/nsu-llm-node", node_image_tag="0.1.0")
-    offer(registry, "0.1.0-cpu", DIGEST, mirrored)
+    mirrored = Settings(node_image_repo="ghcr.io/nsu/nsu-llm-node", node_image_tag="0.2.0")
+    offer(registry, "0.2.0-cpu", DIGEST, mirrored)
     assert container(replicas_daemonset(dep(), "cpu", mirrored))["image"] == f"ghcr.io/nsu/nsu-llm-node@{DIGEST}"
 
 
 def test_a_tag_main_registry_does_not_have_stays_a_tag_that_is_always_pulled(registry):
-    offer(registry, "0.1.0-cpu", None)  # the registry answered 404
+    offer(registry, "0.2.0-cpu", None)  # the registry answered 404
     for make in (
         lambda: replicas_daemonset(dep(), "cpu", S),
         lambda: rpc_daemonset(dep(mode="split"), "cpu", S),
@@ -710,26 +710,26 @@ def test_a_tag_main_registry_does_not_have_stays_a_tag_that_is_always_pulled(reg
 
 
 def test_pinning_can_be_switched_off(registry):
-    off = Settings(node_image_tag="0.1.0", node_image_pin=False, hf_mirror_enabled=False)
-    offer(registry, "0.1.0-cpu", DIGEST, off)
+    off = Settings(node_image_tag="0.2.0", node_image_pin=False, hf_mirror_enabled=False)
+    offer(registry, "0.2.0-cpu", DIGEST, off)
     c = container(replicas_daemonset(dep(), "cpu", off))
     assert c["image"] == "nsu-llm-node:0.2.0-cpu" and c["imagePullPolicy"] == "IfNotPresent"
 
 
 def test_the_pod_template_changes_with_the_digest_and_only_with_it(registry):
     spec_hash = lambda: annotations(replicas_daemonset(dep(), "cpu", S))["llm.nsu/spec-hash"]  # noqa: E731
-    offer(registry, "0.1.0-cpu", DIGEST)
+    offer(registry, "0.2.0-cpu", DIGEST)
     first = spec_hash()
-    registry.put(S, "0.1.0-cpu", versions.ImageInfo("0.1.0-cpu", DIGEST, version="9", revision="x"))  # labels are not the image
+    registry.put(S, "0.2.0-cpu", versions.ImageInfo("0.2.0-cpu", DIGEST, version="9", revision="x"))  # labels are not the image
     assert spec_hash() == first  # the registry asked again, same image: the deployments do not restart
-    offer(registry, "0.1.0-cpu", DIGEST_2)
+    offer(registry, "0.2.0-cpu", DIGEST_2)
     assert spec_hash() != first  # an image pushed under the same tag is a new pod template
-    offer(registry, "0.1.0-gpu", DIGEST_2)
+    offer(registry, "0.2.0-gpu", DIGEST_2)
     assert spec_hash() != first
 
 
 def test_the_wake_job_keeps_the_tag_the_node_image_has_on_the_node(registry):
-    offer(registry, "0.1.0-gpu", DIGEST)
+    offer(registry, "0.2.0-gpu", DIGEST)
     job = builders.wake_job("pc03", "nvidia", "pc01", "00:1a:2b:3c:4d:5e", "10.1.2.255", S)
     (c,) = job["spec"]["template"]["spec"]["containers"]
     # `Never` pulls nothing, so the name must be the one the node imported from its archive
@@ -744,7 +744,7 @@ def test_the_pods_mirror_token_names_the_repositories_of_their_deployment_only()
     import hmac
     import json
 
-    s = Settings(node_image_tag="0.1.0", public_hostname="llm.example", hf_mirror_token="mirror-key")
+    s = Settings(node_image_tag="0.2.0", public_hostname="llm.example", hf_mirror_token="mirror-key")
     d = dep(draft_repo="org/draft-GGUF", draft_file="d.gguf", mmproj_file="local/vision/mmproj.gguf")
     token = env(replicas_daemonset(d, "cpu", s))["HF_TOKEN"]
     prefix, payload, sig = token.split(".")

@@ -19,7 +19,7 @@ from tests.fakes.k8s import FakeK8s
 from tests.fakes.litellm import FakeLiteLLM
 from tests.helpers.auth import csrf_headers, login
 
-S = Settings(node_image_tag="0.1.0")
+S = Settings(node_image_tag="0.2.0")
 D1 = "sha256:" + "11" * 32
 D2 = "sha256:" + "22" * 32
 D3 = "sha256:" + "33" * 32
@@ -69,7 +69,7 @@ class FakeRegistry:
                     return httpx.Response(200, json=body, headers={"Docker-Content-Digest": digest})
                 return httpx.Response(200, json=manifest_of(f"sha256:{ref_hash(ref)}"), headers={"Docker-Content-Digest": digest})
             if ref == "sha256:" + "ff" * 32:
-                return httpx.Response(200, json=manifest_of(f"sha256:{ref_hash('0.1.0-gpu')}"))
+                return httpx.Response(200, json=manifest_of(f"sha256:{ref_hash('0.2.0-gpu')}"))
             return httpx.Response(404, json={"errors": [{"code": "MANIFEST_UNKNOWN"}]})
         if kind == "blobs":
             for tag in self.tags:
@@ -88,7 +88,7 @@ def ref_hash(tag):
 def registry():
     """The process-wide Registry pointed at a fake registry, empty before and after."""
     fake = FakeRegistry()
-    fake.tags = {"0.1.0-cpu": D1, "0.1.0-gpu": D2}
+    fake.tags = {"0.2.0-cpu": D1, "0.2.0-gpu": D2}
     versions.REGISTRY.reset()
     versions.REGISTRY.transport = httpx.MockTransport(fake)
     yield fake
@@ -105,13 +105,13 @@ def redis():
 
 
 async def test_the_registry_gives_the_digest_and_the_labels_of_a_tag(registry):
-    info = await versions.REGISTRY.fetch(S, "0.1.0-gpu")
-    assert info == ImageInfo("0.1.0-gpu", D2, "0.1.0", "abc1234", "2026-11-03T10:00:00Z")
+    info = await versions.REGISTRY.fetch(S, "0.2.0-gpu")
+    assert info == ImageInfo("0.2.0-gpu", D2, "0.1.0", "abc1234", "2026-11-03T10:00:00Z")
 
 
 async def test_an_index_is_followed_to_the_amd64_image(registry):
     registry.index = True
-    info = await versions.REGISTRY.fetch(S, "0.1.0-gpu")
+    info = await versions.REGISTRY.fetch(S, "0.2.0-gpu")
     assert info.digest == D2  # the digest of the index: what a pull by tag resolves to
     assert (info.version, info.revision) == ("0.1.0", "abc1234")
 
@@ -120,38 +120,38 @@ async def test_a_tag_the_registry_does_not_have_is_none_and_a_broken_registry_an
     assert await versions.REGISTRY.fetch(S, "9.9.9-cpu") is None
     registry.status = 503
     with pytest.raises(RegistryError):
-        await versions.REGISTRY.fetch(S, "0.1.0-cpu")
+        await versions.REGISTRY.fetch(S, "0.2.0-cpu")
 
 
 async def test_a_registry_that_is_down_keeps_the_digest_the_pods_were_built_with(registry, redis):
     reg = versions.REGISTRY
-    assert (await reg.resolve(S, "0.1.0-cpu", redis)).digest == D1
+    assert (await reg.resolve(S, "0.2.0-cpu", redis)).digest == D1
     reg.reset()  # the process restarts: Redis remembers the digest
     registry.status = 503
-    seeded = await reg.resolve(S, "0.1.0-cpu", redis)
+    seeded = await reg.resolve(S, "0.2.0-cpu", redis)
     assert seeded is not None and seeded.digest == D1
-    assert reg.digest(S, "0.1.0-cpu") == D1
+    assert reg.digest(S, "0.2.0-cpu") == D1
     # and without Redis a young process knows nothing, which the controller reads as «wait»
     reg.reset()
-    assert await reg.resolve(S, "0.1.0-cpu", None) is None
-    assert reg.digest(S, "0.1.0-cpu") is None and not reg.known(S, "0.1.0-cpu")
+    assert await reg.resolve(S, "0.2.0-cpu", None) is None
+    assert reg.digest(S, "0.2.0-cpu") is None and not reg.known(S, "0.2.0-cpu")
 
 
 async def test_a_registry_that_answers_404_says_there_is_no_pin(registry, redis):
     reg = versions.REGISTRY
-    assert (await reg.resolve(S, "0.1.0-cpu", redis)).digest == D1
-    del registry.tags["0.1.0-cpu"]
+    assert (await reg.resolve(S, "0.2.0-cpu", redis)).digest == D1
+    del registry.tags["0.2.0-cpu"]
     reg._cache.clear()
     reg._tried.clear()
-    assert await reg.resolve(S, "0.1.0-cpu", redis) is None
-    assert reg.known(S, "0.1.0-cpu") and reg.digest(S, "0.1.0-cpu") is None  # known to be absent: the tag form
+    assert await reg.resolve(S, "0.2.0-cpu", redis) is None
+    assert reg.known(S, "0.2.0-cpu") and reg.digest(S, "0.2.0-cpu") is None  # known to be absent: the tag form
     assert await redis.get(f"{versions.KEY_PIN}nsu-llm-node:0.2.0-cpu") is None
 
 
 async def test_the_registry_is_not_asked_again_within_a_minute(registry, redis):
-    await versions.REGISTRY.resolve(S, "0.1.0-cpu", redis)
-    await versions.REGISTRY.resolve(S, "0.1.0-cpu", redis)
-    assert [c for c in registry.calls if "/manifests/0.1.0-cpu" in c] == ["/v2/nsu-llm-node/manifests/0.1.0-cpu"]
+    await versions.REGISTRY.resolve(S, "0.2.0-cpu", redis)
+    await versions.REGISTRY.resolve(S, "0.2.0-cpu", redis)
+    assert [c for c in registry.calls if "/manifests/0.2.0-cpu" in c] == ["/v2/nsu-llm-node/manifests/0.2.0-cpu"]
 
 
 class State:
@@ -175,7 +175,7 @@ async def test_the_controller_waits_for_the_registry_only_while_the_process_is_y
 
 
 async def test_tags_of_the_repository(registry):
-    assert await versions.REGISTRY.list_tags(S) == ["0.1.0-cpu", "0.1.0-gpu"]
+    assert await versions.REGISTRY.list_tags(S) == ["0.2.0-cpu", "0.2.0-gpu"]
 
 
 # ---------------------------------------------------------------- who is outdated, who goes now
@@ -185,7 +185,7 @@ def report(digest=D1, **kw):
     return {"version": "0.1.0", "revision": "abc1234", "digest": digest, "tag": "nsu-llm-node:0.2.0-cpu", "update_failed_at": None, **kw}
 
 
-OFFER = ImageInfo("0.1.0-cpu", D1, "0.1.0", "abc1234")
+OFFER = ImageInfo("0.2.0-cpu", D1, "0.1.0", "abc1234")
 
 
 def test_a_node_is_outdated_by_digest_else_by_revision_else_by_version():
@@ -432,7 +432,7 @@ async def test_the_versions_page_groups_the_nodes_and_marks_the_outdated(client,
     data = r.json()
     assert data["main"] == {"version": None, "revision": None, "digest": None}
     assert data["registry"]["available"] is True
-    assert [(t["tag"], t["digest"], t["current"]) for t in data["registry"]["tags"]] == [("0.1.0-gpu", D2, True), ("0.1.0-cpu", D1, True)]
+    assert [(t["tag"], t["digest"], t["current"]) for t in data["registry"]["tags"]] == [("0.2.0-gpu", D2, True), ("0.2.0-cpu", D1, True)]
     assert data["offered"]["nvidia"]["digest"] == D2 and data["offered"]["cpu"]["version"] == "0.1.0"
     assert data["auto_update"] is False
     nodes = {n["name"]: n for n in data["nodes"]}
@@ -572,7 +572,7 @@ async def test_the_name_of_the_node_image_is_public_and_follows_node_image_tag(c
     assert r.json() == {
         "tag": "0.1.1", "cpu": "nsu-llm-node:0.1.1-cpu", "nvidia": "nsu-llm-node:0.1.1-gpu", "digest": {"cpu": "", "nvidia": ""},
     }
-    settings.node_image_tag = "0.1.0"
+    settings.node_image_tag = "0.2.0"
     assert (await client.get("/api/node-image")).json()["digest"] == {"cpu": D1, "nvidia": D2}
     settings.node_image_tag = "0.2.0"
     assert (await client.get("/api/node-image")).json()["nvidia"] == "nsu-llm-node:0.2.0-gpu"

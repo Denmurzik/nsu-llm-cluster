@@ -28,6 +28,8 @@ NODE_NAME="${NODE_NAME:-$(hostname)}"
 NODE_NAME="${NODE_NAME,,}"
 MAIN_URL="${MAIN_URL:-https://${MAIN_HOST:?MAIN_URL or MAIN_HOST is required}}"
 MAIN_URL="${MAIN_URL%/}"
+# fetch-main-ca.sh takes host[:port] (SEC-3 validates it), not a URL
+main_hostport() { local h="${MAIN_URL#*://}"; printf %s "${h%%/*}"; }
 INFER_PORT="${INFER_PORT:-18080}"
 STATE_DIR="${STATE_DIR:-/var/lib/llm-node}"
 # baked into the image (node/Dockerfile ARG VERSION, GIT_COMMIT); the digest of the image in main's registry and its local name
@@ -101,7 +103,7 @@ setup_tls() {
         # verified, 4 main serves no /ca.crt (own certificate), anything else: try again
         if command -v fetch-main-ca.sh >/dev/null 2>&1; then
           local rc=0
-          CLUSTER_TOKEN="$CLUSTER_TOKEN" fetch-main-ca.sh --main "$MAIN_URL" --out "$STATE_DIR/ca.crt" || rc=$?
+          CLUSTER_TOKEN="$CLUSTER_TOKEN" fetch-main-ca.sh --main "$(main_hostport)" --out "$STATE_DIR/ca.crt" || rc=$?
           if [ "$rc" = 0 ] && [ -s "$STATE_DIR/ca.crt" ]; then
             log "CA saved to $STATE_DIR/ca.crt (checked by fetch-main-ca.sh)"
             break

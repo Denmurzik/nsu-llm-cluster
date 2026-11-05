@@ -34,8 +34,8 @@ SHA = "a" * 40
 SHA2 = "b" * 40
 NODE_BIN = Path(__file__).resolve().parents[2] / "node" / "rootfs" / "opt" / "llm"
 
-S = Settings(node_image_tag="0.1.0", hf_mirror_enabled=False)
-M = Settings(node_image_tag="0.1.0", public_hostname="llm.example")
+S = Settings(node_image_tag="0.2.0", hf_mirror_enabled=False)
+M = Settings(node_image_tag="0.2.0", public_hostname="llm.example")
 
 
 def dep(**kw):
@@ -160,7 +160,7 @@ def test_preview_of_a_replica_shows_the_flags_and_masks_the_keys():
 
 
 def test_preview_masks_every_secret():
-    tokened = Settings(node_image_tag="0.1.0", hf_mirror_enabled=False, hf_token="hf_secret_value")
+    tokened = Settings(node_image_tag="0.2.0", hf_mirror_enabled=False, hf_token="hf_secret_value")
     p = command_preview(dep(), tokened)
     assert "hf_secret_value" not in p["leader"] and "HF_TOKEN=***" in p["leader"] and "LLAMA_API_KEY=***" in p["leader"]
     assert "--api-key" not in p["leader"]
