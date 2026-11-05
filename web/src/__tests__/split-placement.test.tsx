@@ -161,6 +161,11 @@ describe("split placement notes", () => {
 describe("split rules", () => {
   const base = { ctx: 8192, parallel: 1, mode: "split" as const, group: 2, accel: "nvidia" as const };
 
+  it("lets the admin take the whole class of 15 PCs into one group", () => {
+    expect(checkRules({ ...base, group: 15, useNodeRam: true }).group).toBeUndefined();
+    expect(checkRules({ ...base, group: 15, useNodeRam: false }).group).toBeUndefined();
+  });
+
   it("limits a group to the devices llama.cpp can drive", () => {
     expect(checkRules({ ...base, group: 31 }).group).toBeUndefined();
     expect(checkRules({ ...base, group: 32 }).group).toBe(

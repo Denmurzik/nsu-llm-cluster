@@ -3,7 +3,6 @@
 import ipaddress
 import json
 import logging
-import re
 import time
 from collections import Counter
 from dataclasses import dataclass, field, replace
@@ -16,7 +15,7 @@ from app.catalog import placement
 from app.catalog.sources import model_sources
 from app.deployments import schedule, service
 from app.deployments.service import NodeCandidate
-from app.k8s import A_GROUP_HASH, A_SPEC_HASH, L_DEPLOYMENT, L_NODE_DEPLOYMENT, K8sUnavailable, NodeInfo
+from app.k8s import A_GROUP_HASH, A_SPEC_HASH, L_DEPLOYMENT, L_NODE_DEPLOYMENT, MAIN_NODE, K8sUnavailable, NodeInfo
 from app.models import ControllerTimer, NodeAssignment, NodeModels, NodeWake, StandaloneNode
 from app.nodes import cleanup, identity, registry, relay, wake
 from app.workloads import builders
@@ -72,8 +71,7 @@ def _stale(owned, manifest: dict) -> bool:
 def _leader_index(deployment: str, pod) -> int | None:
     """The group index of a pod of the leader Deployment `llm-<deployment>-g<i>`, read from the object the pod
     belongs to: its own name is cut short for long deployment names (generateName)."""
-    match = re.fullmatch(rf"llm-{re.escape(deployment)}-g(\d+)", pod.workload or "")
-    return int(match.group(1)) if match else None
+    return builders.leader_index(deployment, pod.workload)
 
 
 def _crash_looping(pod) -> bool:
@@ -492,6 +490,7 @@ class WorkloadController:
         A group whose lost members are all back (`_recover`) stays as it is unless a process lost its peer meanwhile.
         """
         s = self.app_state.settings
+        on_main = await settings_store.live(self.app_state, "split_leader_on_main")  # where the leaders of this pass run
         plan = _Plan()
         seen: set[tuple[str, int]] = set()
         memory = {n.name.lower(): service.node_memory(n) for n in nodes}
@@ -534,7 +533,7 @@ class WorkloadController:
                 forming = builders.plan_groups(workers, dep.group_size, whole, in_groups, limit, reserved, mixed)
                 grouped = in_groups | {w.node_name for g in forming.values() for w in g}
                 free = Counter(w.accel for w in workers if w.node_name not in grouped)
-                held, recovered = self._held(dep, existing, alive, assigned_names, free, node_accel)
+                held, recovered = self._held(dep, existing, alive, assigned_names, free, node_accel, on_main)
                 plan.hold.update(("Deployment", builders.object_name(dep, f"g{i}")) for i in held)
                 plan.unserved.update(builders.object_name(dep, f"g{i}") for i in held)
                 waiting = {n for names in held.values() for n in names}
@@ -548,7 +547,7 @@ class WorkloadController:
                 relaunch: set[str] = set()
                 for i, lost in recovered.items():
                     if i in intact:
-                        members, leaders = self._recover(lost, live[i], [p for p, j in pods if j == i], endpoints)
+                        members, leaders = self._recover(lost, live[i], [p for p, j in pods if j == i], endpoints, on_main)
                         restart |= members
                         relaunch |= leaders
                         if members or leaders:
@@ -557,9 +556,9 @@ class WorkloadController:
                 plan.recycle += sorted(relaunch)
                 exclude = survivors | waiting
                 for i, group in builders.plan_groups(workers, dep.group_size, live, exclude, limit, reserved, mixed).items():
-                    decision, tensor_split = self._placement(dep, i, group, memory)
+                    decision, tensor_split = self._placement(dep, i, group, memory, on_main)
                     if decision != placement.HOLD:
-                        self._add(plan.desired, builders.split_leader(dep, i, group, s, tensor_split))
+                        self._add(plan.desired, builders.split_leader(dep, i, group, s, tensor_split, on_main))
             elif dep.engine == "vllm":
                 if "nvidia" in accels:
                     self._add(plan.desired, builders.vllm_daemonset(dep, s))
@@ -568,7 +567,7 @@ class WorkloadController:
                     self._add(plan.desired, builders.replicas_daemonset(dep, accel, s))
         for key in set(self._lost) - seen:
             del self._lost[key]
-        ready = {n.name for n in nodes if n.ready}
+        ready = {n.name for n in nodes if n.ready} | {MAIN_NODE}  # `nodes` leaves main out, and this code runs on it
         for name, pods in leader_pods.items():
             for p in pods:
                 key = ("Deployment", p.workload)
@@ -582,15 +581,20 @@ class WorkloadController:
         return plan
 
     def _placement(
-        self, dep, index: int, group: list[RpcWorker], memory: dict[str, placement.NodeMemory]
+        self, dep, index: int, group: list[RpcWorker], memory: dict[str, placement.NodeMemory], on_main: bool = False
     ) -> tuple[str, list[int] | None]:
         """`placement.decide` for one group and the `--tensor-split` it gets: SPLIT with the plan, AUTO without
         (llama.cpp splits by free memory), HOLD (a group with RAM devices that does not fit: no leader, the status page
         says why). Anything but SPLIT is logged once per group."""
         nodes = [memory.get(w.node_name) or placement.NodeMemory(w.node_name, w.accel, None, None) for w in group]
-        plan = placement.plan_for(dep, nodes, self.app_state.settings.gpu_compute_reserve_mib)
+        plan = placement.plan_for(dep, nodes, self.app_state.settings.gpu_compute_reserve_mib, on_main)
         decision = placement.decide(plan)
         key = (dep.name, index, tuple(w.node_name for w in group))
+        if on_main and decision != placement.HOLD and (problem := builders.main_disk_problem(dep)):
+            if key not in self._unplaced:
+                self._unplaced.add(key)
+                log.warning("deployment %s group %d: %s", dep.name, index, problem)
+            return placement.HOLD, None
         if decision == placement.SPLIT:
             self._unplaced.discard(key)
             return decision, plan.tensor_split
@@ -610,6 +614,7 @@ class WorkloadController:
         assigned: set[str],
         free: Counter,
         node_accel: dict[str, str],
+        on_main: bool = False,
     ) -> tuple[dict[int, list[str]], dict[int, _Lost]]:
         """The groups of `dep` waiting out the regroup grace for a lost member, and the groups whose lost members are
         all back (with the loss they recovered from).
@@ -618,7 +623,7 @@ class WorkloadController:
         restarting rpc pod), no `free` worker (accel -> count of spare workers: alive, in no group and in no group
         formed this pass) of the accel of each missing member can take its place (a mixed group of accel `any` needs a
         GPU node for a GPU member) and the grace has not run out. A member taken off on purpose (maintenance, another
-        assignment) or a changed group size is not waited for.
+        assignment) or a changed group size is not waited for. With `on_main` no member's node holds the leader.
         """
         grace = service.regroup_grace(dep, self.app_state.settings)
         now = _now()
@@ -646,13 +651,15 @@ class WorkloadController:
                 continue
             if lost is None:
                 lost = self._lost[key] = _Lost(tuple(members), now)
-            lost.leader_lost = lost.leader_lost or members[0] in missing
+            lost.leader_lost = lost.leader_lost or (not on_main and members[0] in missing)
             if now - lost.since < grace:
                 held[index] = members
         return held, recovered
 
     @staticmethod
-    def _recover(lost: _Lost, members: list[str], leader_pods: list, endpoints: list) -> tuple[set[str], set[str]]:
+    def _recover(
+        lost: _Lost, members: list[str], leader_pods: list, endpoints: list, on_main: bool = False
+    ) -> tuple[set[str], set[str]]:
         """The members whose rpc pods are recreated and the leader pods that are, for a group whose lost members are
         all back. A short NotReady blip (a lost lease, a slow probe) restarts nothing: the processes ran through it.
 
@@ -664,7 +671,8 @@ class WorkloadController:
           start): the leader holds a dead connection and its first request would end in GGML_ABORT, it is recreated;
         - otherwise a leader that crash-looped while a member was away starts at once, not after its back-off.
         A start within CLOCK_SKEW_S of a moment of another clock is taken the way that restarts rather than leaves a
-        group stuck; the leader and the rpc server of its own node share one clock.
+        group stuck; the leader and the rpc server of its own node share one clock (`on_main`: no rpc server has the
+        leader's clock).
         """
         rpc_start = {ep.node_name: ep.started_at for ep in endpoints}
         leader_start = max((p.started_at for p in leader_pods if p.started_at is not None), default=None)
@@ -673,7 +681,7 @@ class WorkloadController:
             restart = {n for n in members[1:] if _ran_through(rpc_start.get(n), lost.since)}
         if leader_start is not None and any(
             _restarted(rpc_start.get(n), lost.since)
-            and _restarted(rpc_start.get(n), leader_start, 0 if n == members[0] else CLOCK_SKEW_S)
+            and _restarted(rpc_start.get(n), leader_start, 0 if n == members[0] and not on_main else CLOCK_SKEW_S)
             for n in members
         ):
             return restart, {p.name for p in leader_pods}

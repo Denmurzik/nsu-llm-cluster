@@ -55,7 +55,7 @@ async def _backend_status(state) -> dict[str, Any]:
 
 
 async def collect_nodes(
-    state, db: AsyncSession, k8s, settings: Settings, with_heartbeats: bool = False
+    state, db: AsyncSession, k8s, settings: Settings, with_heartbeats: bool = False, with_enrolled: bool = False
 ) -> tuple[bool, list[dict[str, Any]], list[dict[str, Any]], dict[str, datetime]]:
     """Cluster nodes and standalone nodes merged: (k8s reachable, rows, backends, last sign of life by node name)."""
     assignments = {a.node_name: a for a in (await db.scalars(select(NodeAssignment))).all()}
@@ -200,17 +200,47 @@ async def collect_nodes(
                 **identity_of(name),
             }
         )
+    if with_enrolled and k8s_available:
+        # registered with the portal but neither in the cluster nor a standalone record (its agent has not joined yet, or
+        # k3s refuses it): without a row of its own the admin would see no «Подтвердить», no claim and nothing to delete
+        listed = {row["name"] for row in result}
+        for name in sorted((set(identities) | set(claims)) - listed - {MAIN_NODE}):
+            row = identities.get(name)
+            first_claim = next(iter(claims.get(name, [])), None)
+            result.append(
+                {
+                    "name": name,
+                    "source": "enrolled",
+                    "accel": "cpu",
+                    "ip": (row.last_ip if row is not None else None) or (first_claim.ip if first_claim else None),
+                    "ready": False,
+                    "vram_mib": None,
+                    "mem_mib": None,
+                    "capacity_bytes": None,
+                    "deployment": deployment_of(name, None),
+                    "backends": per_node.get(name, 0),
+                    "version": None,
+                    "is_main": False,
+                    "maintenance": maintenance_of(name),
+                    "models_bytes": models.get(name),
+                    **wake_of(name),
+                    **identity_of(name),
+                }
+            )
     return k8s_available, result, backends, heartbeat_at
 
 
 @router.get("/nodes")
 async def nodes(
     request: Request,
+    enrolled: bool = Query(False),
     db: AsyncSession = Depends(get_session),
     k8s=Depends(get_k8s),
     settings: Settings = Depends(get_settings_dep),
 ) -> dict[str, Any]:
-    k8s_available, result, backends, _ = await collect_nodes(request.app.state, db, k8s, settings)
+    """`enrolled=1` (the «Ноды» page): also the names that registered but are neither in the cluster nor standalone
+    (source `enrolled`). The pickers of deployments leave it out: nothing can run there yet."""
+    k8s_available, result, backends, _ = await collect_nodes(request.app.state, db, k8s, settings, with_enrolled=enrolled)
     return {"k8s_available": k8s_available, "nodes": result, "backends": backends}
 
 

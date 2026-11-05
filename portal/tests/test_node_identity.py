@@ -16,6 +16,7 @@ from app import mirror_tokens, settings_store
 from app.controllers.backends import BackendController
 from app.controllers.workloads import WorkloadController
 from app.deployments import service
+from app.k8s import K8sUnavailable
 from app.models import AuditLog, NodeAssignment, NodeIdentity, StandaloneNode
 from app.nodes import identity, routes
 from tests.fakes.k8s import FakeK8s
@@ -29,7 +30,7 @@ NO_KEY = {**TOKEN, "X-Node-Key": ""}
 ADMIN = {"sub": "adm", "email": "admin@g.nsu.ru", "email_verified": True, "name": "Админ"}
 REG = {"name": "lab-1", "url": "http://10.0.0.5:18080", "accel": "cpu", "ram_mib": 16000, "version": "0.1.0"}
 FROM_ELSEWHERE = {"X-Forwarded-For": "10.66.66.66"}  # Caddy's peer: another machine than the node's
-IMAGE = {"version": "0.1.0", "revision": "abc", "digest": "", "tag": "nsu-llm-node:0.2.0-cpu"}
+IMAGE = {"version": "0.1.0", "revision": "abc", "digest": "", "tag": "nsu-llm-node:0.2.1-cpu"}
 SAMPLE = {"gpus": [], "ram_used_mib": 1, "ram_total_mib": 2, "cpu_pct": 1.0, "disk_used_bytes": 0, "disk_free_bytes": 1,
           "llama_up": False, "rpc_up": False}
 
@@ -85,8 +86,12 @@ async def test_the_agent_token_alone_cannot_take_over_or_remove_a_name_that_has_
     app.state.k8s.add_node("lab-1", accel="cpu", internal_ip="10.0.0.5")
     key = (await register(client))["node_key"]
     evil = {**REG, "url": "http://10.66.66.66:8080"}
-    r = await client.post("/api/nodes/register", json=evil, headers=NO_KEY)
-    assert r.status_code == 409 and r.json()["detail"]["code"] == identity.TAKEN
+    # without the key the registration is only a claim for the admin (task B2): the name, its key and its url stay
+    reply = await register(client, evil, {**NO_KEY, **FROM_ELSEWHERE})
+    assert reply["approved"] is False
+    claim_key = reply["node_key"]
+    r = await client.post("/api/nodes/lab-1/stop", headers=with_key(claim_key))
+    assert r.status_code == 403 and r.json()["detail"]["code"] == identity.PENDING
     r = await client.post("/api/nodes/register", json=evil, headers=with_key("x" * 43))
     assert r.status_code == 403 and r.json()["detail"]["code"] == identity.INVALID
     db_session.expire_all()
@@ -136,11 +141,14 @@ async def test_k3s_nodes_enroll_and_concurrent_enrolls_of_one_name_give_one_key(
     replies = await asyncio.gather(
         *(client.post("/api/nodes/enroll", json={"name": "pc01"}, headers=NO_KEY) for _ in range(4))
     )
-    ok = [r for r in replies if r.status_code == 200]
-    assert len(ok) == 1 and all(r.status_code == 409 for r in replies if r.status_code != 200)
-    key = ok[0].json()["node_key"]
-    r = await client.post("/api/nodes/models", json={"name": "pc01", "models_bytes": 7}, headers=with_key(key))
-    assert r.status_code == 200
+    # one gets the name; the others are claims (task B2) or, in a race on the first insert, 409: the keeper tries again
+    assert all(r.status_code in (200, 409) for r in replies)
+    keys = [r.json()["node_key"] for r in replies if r.status_code == 200]
+    taken = [
+        k for k in keys
+        if (await client.post("/api/nodes/models", json={"name": "pc01", "models_bytes": 7}, headers=with_key(k))).status_code == 200
+    ]
+    assert len(taken) == 1
 
 
 # ---- migration: nodes known before identities -------------------------------------------------------------------
@@ -270,19 +278,22 @@ async def test_the_migration_window_closes(client, app, db_session):
 
 async def test_a_lost_reply_of_the_first_registration_does_not_lock_the_node(client, app, db_session):
     """Fix round 1, Important 3: the same registration again (the node's nonce), while the key it got was never used, gets a
-    new key instead of 409; once the key was used, or with another nonce, it is 409."""
+    new key of the name; once the key was used, or with another nonce, it is a claim for the admin (task B2)."""
     nonce = {**NO_KEY, "X-Node-Enroll-Nonce": "n" * 24}
     first = (await client.post("/api/nodes/enroll", json={"name": "pc01"}, headers=nonce)).json()["node_key"]
-    r = await client.post("/api/nodes/enroll", json={"name": "pc01"}, headers={**NO_KEY, "X-Node-Enroll-Nonce": "m" * 24})
-    assert r.status_code == 409
-    assert (await client.post("/api/nodes/enroll", json={"name": "pc01"}, headers=NO_KEY)).status_code == 409
+    other = {**NO_KEY, "X-Node-Enroll-Nonce": "m" * 24}
+    r = await client.post("/api/nodes/enroll", json={"name": "pc01"}, headers=other)
+    assert r.status_code == 200 and len(await identity.live_claims(db_session, "pc01")) == 1
     second = await client.post("/api/nodes/enroll", json={"name": "pc01"}, headers=nonce)
     assert second.status_code == 200 and second.json()["node_key"] != first
     key = second.json()["node_key"]
     r = await client.post("/api/nodes/models", json={"name": "pc01", "models_bytes": 1}, headers=with_key(first))
     assert r.status_code == 403  # the lost key is no key any more
     assert (await client.post("/api/nodes/models", json={"name": "pc01", "models_bytes": 1}, headers=with_key(key))).status_code == 200
-    assert (await client.post("/api/nodes/enroll", json={"name": "pc01"}, headers=nonce)).status_code == 409  # used now
+    late = await client.post("/api/nodes/enroll", json={"name": "pc01"}, headers=nonce)  # used now: not the name's key any more
+    assert late.status_code == 200 and late.json()["approved"] is False
+    r = await client.post("/api/nodes/models", json={"name": "pc01", "models_bytes": 1}, headers=with_key(late.json()["node_key"]))
+    assert r.status_code == 403 and r.json()["detail"]["code"] == identity.PENDING
 
 
 async def test_a_known_name_keeps_every_claim_and_the_admin_picks_one(client, app, db_session):
@@ -342,12 +353,226 @@ async def test_claims_can_be_rejected_one_by_one_or_all(client, app, db_session)
     assert len(actions) == 2
 
 
-async def test_approve_is_only_for_names_that_registered(client, app):
+async def test_approve_is_only_for_names_that_registered(client, app, db_session):
     h = await admin(client, app)
     r = await client.post("/api/admin/nodes/ghost/approve", headers=h)
     assert r.status_code == 404
     r = await client.post("/api/admin/nodes/approve", json={"names": ["ghost"]}, headers=h)
     assert r.status_code == 404
+    # task B2: a Kubernetes node that never registered is no exception: an approval must not leave a row without a key
+    await approval(app, True)
+    app.state.k8s.add_node("lab-2", accel="cpu", internal_ip="10.0.0.7")
+    r = await client.post("/api/admin/nodes/lab-2/approve", headers=h)
+    assert r.status_code == 404 and "ещё не получила свой ключ" in r.json()["detail"]
+    assert await db_session.get(NodeIdentity, "lab-2") is None
+    # and its registration then is an ordinary waiting node with its key
+    reply = (await client.post("/api/nodes/enroll", json={"name": "lab-2"}, headers=NO_KEY)).json()
+    assert reply["approved"] is False and identity.KEY_RE.fullmatch(reply["node_key"])
+    assert (await client.post("/api/admin/nodes/lab-2/approve", headers=h)).status_code == 200
+
+
+@pytest.mark.parametrize(
+    "legacy, approved, days, reset",
+    [
+        (False, True, 0, False),  # the live case of 2026-11-05: a row of an older portal's approval, window closed
+        (False, True, 7, False),  # the same from an address the portal does not know
+        (False, False, 7, True),  # after «Сбросить ключ»
+        (True, True, 0, False),  # legacy, window closed
+        (True, False, 7, False),  # legacy, not approved
+    ],
+)
+async def test_a_known_name_without_a_key_always_ends_in_a_claim_the_admin_sees(
+    client, app, db_session, legacy, approved, days, reset
+):
+    """Task B2, point 3: no combination leaves a node without a key and the admin without anything to click."""
+    await approval(app, True)
+    async with app.state.sessionmaker() as db:
+        await settings_store.set(db, identity.MIGRATION_SETTING, days, None)
+        await db.commit()
+    app.state.k8s.add_node("lab-1", accel="cpu", internal_ip="10.0.0.5")
+    db_session.add(NodeIdentity(name="lab-1", approved=approved, approved_at=datetime.now(UTC), legacy=legacy))
+    await db_session.commit()
+    h = await admin(client, app)
+    if reset:
+        assert (await client.post("/api/admin/nodes/lab-1/reset-key", headers=h)).status_code == 200
+    r = await client.post("/api/nodes/enroll", json={"name": "lab-1"}, headers={**NO_KEY, **FROM_ELSEWHERE})
+    assert r.status_code == 200 and r.json()["approved"] is False
+    key = r.json()["node_key"]
+    assert identity.KEY_RE.fullmatch(key)
+    nodes = {n["name"]: n for n in (await client.get("/api/admin/nodes", headers=h)).json()["nodes"]}
+    (claim,) = nodes["lab-1"]["claims"]
+    r = await client.post("/api/admin/nodes/lab-1/approve", json={"claim_id": claim["id"]}, headers=h)
+    assert r.status_code == 200
+    r = await client.post("/api/nodes/lab-1/metrics", json=SAMPLE, headers=with_key(key))
+    assert r.status_code == 204
+
+
+async def test_the_messages_say_what_to_do(client, app):
+    await register(client)
+    r = await client.post("/api/nodes/models", json={"name": "lab-1", "models_bytes": 1}, headers=NO_KEY)
+    assert r.status_code == 403 and "Сделать нодой" in r.json()["detail"]["message"]
+
+
+async def test_a_reinstalled_pc_rejoins_under_its_name(client, app, db_session):
+    """Task B2, point 6: install -> data loss (no uninstall: new k3s password, no node.key) -> reinstall under the same name ->
+    enrol -> claim -> the admin picks it -> heartbeat 200, metrics taken; the old key is dead, the old k3s password is gone."""
+    await approval(app, True)
+    app.state.k8s.add_node("lab-1", accel="cpu", internal_ip="10.0.0.5", ready=False)
+    h = await admin(client, app)
+    old = (await register(client))["node_key"]
+    assert (await client.post("/api/admin/nodes/lab-1/approve", headers=h)).status_code == 200
+    # the reinstalled PC: no key, no nonce of before, the same address
+    state = (await client.get("/api/nodes/lab-1/known", headers=NO_KEY)).json()
+    assert state["known"] is True and state["own_key"] is False and "Сделать нодой" in state["message"]
+    reply = await register(client)
+    assert reply["approved"] is False
+    key = reply["node_key"]
+    state = (await client.get("/api/nodes/lab-1/known", headers=with_key(key))).json()
+    assert state["own_claim"] is True and "Сделать нодой" in state["message"]
+    r = await client.post("/api/nodes/heartbeat", json={"name": "lab-1"}, headers=with_key(key))
+    assert r.status_code == 200 and r.json()["approved"] is False and r.json()["desired"] is None
+    r = await client.post("/api/nodes/lab-1/metrics", json=SAMPLE, headers=with_key(key))
+    assert r.status_code == 403 and r.json()["detail"]["code"] == identity.PENDING
+    nodes = {n["name"]: n for n in (await client.get("/api/admin/nodes", headers=h)).json()["nodes"]}
+    (claim,) = nodes["lab-1"]["claims"]
+    assert claim["known"] is True  # the same address as before
+    assert app.state.k8s.deleted_node_passwords == []
+    r = await client.post("/api/admin/nodes/lab-1/approve", json={"claim_id": claim["id"]}, headers=h)
+    assert r.status_code == 200
+    assert app.state.k8s.deleted_node_passwords == ["lab-1"]  # k3s lets the new agent in
+    again = await register(client, headers=with_key(key))  # standalone: its record went with the approval
+    assert again["approved"] is True and "node_key" not in again
+    r = await client.post("/api/nodes/heartbeat", json={"name": "lab-1"}, headers=with_key(key))
+    assert r.status_code == 200 and r.json()["approved"] is True
+    assert (await client.post("/api/nodes/lab-1/metrics", json=SAMPLE, headers=with_key(key))).status_code == 204
+    r = await client.post("/api/nodes/heartbeat", json={"name": "lab-1"}, headers=with_key(old))
+    assert r.status_code == 403 and r.json()["detail"]["code"] == identity.INVALID
+
+
+async def test_a_deleted_node_leaves_nothing_that_blocks_its_name(client, app, db_session):
+    """Task B2, point 4: «Удалить из кластера» and the node's own DELETE take the k3s node password, the identity and the
+    claims too; a reinstall is a new node."""
+    await approval(app, True)
+    h = await admin(client, app)
+    for delete in ("admin", "node"):
+        app.state.k8s.add_node("lab-1", accel="cpu", internal_ip="10.0.0.5")
+        key = (await register(client))["node_key"]
+        assert (await client.post("/api/admin/nodes/lab-1/approve", headers=h)).status_code == 200
+        await register(client, headers={**NO_KEY, **FROM_ELSEWHERE})  # a claim on it
+        app.state.k8s.deleted_node_passwords.clear()
+        if delete == "admin":
+            r = await client.delete("/api/admin/nodes/lab-1", headers=h)
+            assert r.status_code == 200, r.text
+        else:
+            assert (await client.delete("/api/nodes/lab-1", headers=with_key(key))).status_code == 204
+        assert app.state.k8s.deleted_node_passwords == ["lab-1"], delete
+        db_session.expire_all()
+        assert await db_session.get(NodeIdentity, "lab-1") is None
+        assert await identity.live_claims(db_session, "lab-1") == []
+        state = (await client.get("/api/nodes/lab-1/known", headers=NO_KEY)).json()
+        assert state["known"] is False and "Подтвердить" in state["message"]
+
+
+async def test_a_name_that_registered_but_is_not_in_the_cluster_has_a_row_on_the_nodes_page(client, app):
+    """k3s refuses the agent or it has not joined yet: without this row the admin would have no «Подтвердить» and no claim."""
+    await approval(app, True)
+    h = await admin(client, app)
+    await client.post("/api/nodes/enroll", json={"name": "lab-3"}, headers=NO_KEY)
+    rows = {n["name"]: n for n in (await client.get("/api/admin/nodes?enrolled=1", headers=h)).json()["nodes"]}
+    assert rows["lab-3"]["source"] == "enrolled" and rows["lab-3"]["approved"] is False and rows["lab-3"]["has_key"] is True
+    plain = {n["name"] for n in (await client.get("/api/admin/nodes", headers=h)).json()["nodes"]}
+    assert "lab-3" not in plain  # the pickers of deployments do not offer it
+    assert (await client.post("/api/admin/nodes/lab-3/approve", headers=h)).status_code == 200
+    assert (await client.delete("/api/admin/nodes/lab-3", headers=h)).status_code == 200
+
+
+async def test_a_claim_does_not_stop_the_approval_of_a_waiting_node(client, app, db_session):
+    """Review B-4: the token is on every PC, one POST from anywhere must not hold up a new node: «Подтвердить» approves the
+    holder of the name's key, the claim stays for the admin and its key is still good for nothing but a heartbeat."""
+    await approval(app, True)
+    h = await admin(client, app)
+    key = (await client.post("/api/nodes/enroll", json={"name": "lab-4"}, headers=NO_KEY)).json()["node_key"]
+    claim = await client.post("/api/nodes/enroll", json={"name": "lab-4"}, headers={**NO_KEY, **FROM_ELSEWHERE})
+    assert claim.json()["approved"] is False
+    assert (await client.post("/api/admin/nodes/lab-4/approve", headers=h)).status_code == 200
+    r = await client.post("/api/nodes/lab-4/metrics", json=SAMPLE, headers=with_key(key))
+    assert r.status_code == 204
+    r = await client.post("/api/nodes/lab-4/metrics", json=SAMPLE, headers=with_key(claim.json()["node_key"]))
+    assert r.status_code == 403 and r.json()["detail"]["code"] == identity.PENDING
+    assert len(await identity.live_claims(db_session, "lab-4")) == 1
+
+
+async def test_a_picked_claim_with_the_cluster_down_spends_nothing(client, app, db_session):
+    """Review B-3: the secret goes before the commit: without it k3s would refuse the agent and the claim would be gone."""
+    await approval(app, True)
+    app.state.k8s.add_node("lab-1", accel="cpu", internal_ip="10.0.0.5")
+    h = await admin(client, app)
+    old = (await register(client))["node_key"]
+    assert (await client.post("/api/admin/nodes/lab-1/approve", headers=h)).status_code == 200
+    key = (await register(client))["node_key"]  # the reinstalled PC
+    (claim,) = await identity.live_claims(db_session, "lab-1")
+    claim_id = claim.id
+    app.state.k8s.unavailable = True
+    r = await client.post("/api/admin/nodes/lab-1/approve", json={"claim_id": claim_id}, headers=h)
+    assert r.status_code == 503 and "Кластер не ответил" in r.json()["detail"]
+    db_session.expire_all()
+    assert [c.id for c in await identity.live_claims(db_session, "lab-1")] == [claim_id]
+    r = await client.post("/api/nodes/models", json={"name": "lab-1", "models_bytes": 1}, headers=with_key(old))
+    assert r.status_code == 200  # the name's key is still the old one
+    app.state.k8s.unavailable = False
+    assert (await client.post("/api/admin/nodes/lab-1/approve", json={"claim_id": claim_id}, headers=h)).status_code == 200
+    assert app.state.k8s.deleted_node_passwords == ["lab-1"]
+    assert (await client.post("/api/nodes/lab-1/metrics", json=SAMPLE, headers=with_key(key))).status_code == 204
+
+
+async def test_a_deletion_with_the_cluster_down_says_the_password_stayed_and_approve_clears_it(client, app, db_session):
+    """Review B-3: no report of success, and no kubectl: the name comes back as a new waiting node, its «Подтвердить» clears it."""
+    await approval(app, True)
+    h = await admin(client, app)
+    app.state.k8s.add_node("lab-1", accel="cpu", internal_ip="10.0.0.5")
+    await register(client)
+    assert (await client.post("/api/admin/nodes/lab-1/approve", headers=h)).status_code == 200
+    app.state.k8s.unavailable = True
+    r = await client.delete("/api/admin/nodes/lab-1", headers=h)
+    assert r.status_code == 200 and r.json()["k8s"] == "unavailable" and r.json()["k3s_password"] == "left"
+    (row,) = (await db_session.scalars(select(AuditLog).where(AuditLog.action == "node.delete"))).all()
+    assert row.details["k3s_cleanup"] == "left"
+    app.state.k8s.unavailable = False
+    app.state.k8s.nodes.pop("lab-1")  # the Node went while the portal could not see it: the PC is being reinstalled
+    await client.post("/api/nodes/enroll", json={"name": "lab-1"}, headers=NO_KEY)
+    assert (await client.post("/api/admin/nodes/lab-1/approve", headers=h)).status_code == 200
+    assert app.state.k8s.deleted_node_passwords == ["lab-1"]
+
+
+async def test_only_the_password_of_a_call_that_failed_is_reported(client, app, monkeypatch):
+    """Review B-3: the Node went, the secret did not: `left`, not a plain success."""
+    h = await admin(client, app)
+    app.state.k8s.add_node("lab-1", accel="cpu", internal_ip="10.0.0.5")
+    await register(client)
+
+    async def broken(name):
+        raise K8sUnavailable("timeout")
+
+    monkeypatch.setattr(app.state.k8s, "delete_node_password", broken)
+    r = await client.delete("/api/admin/nodes/lab-1", headers=h)
+    assert r.status_code == 200 and r.json()["k8s"] == "deleted" and r.json()["k3s_password"] == "left"
+
+
+async def test_approve_leaves_the_password_of_a_node_in_the_cluster_alone_and_a_standalone_node_needs_no_cluster(client, app):
+    await approval(app, True)
+    h = await admin(client, app)
+    app.state.k8s.add_node("lab-2", accel="cpu", internal_ip="10.0.0.7")
+    await client.post("/api/nodes/enroll", json={"name": "lab-2"}, headers=NO_KEY)
+    assert (await client.post("/api/admin/nodes/lab-2/approve", headers=h)).status_code == 200
+    assert app.state.k8s.deleted_node_passwords == []
+    await register(client)  # standalone lab-1, waiting
+    app.state.k8s.unavailable = True
+    assert (await client.post("/api/admin/nodes/lab-1/approve", headers=h)).status_code == 200
+
+
+async def test_known_needs_the_agent_token_and_a_name(client, app):
+    assert (await client.get("/api/nodes/lab-1/known")).status_code == 401
+    assert (await client.get("/api/nodes/Bad_Name/known", headers=NO_KEY)).status_code == 422
 
 
 async def test_the_known_address_of_a_legacy_standalone_node_is_the_host_of_its_url(client, app, db_session):
@@ -463,8 +688,9 @@ async def test_an_unapproved_cluster_node_gets_no_label_and_no_backend(client, a
     await service.assign(db_session, "pc01", dep.id)
     await WorkloadController(app.state).reconcile_once()
     assert next(n for n in await k8s.list_nodes() if n.name == "pc01").deployment is None
-    h = await admin(client, app)
-    assert (await client.post("/api/admin/nodes/pc01/approve", headers=h)).status_code == 200
+    # a row without a key that an older portal's approval left (today approve refuses a name that never registered)
+    db_session.add(NodeIdentity(name="pc01", approved=True, approved_at=datetime.now(UTC), legacy=False))
+    await db_session.commit()
     await WorkloadController(app.state).reconcile_once()
     assert next(n for n in await k8s.list_nodes() if n.name == "pc01").deployment == "gemma-4-e4b"
     # approved but without its own key (it never enrolled): its pods cannot have a key, LiteLLM gets no entry for it

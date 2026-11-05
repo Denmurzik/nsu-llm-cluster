@@ -6,6 +6,7 @@ The agent token only joins: every call for a name that has a key must carry it a
 import asyncio
 import ipaddress
 import logging
+import re
 import socket
 from collections.abc import Awaitable, Callable
 from dataclasses import asdict, replace
@@ -231,6 +232,15 @@ async def enroll(body: EnrollIn, request: Request, db: AsyncSession = Depends(ge
     return {"ok": True, **_identity_reply(checked)}
 
 
+@router.get("/{name}/known")
+async def known(name: str, request: Request, db: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    """run-node asks this before it starts the container (task B2): does main know the name, does this PC hold its key, and
+    in Russian what will happen and what the admin clicks. The agent token is enough: it says nothing about the name's key."""
+    if not re.fullmatch(_NAME, name.lower()):
+        raise HTTPException(422, "Не имя ноды")
+    return await identity.name_state(request, db, name)
+
+
 _WAKE_WARNED: set[str] = set()
 
 
@@ -354,36 +364,36 @@ async def deregister(name: str, request: Request, db: AsyncSession = Depends(get
     # waiting node delete nothing (the admin can, «Удалить из кластера…»)
     await identity.check(request, db, name, strict=True)
 
-    async def log_it(found: bool, k8s_state: str) -> None:
+    async def log_it(found: bool, k8s_state: str, password_gone: bool) -> None:
         # no admin acts here (the actor is empty): the row says it was the node's own request and from where; a name nobody
         # knew leaves no row.
         if found or k8s_state == "deleted":
-            await audit.record(
-                db, None, "node.delete", "node", name, {"by": "node", "k8s": k8s_state}, audit.client_ip(request)
-            )
+            details = {"by": "node", "k8s": k8s_state} | ({} if password_gone else {"k3s_cleanup": "left"})
+            await audit.record(db, None, "node.delete", "node", name, details, audit.client_ip(request))
 
     await remove_node(request.app.state, db, name, log_it)
     return Response(status_code=204)
 
 
 async def remove_node(
-    state, db: AsyncSession, name: str, audit: Callable[[bool, str], Awaitable[None]] | None = None
-) -> tuple[bool, str]:
+    state, db: AsyncSession, name: str, audit: Callable[[bool, str, bool], Awaitable[None]] | None = None
+) -> tuple[bool, str, bool]:
     """Removes everything the portal keeps for the node `name`: the Kubernetes Node object, the registry row, its identity
     (key and approval: a PC that comes back registers as a new node), the NIC for Wake-on-LAN, the size of the models volume, the assignment and the controllers' pauses, the node's keys in Redis
     (versions, live metrics, cleanup and relay orders). Returns (a registry row existed, state of the Kubernetes node:
-    deleted | absent | unavailable). The Kubernetes node goes first: a node the cluster still lists would be assigned
+    deleted | absent | unavailable, the k3s node password is gone: while it stays k3s refuses a PC reinstalled under this
+    name until «Подтвердить» clears it). The Kubernetes node goes first: a node the cluster still lists would be assigned
     again by the controllers between the two steps. `audit` is awaited with that result just before the commit, so
     the audit row and the database part of the removal are one transaction."""
-    k8s_state = await registry.delete_k8s_node(state.k8s, name)
+    k8s_state, password_gone = await registry.delete_k8s_node(state.k8s, name)
     try:
         found = await registry.remove(db, name, commit=False)
         await identity.forget(db, name)
         if audit is not None:
-            await audit(found, k8s_state)
+            await audit(found, k8s_state, password_gone)
         await db.commit()
     except Exception:
         await db.rollback()
         raise
     await registry.forget_live(state.redis, name)
-    return found, k8s_state
+    return found, k8s_state, password_gone

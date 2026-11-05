@@ -7,7 +7,8 @@
 # Что проверяется (у каждого провала печатаются причина и готовая команда исправления):
 #   1. 443/tcp и 6443/tcp слушаются на этом хосте; контейнер llm-main работает; портал отвечает на /readyz;
 #   2. DNS: PUBLIC_HOSTNAME разрешается в адрес главного; сертификат доверенный для этого хоста;
-#   3. для каждой ноды кластера: 18080/tcp (инференс);
+#   3. для каждой ноды кластера: 18080/tcp (инференс) и 18050/tcp (RPC split: туда ходит лидер на главном);
+#      в реестре главного есть образы ноды с тегом NODE_IMAGE_TAG;
 #   4. системные поды kube-system работают на llm-main, а не на ПК класса;
 #   5. локальный брандмауэр (ufw, firewalld), если он включён.
 #
@@ -230,7 +231,7 @@ if [ "$DNS_OK" = 1 ] && listening 443; then
   esac
 fi
 
-# ------------------------------------------------------------------ 3. ноды: 18080
+# ------------------------------------------------------------------ 3. ноды: 18080, 18050
 NODES=()
 if [ "$DOCKER_OK" = 1 ] && [ "$RUNNING" = 1 ]; then
   while read -r name internal external _; do
@@ -268,9 +269,44 @@ for entry in "${NODES[@]:-}"; do
          "Исправление (Linux-нода): sudo ufw allow from $MAIN_ADVERTISE_IP to any port 18080 proto tcp" \
          "Проверка маршрута: traceroute -n $addr; на самой ноде запустите node/diag.ps1 (Windows): он покажет, какого правила не хватает" ;;
   esac
+  # 18050: лидер split на главном (SPLIT_LEADER_ON_MAIN) ходит на него с адреса хоста, как и эта проверка. Отказ соединения значит, что
+  # сеть и брандмауэр пропускают: rpc-сервер работает только при split-развёртывании. Standalone-ноде порт не нужен, поэтому не провал.
+  case "$(tcp_probe "$addr" 18050)" in
+    open) ok "$label: 18050/tcp доступен (RPC split)" ;;
+    refused) ok "$label: 18050/tcp сеть доходит, порт никто не слушает (rpc-сервер работает только при split-развёртывании)" ;;
+    *) warn "$label: 18050/tcp недоступен с главного: лидер split на главном не достанет эту ноду" \
+         "Причина: маршрутизатор между подсетями не пропускает 18050, брандмауэр ноды не узнаёт адрес главного или это нода standalone (ей порт не нужен)." \
+         "Проверка: ip -4 route get $addr на главном: src должен быть адресом, который нода знает как --main; маршрут: traceroute -n $addr." \
+         "На ноде: node/diag.ps1 (Windows) покажет правило NSU-LLM-Node-RPC; Linux: sudo ./node/run-node.sh --sync-firewall."
+  esac
 done
 if [ "${#NODES[@]}" != 0 ]; then
   info "10250/tcp (kubelet) не проверяется: главному он не нужен (logs и exec идут через туннель ноды на 6443, metrics-server выключен); на адресе ПК он слушается только у ноды с --network host"
+fi
+
+# ------------------------------------------------------------------ 3a. образы нод в реестре главного
+# Тег NODE_IMAGE_TAG, которого нет в реестре, снаружи не виден: портал работает, а поды висят в ImagePullBackOff. Значения берутся
+# из portal.env работающего контейнера: это то, чем пользуется портал. Образа одного вида может не быть нарочно (класс только на
+# GPU не нуждается в -cpu, пока лидер split не на главном), поэтому это предупреждение, не провал.
+if [ "$DOCKER_OK" = 1 ] && [ "$RUNNING" = 1 ]; then
+  node_tag="$(docker exec "$CONTAINER" sed -n 's/^NODE_IMAGE_TAG=//p' /run/llm/portal.env 2>/dev/null | tail -n1)"
+  reg_port="$(docker exec "$CONTAINER" sed -n 's/^REGISTRY_PORT=//p' /run/llm/portal.env 2>/dev/null | tail -n1)"
+  reg_tags="$(docker exec "$CONTAINER" curl -s -m "$PROBE_TIMEOUT" "http://127.0.0.1:${reg_port:-5000}/v2/nsu-llm-node/tags/list" 2>/dev/null)"
+  if [ -z "$node_tag" ]; then
+    info "NODE_IMAGE_TAG не прочитан из контейнера $CONTAINER: образы нод в реестре не проверены"
+  elif ! grep -qF '"tags"' <<<"$reg_tags"; then
+    info "реестр главного не ответил на 127.0.0.1:${reg_port:-5000}: образы нод с тегом $node_tag не проверены"
+  else
+    for variant in cpu gpu; do
+      if grep -qF "\"$node_tag-$variant\"" <<<"$reg_tags"; then
+        ok "реестр главного: образ ноды $node_tag-$variant есть"
+      else
+        warn "реестр главного: нет образа ноды $node_tag-$variant (NODE_IMAGE_TAG=$node_tag): поды на нём не запустятся" \
+          "Теги реестра: $reg_tags" \
+          "Исправление: sudo ./main/install-main.sh --yes с IMAGE_SOURCE=pull положит образы версии чекаута в реестр и заменит старый NODE_IMAGE_TAG; свой тег положите в реестр сами (docs/release.md)."
+      fi
+    done
+  fi
 fi
 
 # ------------------------------------------------------------------ 4. системные поды на главном

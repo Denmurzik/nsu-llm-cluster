@@ -27,6 +27,13 @@
 #   Wake-on-LAN: физическая сетевая карта с адресом ноды получает «Wake on Magic Packet» и право будить ПК, быстрый
 #   запуск Windows выключается, MAC и подсеть уходят ноде (портал будит выключенный ПК). -PowerButton nothing (по
 #   умолчанию) — кнопка питания ничего не делает, -PowerButton keep — оставить как есть.
+#   Место на системном диске: перед установкой проверяется свободное место на диске каталога установки (обычно C:). Меньше
+#   -MinFreeGB (по умолчанию 14 ГБ: на ПК класса вся нода обязана уложиться в 16 ГБ диска) — ошибка, меньше -WarnFreeGB (по умолчанию 18 ГБ) —
+#   предупреждение; -MinFreeGB 0 отключает проверку. -Status сравнивает размер C:\ProgramData\NSU-LLM с этими 16 ГБ. -DeleteImageTar: удалить
+#   архив образа сразу после docker load (class-deploy передаёт его для архивов из своей раздачи; архив на сетевом пути не удаляется никогда).
+#   Диск дистрибутива WSL делается разреженным (wsl --manage <дистрибутив> --set-sparse true): удалённые образы и модели возвращают
+#   место Windows. -NoSparse не трогает диск. Временные файлы установщика (загрузка дистрибутива, копия архива образа с сетевого пути)
+#   лежат в <каталог установки>\tmp и удаляются после установки, в том числе при ошибке.
 #
 # Ответы сохраняются в C:\ProgramData\NSU-LLM\install.json (токен зашифрован DPAPI LocalMachine, файл доступен только
 # администраторам и SYSTEM),
@@ -44,6 +51,8 @@ param(
     [string]$AllowFrom = '',
     [string]$CaSha256 = '',
     [int]$MemoryGB = 0,
+    [int]$MinFreeGB = -1,
+    [int]$WarnFreeGB = -1,
     [string]$Distro = '',
     [string]$DistroSource = '',
     [string]$ImageTar = '',
@@ -62,6 +71,8 @@ param(
     [switch]$Status,
     [switch]$Uninstall,
     [switch]$KeepDistro,
+    [switch]$NoSparse,
+    [switch]$DeleteImageTar,
     [switch]$ViaTask,
     [switch]$FromTask
 )
@@ -94,6 +105,10 @@ $FwRuleRpc = 'NSU-LLM-Node-RPC'
 $SyncTaskName = 'NSU-LLM-Node-FwSync'                  # Docker Desktop: раз в минуту run-node.ps1 -SyncFirewall (для WSL это делает node-boot.ps1)
 $WslCreator = '{40E0AC32-46A5-438A-A0B2-2B479E8F2E90}'   # VMCreatorId WSL в Hyper-V firewall
 $MinWsl = [version]'2.4.4'                                # wsl --install --name/--location/--from-file
+$MinWslSparse = [version]'2.0.0'                          # wsl --manage <дистрибутив> --set-sparse true
+$DefaultMinFreeGB = 14                                    # меньше свободного места на системном диске установка не начинается
+$DefaultWarnFreeGB = 18                                   # меньше — предупреждение (модели пойдут в тот же диск)
+$FootprintLimitGB = 16                                    # вся нода (C:\ProgramData\NSU-LLM с диском дистрибутива) на ПК класса укладывается в 16 ГБ
 $MinDriver = 570                                          # образ собран на CUDA 12.8
 $UbuntuDistro = 'Ubuntu-24.04'
 $CurlExe = $(if ($env:NSU_LLM_CURL) { $env:NSU_LLM_CURL } else { 'curl.exe' })   # не алиас curl из PowerShell 5.1
@@ -104,6 +119,8 @@ $DesktopFix = 'Войдите в Windows под этой учётной запи
 if (-not $InstallDir) { $InstallDir = Join-Path $env:ProgramData 'NSU-LLM' }
 if (-not $WslConfigPath) { $WslConfigPath = Join-Path $env:USERPROFILE '.wslconfig' }
 $ScriptsDir = Join-Path $InstallDir 'scripts'
+$TmpDir = Join-Path $InstallDir 'tmp'                   # TEMP дочерних процессов установки (загрузка дистрибутива wsl --install); удаляется целиком
+$ImagesDir = Join-Path $InstallDir 'images'             # копия архива образа с сетевого пути; удаляется после docker load
 # wsl\ — диск дистрибутива: Secure-Dir не трогает его содержимое (право ВМ Hyper-V на ext4.vhdx нужно для запуска WSL).
 $SecureExclude = @('wsl')
 $AnswersPath = Join-Path $InstallDir 'install.json'     # сюда пишутся ответы этой машины
@@ -427,6 +444,115 @@ function Get-FsFormat([string]$p) {
     if ($env:NSU_LLM_TEST_FS) { return $env:NSU_LLM_TEST_FS }
     try { return ([IO.DriveInfo]::new([IO.Path]::GetPathRoot([IO.Path]::GetFullPath($p)))).DriveFormat } catch { return '' }
 }
+# ------------------------------------------------------------------ место на системном диске, диск дистрибутива, временные файлы
+# Свободное место (ГБ) на диске каталога установки: на нём лежат ext4.vhdx дистрибутива, образы и кэш моделей; обычно это C:.
+# $null, если определить нельзя. NSU_LLM_TEST_FREE_GB подменяет ответ в тестах.
+function Get-SystemFreeGB {
+    if ($env:NSU_LLM_TEST_FREE_GB) { return [double]$env:NSU_LLM_TEST_FREE_GB }
+    try { return [math]::Round(([IO.DriveInfo]::new([IO.Path]::GetPathRoot([IO.Path]::GetFullPath($InstallDir)))).AvailableFreeSpace / 1GB, 1) } catch { return $null }
+}
+function Get-DriveName { try { return ([IO.Path]::GetPathRoot([IO.Path]::GetFullPath($InstallDir))).TrimEnd('\') } catch { return 'C:' } }
+# 'low' (меньше -MinFreeGB), 'warn' (меньше -WarnFreeGB) или 'ok'; -MinFreeGB 0 отключает проверку, -WarnFreeGB 0 — только предупреждение.
+function Get-DiskVerdict($free) {
+    if ($null -eq $free -or $MinFreeGB -le 0) { return 'ok' }
+    if ($free -lt $MinFreeGB) { return 'low' }
+    if ($WarnFreeGB -gt 0 -and $free -lt $WarnFreeGB) { return 'warn' }
+    return 'ok'
+}
+$DiskFix = 'Освободите место на системном диске: Параметры, Система, Память, «Временные файлы» (и «Очистка диска» от имени администратора, кнопка «Очистить системные файлы»), удалите ненужное. Порог задаёт -MinFreeGB (по умолчанию 14 ГБ; 0 отключает проверку), предупреждение — -WarnFreeGB (18 ГБ).'
+# Сколько места занимает сама нода: каталог установки целиком (диск дистрибутива ext4.vhdx, скрипты, образы, остатки). Лимит $FootprintLimitGB ГБ.
+# NSU_LLM_TEST_FOOTPRINT_GB подменяет ответ в тестах. Диск Docker Desktop лежит в профиле пользователя и сюда не входит.
+function Get-FootprintGB {
+    if ($env:NSU_LLM_TEST_FOOTPRINT_GB) { return [double]$env:NSU_LLM_TEST_FOOTPRINT_GB }
+    if (-not (Test-Path -LiteralPath $InstallDir)) { return $null }
+    try { $sum = [double]0; foreach ($f in @(Get-ChildItem -LiteralPath $InstallDir -Recurse -File -Force -ErrorAction SilentlyContinue)) { $sum += Get-DiskBytes $f }; return [math]::Round($sum / 1GB, 1) } catch { return $null }
+}
+# Место файла на диске. Длина разреженного ext4.vhdx не уменьшается после удаления модели (на ноутбуке с RTX 4070: длина 31,9 ГБ, на диске 25,4 ГБ): считать по ней нельзя.
+function Get-DiskBytes($file) {
+    try {
+        if (-not ('NsuLlm.DiskSize' -as [type])) { Add-Type -Namespace NsuLlm -Name DiskSize -MemberDefinition '[DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] public static extern uint GetCompressedFileSizeW(string name, out uint high);' }
+        $hi = [uint32]0; $lo = [NsuLlm.DiskSize]::GetCompressedFileSizeW($file.FullName, [ref]$hi)
+        if ($lo -eq [uint32]::MaxValue -and [Runtime.InteropServices.Marshal]::GetLastWin32Error() -ne 0) { return [double]$file.Length }
+        return [double]$hi * 4294967296 + $lo
+    }
+    catch { return [double]$file.Length }
+}
+# Архив образа, уже загруженного в Docker, больше не нужен: удаляется сразу после docker load, если его просили (-DeleteImageTar).
+function Remove-LoadedImageTar {
+    if (-not $DeleteImageTar -or $DryRun -or -not $ImageTar) { return }
+    # Только локальный архив (раздача class-deploy на этом ПК): оригинал на сетевом пути не принадлежит установщику, удаляется лишь его копия в $ImagesDir.
+    if ($ImageTar.StartsWith('\\')) { return }
+    if (Test-Path -LiteralPath $ImageTar) {
+        Remove-Item -LiteralPath $ImageTar -Force -ErrorAction SilentlyContinue
+        if (Test-Path -LiteralPath $ImageTar) { Warn "архив образа $ImageTar не удалился: удалите его вручную, он занимает место" } else { Say "Архив образа $ImageTar удалён: образ уже загружен." }
+    }
+}
+# Перед установкой: мало места (меньше порога) — ошибка, если что-то надо ставить или скачивать ($needSpace), иначе предупреждение
+# (нода уже стоит, и запуск должен помочь разобраться, а не мешать); меньше рекомендованного — предупреждение.
+function Test-InstallDisk([bool]$needSpace) {
+    $free = Get-SystemFreeGB
+    if ($null -eq $free) { Warn "свободное место на диске $(Get-DriveName) не определилось, проверка пропущена"; return }
+    $drv = Get-DriveName
+    Say "Свободно на диске ${drv}: $free ГБ$(if ($MinFreeGB -gt 0) { " (нужно не меньше $MinFreeGB ГБ, рекомендуется $WarnFreeGB ГБ)" } else { ' (проверка места отключена: -MinFreeGB 0)' })"
+    $v = Get-DiskVerdict $free
+    if ($v -eq 'low' -and $needSpace) {
+        Fail "На диске ${drv} свободно $free ГБ, а для установки ноды нужно не меньше $MinFreeGB ГБ (дистрибутив WSL с Docker, образ ноды с копией при загрузке, модели): с заполненным диском WSL отвечает ошибками ввода-вывода, диск дистрибутива становится только для чтения и нода останавливается" $DiskFix
+    }
+    if ($v -eq 'low') { Warn "на диске ${drv} свободно $free ГБ, меньше порога $MinFreeGB ГБ: нода скоро остановится, когда диск заполнится. $DiskFix" }
+    elseif ($v -eq 'warn') { Warn "на диске ${drv} свободно $free ГБ, рекомендуется не меньше $WarnFreeGB ГБ: модели и образы заполнят диск. $DiskFix" }
+}
+# Диск дистрибутива (ext4.vhdx) растёт при записи и сам не уменьшается: после удаления образов и моделей место не возвращается Windows.
+# Разреженный (sparse) диск возвращает его. WSL 2.5 и новее отказывается включать sparse без --allow-unsafe (риск повреждения диска при
+# аварийном завершении); тогда команда повторяется с этим ключом, отказаться от всего: -NoSparse. Повторный запуск безопасен.
+function Set-DistroSparse {
+    if ($NoSparse) { Say "Разреженный диск дистрибутива отключён (-NoSparse): удалённые образы и модели не вернут место Windows."; return }
+    $cmd = @('wsl', '--manage', $Distro, '--set-sparse', 'true')
+    if ($DryRun) { Invoke-Change @('wsl', '--terminate', $Distro) '' | Out-Null; Invoke-Change $cmd '' | Out-Null; return }
+    $v = Get-WslVersion
+    if ($v -and $v -lt $MinWslSparse) { Warn "WSL $v не умеет делать диск разреженным (нужен $MinWslSparse или новее, wsl --update): удалённые образы и модели не вернут место Windows. Шаг пропущен."; return }
+    Invoke-Change @('wsl', '--terminate', $Distro) "wsl --terminate $Distro" -AllowFail | Out-Null   # sparse переключается у остановленного дистрибутива
+    $r = Invoke-Change $cmd 'wsl --manage --set-sparse' -AllowFail
+    if ($r.Code -ne 0 -and $r.Out -match 'allow-unsafe') {
+        Say 'WSL требует --allow-unsafe для разреженного диска: повторяю с ним (отказаться: -NoSparse).'
+        $cmd = $cmd + '--allow-unsafe'
+        $r = Invoke-Change $cmd 'wsl --manage --set-sparse --allow-unsafe' -AllowFail
+    }
+    # WSL 2.7.14 на ноутбуке с RTX 4070: после wsl --terminate диск занят (ERROR_SHARING_VIOLATION), ожидание не помогает (35 с), отпускает только wsl --shutdown.
+    if ($r.Code -ne 0 -and $r.Out -match 'SHARING_VIOLATION') {
+        Say 'Диск дистрибутива занят WSL: wsl --shutdown (остановит все дистрибутивы) и ещё одна попытка.'
+        Invoke-Change @('wsl', '--shutdown') 'wsl --shutdown' -AllowFail | Out-Null
+        $r = Invoke-Change $cmd 'wsl --manage --set-sparse' -AllowFail
+    }
+    if ($r.Code -eq 0) { Set-State 'DistroSparse' $true; Save-State; Say "Диск дистрибутива $Distro разреженный: место удалённых файлов возвращается Windows." }
+    else { Warn "диск дистрибутива $Distro не стал разреженным (wsl --manage --set-sparse, код $($r.Code)): место удалённых образов и моделей не вернётся Windows, следите за свободным местом. Вручную: wsl --manage $Distro --set-sparse true" }
+}
+# Временные файлы установщика: загрузки wsl --install/--update --web-download и docker load идут в TEMP дочерних процессов. На время шагов
+# TEMP и TMP указывают в $TmpDir, и он удаляется целиком после установки и при ошибке (так же копия архива с сетевого пути в $ImagesDir).
+# Чужие временные файлы (%TEMP% пользователя, C:\Windows\Temp) установщик не трогает.
+function Remove-InstallerTemp {
+    foreach ($d in @($TmpDir, $ImagesDir)) { if (Test-Path -LiteralPath $d) { Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue } }
+}
+function Invoke-WithInstallerTemp([scriptblock]$body) {
+    if ($DryRun) { Show-Dry "TEMP и TMP шагов установки: $TmpDir (удаляется после установки и при ошибке)"; return (& $body) }
+    $prev = @{ TEMP = $env:TEMP; TMP = $env:TMP }
+    Remove-InstallerTemp   # остатки прошлого запуска, который оборвался
+    try {
+        Initialize-InstallDir
+        New-Item -ItemType Directory -Force -Path $TmpDir | Out-Null
+        $env:TEMP = $TmpDir; $env:TMP = $TmpDir
+        return (& $body)
+    }
+    finally {
+        $env:TEMP = $prev.TEMP; $env:TMP = $prev.TMP
+        Remove-InstallerTemp
+    }
+}
+function Get-GbAnswer([int]$given, [string]$name, [int]$def) {
+    if ($given -ge 0) { return $given }
+    $v = Get-Prop $answers $name; $n = 0
+    if ($null -ne $v -and [int]::TryParse("$v", [ref]$n) -and $n -ge 0) { return $n }
+    return $def
+}
 function Find-ImageTar([string]$acc) {
     $tag = $(if ($acc -eq 'nvidia') { 'gpu' } else { 'cpu' })
     # Только каталог скрипта: родитель раздачи — C:\ProgramData, куда может писать любой пользователь, а образ запускается с
@@ -732,6 +858,10 @@ function Resolve-Answers {
     if ($pb -notin @('', 'nothing', 'keep')) { Fail "Неизвестное значение PowerButton=$pb в $AnswersIn" 'Укажите -PowerButton nothing или -PowerButton keep.' }
     $script:PowerButton = $pb
     $script:MemoryGB = [int](Pick $(if ($MemoryGB -gt 0) { "$MemoryGB" } else { '' }) 'MemoryGB' '0')
+    $script:MinFreeGB = Get-GbAnswer $MinFreeGB 'MinFreeGB' $DefaultMinFreeGB
+    $script:WarnFreeGB = Get-GbAnswer $WarnFreeGB 'WarnFreeGB' $DefaultWarnFreeGB
+    if ($WarnFreeGB -gt 0 -and $MinFreeGB -gt $WarnFreeGB) { $script:WarnFreeGB = $MinFreeGB }
+    if (-not $NoSparse -and (Get-Prop $answers 'NoSparse')) { $script:NoSparse = [switch]$true }
     if (-not $InsecureTls -and (Get-Prop $answers 'InsecureTls')) { $script:InsecureTls = [switch]$true }
     if (-not $Token) { $script:Token = $(if ($env:CLUSTER_TOKEN) { $env:CLUSTER_TOKEN } else { Get-SavedToken }) }
     if (-not $TaskPassword -and $env:NSU_LLM_TASK_PASSWORD) { $script:TaskPassword = $env:NSU_LLM_TASK_PASSWORD }
@@ -765,6 +895,34 @@ function Show-Status {
         if ($gpu.DriverMajor -lt $MinDriver) { Bad "$line — драйвер старее $MinDriver, GPU-нода невозможна" $DriverFix } else { Ok $line }
     }
     else { Info 'GPU NVIDIA не найден (nvidia-smi): нода работает как cpu' }
+
+    # Место на системном диске: на нём диск дистрибутива, образы и модели; с заполненным диском WSL получает ошибки ввода-вывода.
+    $freeGB = Get-SystemFreeGB; $drv = Get-DriveName
+    if ($null -eq $freeGB) { Info "свободное место на диске ${drv} не определилось" }
+    else {
+        $dv = Get-DiskVerdict $freeGB
+        if ($dv -eq 'low') { Bad "на диске ${drv} свободно $freeGB ГБ, меньше порога $MinFreeGB ГБ: нода остановится, когда диск заполнится" $DiskFix }
+        elseif ($dv -eq 'warn') { Info "на диске ${drv} свободно $freeGB ГБ, меньше рекомендованных $WarnFreeGB ГБ (порог ошибки $MinFreeGB ГБ): следите за местом. $DiskFix" }
+        else { Ok "на диске ${drv} свободно $freeGB ГБ" }
+    }
+    $fpGB = Get-FootprintGB
+    if ($null -ne $fpGB) {
+        if ($fpGB -gt $FootprintLimitGB) { Bad "нода занимает на диске $fpGB ГБ ($InstallDir$(if ($desk) { ', без диска Docker Desktop' })), больше лимита $FootprintLimitGB ГБ для ПК класса" "удалите ненужные модели (кнопка очистки на странице «Ноды» портала), образы прежних версий (docker image prune -a в $Distro), остатки установки в $TmpDir; диск дистрибутива должен быть разреженным (wsl --manage $Distro --set-sparse true)" }
+        else { Ok "нода занимает на диске $fpGB ГБ из $FootprintLimitGB ГБ ($InstallDir$(if ($desk) { ', без диска Docker Desktop' }))" }
+    }
+    if (-not $desk) {
+        $vd = @(Get-ChildItem -LiteralPath (Join-Path $InstallDir 'wsl') -Filter '*.vhdx' -File -Force -ErrorAction SilentlyContinue)
+        $vsz = $(if ($vd.Count) { ", файл диска $($vd[0].Name) занимает $([math]::Round((Get-DiskBytes $vd[0]) / 1GB, 1)) ГБ" } else { '' })
+        if (Get-Prop $state 'DistroSparse') { Info "диск дистрибутива разреженный: удалённые образы и модели возвращают место Windows$vsz" }
+        elseif ($NoSparse) { Info "разреженный диск дистрибутива отключён (-NoSparse)$vsz" }
+        else { Info "диск дистрибутива не разреженный (удалённые образы и модели не возвращают место Windows)$vsz; включить: $installer (или wsl --manage $Distro --set-sparse true)" }
+    }
+    foreach ($d in @($TmpDir, $ImagesDir)) {
+        if ((Test-Path -LiteralPath $d) -and -not (Get-InstallTaskRunning)) {
+            $left = [math]::Round((@(Get-ChildItem -LiteralPath $d -Recurse -File -Force -ErrorAction SilentlyContinue) | Measure-Object -Property Length -Sum).Sum / 1GB, 1)
+            Info "остатки установки в $d ($left ГБ): следующая установка удалит их сама, сейчас можно вручную: Remove-Item -Recurse -Force '$d'"
+        }
+    }
 
     $running = $false
     if ($desk) {
@@ -828,12 +986,13 @@ function Show-Status {
         }
         catch { Bad "права $wd не читаются: $($_.Exception.Message)" 'запустите -Status от имени администратора' }
     }
-    $it = Get-InstallTaskRunning
+    # Внутри самой задачи её вывод и есть этот журнал: чтение хвоста дописывало бы журнал само в себя без конца (30 ГБ за 20 минут на ноутбуке с RTX 4070).
+    $it = $(if ($FromTask) { $null } else { Get-InstallTaskRunning })
     $act = ''; try { $act = ([IO.File]::ReadAllText($InstallActionFile)).Trim() } catch { }
     $doneFile = Join-Path $RunDir 'run.done'
     if ($it) {
         Info "идёт $(if ($act -eq 'uninstall') { 'удаление' } else { 'установка' }) в разовой задаче $InstallTaskName (журнал $InstallLog); повторный запуск install-node.ps1 покажет ход"
-        if (Test-Path -LiteralPath $InstallLog) { Get-Content -LiteralPath $InstallLog -Tail 5 -Encoding UTF8 | ForEach-Object { Write-Host "     $_" } }
+        if (Test-Path -LiteralPath $InstallLog) { @(Get-Content -LiteralPath $InstallLog -Tail 5 -Encoding UTF8) | ForEach-Object { Write-Host "     $_" } }
     }
     elseif (Test-Path -LiteralPath $doneFile) {
         $dc = ''; try { $dc = ([IO.File]::ReadAllText($doneFile)).Trim() } catch { }
@@ -1185,6 +1344,9 @@ function Invoke-Install {
         $pullImage = $true   # умолчание: образ с главного сервера по локальной сети
     }
 
+    # --- место на системном диске: до любых изменений. Ошибка, только если что-то надо ставить или скачивать (нет дистрибутива или образа).
+    Test-InstallDisk (((-not $desk) -and -not $hasDistro) -or $pullImage -or $loadImage -or -not $haveImage)
+
     # --- задача планировщика: пароль нужен, только если задачу надо (пере)создать
     $user = Get-CurrentUser
     $task = Get-BootTask
@@ -1244,6 +1406,7 @@ function Invoke-Install {
             }
             if ($DistroSource) { Add-Step "установить дистрибутив $Distro из $DistroSource в $loc" { Invoke-Change @('wsl', '--install', '--from-file', $DistroSource, '--name', $Distro, '--location', $loc, '--no-launch') "Не удалось установить дистрибутив $Distro" "Проверьте файл $DistroSource (.wsl или .tar.gz с rootfs Ubuntu 24.04)." | Out-Null; Set-State 'CreatedDistro' $true; Save-State } }
             else { Add-Step "установить дистрибутив $UbuntuDistro под именем $Distro в $loc (из интернета)" { Invoke-Change @('wsl', '--install', $UbuntuDistro, '--name', $Distro, '--location', $loc, '--no-launch', '--web-download') "Не удалось установить дистрибутив $Distro" 'Нет интернета: скачайте образ Ubuntu 24.04 для WSL (.wsl) на другой машине и укажите -DistroSource <путь>.' | Out-Null; Set-State 'CreatedDistro' $true; Save-State } }
+            Add-Step "сделать диск дистрибутива разреженным (wsl --manage $Distro --set-sparse true): удалённые образы и модели возвращают место Windows" { Set-DistroSparse }
             Add-Step "проверить запуск $Distro" { Invoke-Change (Get-WslRoot @('true')) "Дистрибутив $Distro не запускается" "wsl -d $Distro -u root  (посмотрите сообщение об ошибке)" | Out-Null }
             if ($script:AccelFinal -eq 'nvidia') {
                 Add-Step 'проверить GPU в WSL' {
@@ -1254,6 +1417,9 @@ function Invoke-Install {
                     }
                 }
             }
+        }
+        if (-not $desk -and $hasDistro -and -not $NoSparse -and -not (Get-Prop $state 'DistroSparse')) {
+            Add-Step "сделать диск дистрибутива $Distro разреженным (wsl --manage $Distro --set-sparse true, остановит дистрибутив): удалённые образы и модели возвращают место Windows" { Set-DistroSparse }
         }
         if ($cfgChange) {
             Add-Step "записать $WslConfigPath (memory=${MemoryGB}GB, networkingMode=mirrored, без автоостановки) и перезапустить WSL (wsl --shutdown: остановит все дистрибутивы этого пользователя)" {
@@ -1272,7 +1438,9 @@ function Invoke-Install {
                 $env:WSLENV = ((@($env:WSLENV -split ':' | Where-Object { $_ }) + @('PROXY/u', 'NO_PROXY_LIST/u')) -join ':')
                 if ($DryRun) { Show-Dry "окружение для wsl-setup.sh через WSLENV: PROXY=$(Get-MaskedUrl $Proxy), NO_PROXY_LIST=$($script:NoProxyList)" }
             }
-            try { $r = Invoke-Change (Get-WslRoot @('env', "ACCEL=$($script:AccelFinal)", 'bash', $setup)) 'Настройка дистрибутива не удалась' "Смотрите вывод выше; повторить вручную: wsl -d $Distro -u root -e bash $setup" }
+            # HOST_MOUNT: диск Windows с диском дистрибутива; wsl-setup.sh следит за его свободным местом для отчёта ноды порталу.
+            $hostMount = $(if ((Get-DriveName) -match '^([A-Za-z]):$') { "/mnt/$($matches[1].ToLowerInvariant())" } else { '/mnt/c' })
+            try { $r = Invoke-Change (Get-WslRoot @('env', "ACCEL=$($script:AccelFinal)", "HOST_MOUNT=$hostMount", 'bash', $setup)) 'Настройка дистрибутива не удалась' "Смотрите вывод выше; повторить вручную: wsl -d $Distro -u root -e bash $setup" }
             finally { $env:PROXY = $prevEnv.PROXY; $env:NO_PROXY_LIST = $prevEnv.NO_PROXY_LIST; $env:WSLENV = $prevEnv.WSLENV }
             if ($DryRun -or $r.Out -match 'NSU_LLM_RESTART=1') {
                 Invoke-Change @('wsl', '--terminate', $Distro) "wsl --terminate $Distro завершился ошибкой" | Out-Null
@@ -1294,22 +1462,28 @@ function Invoke-Install {
                     Set-State 'ImageTarSig' (Get-FileSig $ImageTar); Save-State
                     $img = Get-ImageName $script:AccelFinal
                     if (-not (Test-WinImage $img)) { Fail "После загрузки $ImageTar образа $img нет" "Нужен архив nsu-llm-node-$(Get-NodeVersion)-$(if ($script:AccelFinal -eq 'nvidia') { 'gpu' } else { 'cpu' }).tar.gz; укажите его через -ImageTar." }
+                    Remove-LoadedImageTar
                 }
             }
         }
         elseif ($loadImage) {
             Add-Step "загрузить образ ноды из $ImageTar" {
                 $src = $ImageTar
-                if ($src.StartsWith('\\')) {
-                    $dst = Join-Path $InstallDir ('images\' + (Split-Path -Leaf $src))
-                    if ($DryRun) { Show-Dry "Copy-Item $src $dst" } else { New-Item -ItemType Directory -Force -Path (Split-Path $dst) | Out-Null; Copy-Item -Force -Path $src -Destination $dst }
-                    $src = $dst
+                $copied = $false
+                try {
+                    if ($src.StartsWith('\\')) {
+                        $dst = Join-Path $ImagesDir (Split-Path -Leaf $src)
+                        if ($DryRun) { Show-Dry "Copy-Item $src $dst (копия удаляется после docker load)" } else { New-Item -ItemType Directory -Force -Path (Split-Path $dst) | Out-Null; $copied = $true; Copy-Item -Force -Path $src -Destination $dst }
+                        $src = $dst
+                    }
+                    Invoke-Change (Get-WslRoot @('docker', 'load', '-i', (ConvertTo-WslPath $src))) 'docker load не удался' "Проверьте файл $ImageTar (docker save | gzip)." | Out-Null
                 }
-                Invoke-Change (Get-WslRoot @('docker', 'load', '-i', (ConvertTo-WslPath $src))) 'docker load не удался' "Проверьте файл $ImageTar (docker save | gzip)." | Out-Null
+                finally { if ($copied) { Remove-Item -LiteralPath $ImagesDir -Recurse -Force -ErrorAction SilentlyContinue } }   # копия в несколько ГБ не нужна ни после успеха, ни после ошибки
                 if (-not $DryRun) {
                     Set-State 'ImageTarSig' (Get-FileSig $ImageTar); Save-State
                     $img = Get-ImageName $script:AccelFinal
                     if (-not (Test-WslImage $img)) { Fail "После загрузки $ImageTar образа $img нет" "Нужен архив nsu-llm-node-$(Get-NodeVersion)-$(if ($script:AccelFinal -eq 'nvidia') { 'gpu' } else { 'cpu' }).tar.gz; укажите его через -ImageTar." }
+                    Remove-LoadedImageTar
                 }
             }
         }
@@ -1416,6 +1590,14 @@ function Invoke-Install {
             try { & (Join-Path $PSScriptRoot 'run-node.ps1') @p | Out-Host }
             catch { Fail "run-node.ps1: $($_.Exception.Message)" "Состояние: .\install-node.ps1 -Status; журнал ноды: $logs" }
         }
+        # Каждое обновление оставляло в диске дистрибутива образ прежней версии (несколько ГБ): после запуска ноды они не нужны.
+        Add-Step 'освободить место: удалить образы ноды прежних версий и висячие слои (docker rmi, docker image prune)' {
+            $keep = Get-ImageName $script:AccelFinal
+            $dk = $(if ($desk) { @('docker') } else { Get-WslRoot @('docker') })
+            $old = @((Invoke-Read ($dk + @('images', 'nsu-llm-node', '--format', '{{.Repository}}:{{.Tag}}'))).Out -split "`r?`n" | Where-Object { $_ -match '^nsu-llm-node:' -and $_ -ne $keep })
+            foreach ($o in $old) { Invoke-Change ($dk + @('rmi', $o)) "docker rmi $o" -AllowFail | Out-Null }   # образ, который держит контейнер, не удалится: так и надо
+            Invoke-Change ($dk + @('image', 'prune', '-f')) 'docker image prune' -AllowFail | Out-Null
+        }
     }
 
     # --- сводка и подтверждение
@@ -1447,6 +1629,7 @@ function Invoke-Install {
     }
     $save = [ordered]@{ Main = $Main; Mode = $Mode; Accel = $Accel; Docker = $script:DockerFinal; Name = $Name; Distro = $Distro; AllowFrom = $AllowFrom; CaSha256 = $CaSha256; MemoryGB = $MemoryGB
         NodeIp = $(if ($script:NodeIpExplicit -or (Get-Prop $answers 'NodeIp')) { $NodeIp } else { '' })
+        MinFreeGB = $(if ($MinFreeGB -ne $DefaultMinFreeGB) { $MinFreeGB } else { '' }); WarnFreeGB = $(if ($WarnFreeGB -ne $DefaultWarnFreeGB) { $WarnFreeGB } else { '' }); NoSparse = [bool]$NoSparse
         DistroSource = $DistroSource; ImageTar = $ImageTar; ImageSource = $ImageSource; InsecureTls = [bool]$InsecureTls; Proxy = $(if ($Proxy) { Get-MaskedUrl $Proxy } else { '' }); PowerButton = $PowerButton
         ProxyMachine = $proxyEnc; TokenMachine = $tokenEnc
     }
@@ -1466,12 +1649,13 @@ function Invoke-Install {
     }
     if ($script:UseTask) {
         $ta = [ordered]@{ NonInteractive = $true; Yes = $true; FromTask = $true; InstallDir = $InstallDir; NodeIp = $NodeIp; TaskPassword = $TaskPassword }
+        if ($DeleteImageTar) { $ta.DeleteImageTar = $true }   # задача выполняет шаги вместо этого сеанса: без флага архив остался бы до конца запуска
         if ($WslConfigPath -ne (Join-Path $env:USERPROFILE '.wslconfig')) { $ta.WslConfigPath = $WslConfigPath }
         return (Invoke-InstallTask $ta)
     }
 
     $n = 0
-    foreach ($s in $steps) { $n++; Say "[$n/$($steps.Count)] $($s.Title)"; & $s.Do | Out-Host }
+    Invoke-WithInstallerTemp { foreach ($s in $steps) { $n++; Say "[$n/$($steps.Count)] $($s.Title)"; & $s.Do | Out-Host } } | Out-Null
     if ($reboot) {
         Say "Перезагрузите ПК и запустите установку снова: powershell -ExecutionPolicy Bypass -File $Self  (ответы сохранены в $AnswersPath)"
         return 3010

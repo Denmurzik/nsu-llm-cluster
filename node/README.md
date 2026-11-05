@@ -31,8 +31,8 @@ docker build --provenance=false -f node/Dockerfile --target gpu --build-arg JOBS
 | `entrypoint.sh` | PID 1. Аргументы переданы (команда пода) — `exec "$@"`. `MODE=k3s` (по умолчанию) — `exec k3s agent`; `MODE=standalone` — `exec registrar.sh`. k3s обязан оставаться PID 1: эвакуацию корневого cgroup v2 он делает только в этом случае. |
 | `serve-llama.sh` | Запуск `llama-server` из переменных окружения (таблица ниже). |
 | `serve-rpc.sh` | `exec ggml-rpc-server -H 0.0.0.0 -p ${RPC_PORT:-18050} -t ${THREADS:-$(nproc)}`, плюс `-d $RPC_DEVICES` (например `CUDA0,CPU`: видеопамять и RAM ноды, порядок задаёт порядок `--tensor-split`) и `-c` при `RPC_CACHE=1` (кэш тензоров в `$LLAMA_CACHE/rpc`). Значения выставляет портал. `--print-cmd` печатает команду. Перед `exec` запускает в фоне `rpc-cache-gc.sh --loop`. |
-| `rpc-cache-gc.sh` | LRU-очистка кэша тензоров `ggml-rpc-server -c` (`$LLAMA_CACHE/rpc`): `RPC_CACHE_MAX_GIB` (по умолчанию 64, 0 — без лимита), `RPC_CACHE_MIN_FREE_PCT` (10 % файловой системы свободно), проход раз в `RPC_CACHE_GC_INTERVAL_S` (600 с). |
-| `registrar.sh` | Режим standalone: регистрация, heartbeat, запуск `llama-server` по `desired`. С `--wake-report` (k3s, фоном) один раз сообщает сетевую карту для Wake-on-LAN; с `--models-report` (k3s, фоном) раз в `MODELS_REPORT_S` (300 с) сообщает размер тома моделей. |
+| `rpc-cache-gc.sh` | LRU-очистка кэша тензоров `ggml-rpc-server -c` (`$LLAMA_CACHE/rpc`): `RPC_CACHE_MAX_GIB` (по умолчанию 5, 0 — без лимита), `RPC_CACHE_MIN_FREE_PCT` (10 % файловой системы свободно), проход раз в `RPC_CACHE_GC_INTERVAL_S` (600 с). |
+| `registrar.sh` | Режим standalone: регистрация, heartbeat, запуск `llama-server` по `desired`. С `--report` (k3s, фоном; старое имя `--wake-report`) получает и хранит ключ ноды, сообщает сетевую карту для Wake-on-LAN и образ; с `--models-report` (k3s, фоном) раз в `MODELS_REPORT_S` (300 с) сообщает размер тома моделей. |
 | `models-cleanup.sh` | Удаляет с тома моделей файлы, которые не нужны развёртыванию ноды, и кэш тензоров (задача 2-26): раздел «Очистка весов» ниже. |
 | `detect-accel.sh` | `nvidia` или `cpu`; с `--vram` — VRAM первой GPU в МиБ; с `--ram` — память контейнера в МиБ (`MemTotal`, в WSL это память WSL; меньше, если у контейнера есть лимит cgroup). |
 | `node-metrics.sh` | Сборщик мониторинга (задача 2-33). Запускается `entrypoint.sh` в фоне в обоих режимах (k3s и standalone) и раз в `METRICS_INTERVAL_S` секунд (20; допустимо 10-60) отправляет нагрузку ноды на `POST $MAIN_URL/api/nodes/$NODE_NAME/metrics` с токеном агента, как отчёт сетевой карты. Отправляет: по каждой GPU загрузку, VRAM занято/всего, температуру и мощность (`nvidia-smi`; чего он не отдаёт, то `null`), RAM занято/всего в пределах лимита контейнера (в WSL это память WSL), CPU % с прошлой отправки (`/proc/stat`), размер кэша моделей `$LLAMA_CACHE` и свободное место под ним (`du` раз в 5 минут), признаки «запущен `llama-server`» и «запущен `ggml-rpc-server`» (в режиме k3s процессы подов видны в контейнере ноды). Ответ не используется; портал отвечает 429 на отправку чаще раза в 5 секунд. Один сбой пишется в журнал один раз. `NODE_METRICS=0` выключает сборщик. `--once` печатает JSON одного замера. |
@@ -117,10 +117,11 @@ models-cleanup.sh --usage
   `$STATE_DIR/backend/key` (его монтируют поды k3s, `LLAMA_API_KEY_FILE`/`VLLM_API_KEY_FILE`). Ответ 403 с
   `detail.code = node_key_invalid` (ключ сброшен администратором или нода удалена): ключ удаляется, нода регистрируется заново
   и ждёт подтверждения (`"approved": false` в ответах). Регистрация без ключа несёт `X-Node-Enroll-Nonce` (`$STATE_DIR/enroll.nonce`, до сохранения ключа): потерянный ответ повторяется и получает новый ключ вместо 409. В режиме k3s `registrar.sh --report` сначала вызывает
-  `POST /api/nodes/enroll` `{"name"}` и остаётся в фоне: если ключа не стало, регистрирует ноду снова.
+  `POST /api/nodes/enroll` `{"name"}`, потом шлёт отчёты и остаётся в фоне: раз в `ENROLL_RETRY_S` (60 с) подтверждает ключ и заменяет потерянный или отвергнутый. `entrypoint.sh` перезапускает его, если он завершился.
 * `POST /api/nodes/register` `{"name","url","accel","vram_mib"|null,"ram_mib","version"}` →
-  `{"ok":true,"heartbeat_interval":15,"approved":true|false,"node_key"?}`; `url = http://$NODE_IP:$INFER_PORT`. Занятое имя без
-  ключа: 409 `node_name_taken`.
+  `{"ok":true,"heartbeat_interval":15,"approved":true|false,"node_key"?}`; `url = http://$NODE_IP:$INFER_PORT`. Известное имя без
+  ключа: заявка (ключ только для heartbeat, `approved: false`, администратор выбирает её на «Нодах»); 409 `node_name_taken` только сверх 10 заявок.
+* `GET /api/nodes/<name>/known` → `{"known","own_key","own_claim","approved","approval_required","message"}`: `run-node` печатает перед запуском, что будет и что нажать.
 * `POST /api/nodes/heartbeat` `{"name","applied_spec_hash"|null}` → `{"ok":true,"heartbeat_interval":15,"desired":null|{…}}`;
   404 — зарегистрироваться заново. В `desired` есть `backend_api_key`: `registrar.sh` передаёт его `serve-llama.sh`
   в переменной окружения `LLAMA_API_KEY` (не в командной строке) и перезапускает сервер при его смене; `/health` ключа не требует.

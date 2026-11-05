@@ -1,0 +1,14 @@
+{
+  "version": "0.2.1",
+  "created": "2026-11-06T06:25:29Z",
+  "git_commit": "5d895ab989522382f4bace7cdf70f36caf5d2e0e",
+  "ghcr_owner": "denmurzik",
+  "llama_cpp": "b12033",
+  "k3s": "v1.36.5+k3s1",
+  "moving_tags": false,
+  "images": {
+    "main": {"ref": "ghcr.io/denmurzik/nsu-llm-main:0.2.1", "digest": "sha256:534527ee6d49ace9a4b46e3a8d51d37e1e33448a093eca5e64dcb16fe8b6b06c", "size_bytes": 679274476},
+    "node-cpu": {"ref": "ghcr.io/denmurzik/nsu-llm-node:0.2.1-cpu", "digest": "sha256:e3ae7170eaf7ab2cfbc277e9094ada4fae8ff1260fe0318d79b80bf90511c21f", "size_bytes": 326013521},
+    "node-gpu": {"ref": "ghcr.io/denmurzik/nsu-llm-node:0.2.1-gpu", "digest": "sha256:4ab2fcf6ca4ef3b35ec513aa0ee3a96f61407659b686f2eb7e98c39cd7baf253", "size_bytes": 2406628320}
+  }
+}

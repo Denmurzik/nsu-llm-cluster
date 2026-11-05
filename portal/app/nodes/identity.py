@@ -11,9 +11,10 @@ A new name waits for the admin's approval when the setting `node_approval_requir
 itself (heartbeat, metrics, NIC, image), but it gets no deployment, no LiteLLM backend, no backend key and no mirror
 token until «Подтвердить» on the «Ноды» page.
 
-Claims (fix rounds 1-2). A registration of a name the portal knows but that has no key — a node of before (legacy) from
-an address the portal does not know for it or after the migration window, a name whose key the admin reset — does not
-touch the name: it is kept as a *claim* (table node_claims) with a key of its own. The claim's key only heartbeats
+Claims (fix rounds 1-2, task B2). A registration without a key of a name the portal knows — a node of before (legacy) from
+an address the portal does not know for it or after the migration window, a name whose key the admin reset, a name with
+a key whose PC was reinstalled and lost it — does not touch the name: it is kept as a *claim* (table node_claims) with a
+key of its own, so every such PC has a visible way back: the admin's «Сделать нодой» on the «Ноды» page. The claim's key only heartbeats
 (`approved: false`, no deployment, the registry record is not touched). A name keeps several claims (one per address, at
 most MAX_CLAIMS, each for CLAIM_TTL_S), never first-wins: the admin compares each claim's address with the addresses the
 portal knows for the name and picks one («Сделать нодой», never in the bulk approval) or rejects them. A claim refused at
@@ -74,21 +75,23 @@ CLAIM_TTL_S = 7 * 86400  # a claim the admin did not pick in this time is droppe
 # the codes of a 403 (detail.code): the node acts on them (registrar.sh drops a key the portal answers invalid)
 REQUIRED = "node_key_required"  # the name has a key (or its migration window is over); the call came without one
 INVALID = "node_key_invalid"  # the key does not match the name (reset by the admin, the node deleted, or a foreign key)
-TAKEN = "node_name_taken"  # a registration without a key of a name that has one (or a claim waiting for the admin)
+TAKEN = "node_name_taken"  # a registration refused: the name's claims are at MAX_CLAIMS, or a concurrent first registration won
 UNKNOWN = "node_unknown"  # no identity of that name: the node has to register first (register / enroll)
 PENDING = "node_pending"  # the call needs an approved node (stop, delete; a claim may only heartbeat)
 
 _MESSAGES = {
-    REQUIRED: "У ноды «{name}» есть свой ключ (или закончился срок перехода на ключи), а запрос пришёл без него "
-    "(X-Node-Key). Обновите скрипты ноды (run-node) вместе с образом или переустановите ноду.",
+    REQUIRED: "Портал знает ноду «{name}», а запрос пришёл без её ключа (X-Node-Key). Нода получает ключ сама при старте "
+    "контейнера: если ключ потерян (ПК переустановлен, данные удалены), на странице «Ноды» в строке «{name}» появится заявка, "
+    "администратор нажимает «Сделать нодой». Заявки нет: перезапустите ноду (run-node) и посмотрите журнал контейнера.",
     INVALID: "Ключ ноды «{name}» не подходит: администратор сбросил его или удалил ноду. Нода зарегистрируется "
     "заново и будет ждать подтверждения на странице «Ноды».",
-    TAKEN: "Имя «{name}» уже занято другой нодой со своим ключом или ждёт подтверждения. Если это та же машина, "
-    "сбросьте ключ ноды на странице «Ноды» («Сбросить ключ ноды») и подтвердите её после повторной регистрации.",
-    UNKNOWN: "Портал не знает ноду «{name}»: она регистрируется при старте своего контейнера (агентским токеном). "
-    "Перезапустите ноду или обновите её образ.",
-    PENDING: "Нода «{name}» ждёт подтверждения администратора (страница «Ноды», «Подтвердить»): до него ей доступен "
-    "только heartbeat, а остановить или удалить ноду может только подтверждённая нода своим ключом или администратор.",
+    TAKEN: "На имя «{name}» уже слишком много заявок (или одновременно идёт другая регистрация). Администратору: страница "
+    "«Ноды», строка «{name}», «Заявки»: отклоните лишние, эта нода повторит регистрацию сама.",
+    UNKNOWN: "Портал не знает ноду «{name}»: она регистрируется при старте своего контейнера (агентским токеном) и затем "
+    "появляется на странице «Ноды». Перезапустите ноду (run-node) или обновите её образ.",
+    PENDING: "Нода «{name}» ждёт подтверждения администратора (страница «Ноды»: «Подтвердить», для заявки «Сделать нодой»): "
+    "до него ей доступен только heartbeat, а остановить или удалить ноду может только подтверждённая нода своим ключом или "
+    "администратор («Удалить из кластера»).",
 }
 
 
@@ -257,11 +260,12 @@ async def enroll(request: Request, db: AsyncSession, name: str) -> Checked:
 
     With a key: the same node again (or its claim). Without a key:
       - a new name gets a key (approved unless `node_approval_required`);
-      - a name with a key: 409 node_name_taken, unless it is the same registration again (the client's nonce of the one
-        that got the key, within ENROLL_RETRY_S, the key never used: its reply got lost), which gets a new key;
-      - a name without a key: an approved legacy name in its migration window, or one the admin approved before it ever
-        registered, gets the key from its known address and keeps the approval; anything else becomes a claim, kept apart
-        from the name until the admin approves it (one claim at a time: another is 409 unless it is the same nonce).
+      - a name with a key: the same registration again (the client's nonce of the one that got the key, within
+        ENROLL_RETRY_S, the key never used: its reply got lost) gets a new key; anything else (the PC was reinstalled and
+        lost its key, or somebody else with the agent token) is a claim, the name and its key stay as they are;
+      - a name without a key: an approved legacy name in its migration window, or a row approved before it ever registered
+        (older portals made such rows), gets the key from its known address and keeps the approval; anything else is a claim.
+    A claim is kept apart from the name until the admin picks it (409 only at MAX_CLAIMS).
     The new key is returned once (Checked.issued) and written to the audit log as `node.enroll` (without the key)."""
     name = name.lower()
     state = request.app.state
@@ -284,13 +288,12 @@ async def enroll(request: Request, db: AsyncSession, name: str) -> Checked:
         if _same(nonce_digest, row.key_nonce_hash) and row.key_used_at is None and _within_retry(row.key_issued_at, now):
             how = "repeated"  # the reply of the first registration got lost
         else:
-            await db.rollback()
-            raise refuse(TAKEN, name, 409)
+            return await _claim(request, db, row, key, nonce_digest, now)
     else:
         days = await migration_days(state)
         if row.legacy:
             in_window = row.approved and migration_open(row, days)
-        else:  # approved by the admin before it ever registered (a Kubernetes node of an old image): the same window
+        else:  # a row an older portal's approval made before the node ever registered: the same window
             in_window = row.approved and days > 0 and _within(row.approved_at, now, days * 86400)
         if in_window and await _from_known_address(request, db, row):
             how = "migrated" if row.legacy else "approved before"
@@ -373,27 +376,29 @@ async def backend_keys(db: AsyncSession) -> dict[str, str]:
 
 
 class NotRegistered(LookupError):
-    """«Подтвердить» for a name that never registered (no identity, no Kubernetes node), or that did not register again
-    after its key was reset (its registration comes as a claim to pick)."""
+    """«Подтвердить» for a name that never registered (no identity: a Kubernetes node too, an approval must not leave a row
+    without a key that the real node then has to fight), or that did not register again after its key was reset (its
+    registration comes as a claim to pick)."""
 
 
 class ClaimsPending(ValueError):
-    """«Подтвердить» without a claim for a name that has claims: the admin has to pick one."""
+    """«Подтвердить» without a claim for a name without a key that has claims: the admin has to pick one."""
 
 
 class NoSuchClaim(LookupError):
     """The claim the admin picked is not (or no longer) there."""
 
 
-async def approve(db: AsyncSession, name: str, by: str, k8s=None, claim_id: int | None = None) -> NodeIdentity:
+async def approve(db: AsyncSession, name: str, by: str, claim_id: int | None = None) -> NodeIdentity:
     """Admin: the node may serve.
 
     - `claim_id`: that claim becomes the name's key (its holder is the node from now on); the other claims are rejected, and
       the registry record of the name is dropped, so the node registers again with its own url.
-    - Without `claim_id`: a waiting new node (it has its key), or a Kubernetes node that never registered (an old image: a
-      row without a key, its registration from its known address then keeps the approval for node_key_migration_days).
-      A name with claims: ClaimsPending (pick one). A name without a key that is not such a Kubernetes node (after a reset:
-      its registration comes as a claim): NotRegistered.
+    - Without `claim_id`: the holder of the name's key, a waiting new node; claims on the name stay for the admin, so one POST
+      with the agent token cannot make a node wait. A name without a key and with claims: ClaimsPending (pick one). A name
+      that never registered, or without a key after a reset (its registration comes as a claim): NotRegistered; no row
+      without a key is created here.
+    The caller drops the node password k3s keeps for the name (api/admin_node_identity.py): a new agent has a new one.
     The caller writes the audit row and commits."""
     name = name.lower()
     row = await db.get(NodeIdentity, name)
@@ -412,21 +417,10 @@ async def approve(db: AsyncSession, name: str, by: str, k8s=None, claim_id: int 
         row.legacy = False
         await db.execute(delete(NodeClaim).where(NodeClaim.name == name))
         await db.execute(delete(StandaloneNode).where(StandaloneNode.name == name))
-    elif claims:
+    elif claims and (row is None or row.key_hash is None):
         raise ClaimsPending(name)
-    elif row is None:
-        in_cluster = False
-        if k8s is not None:
-            try:
-                in_cluster = any(n.name.lower() == name for n in await k8s.list_nodes())
-            except Exception as exc:  # noqa: BLE001 - nothing to approve that the portal cannot see
-                log.info("approve %s: the cluster does not answer: %s", name, exc)
-        if not in_cluster:
-            raise NotRegistered(name)
-        row = NodeIdentity(name=name, created_at=now)
-        db.add(row)
-    elif row.key_hash is None and not row.approved:
-        raise NotRegistered(name)  # reset and not registered again yet: its registration comes as a claim
+    elif row is None or (row.key_hash is None and not row.approved):
+        raise NotRegistered(name)
     row.approved, row.approved_at, row.approved_by = True, now, by[:320]
     return row
 
@@ -465,3 +459,40 @@ async def forget(db: AsyncSession, name: str) -> None:
     """The node is removed (app.nodes.routes.remove_node): its identity goes with it. Does not commit."""
     await db.execute(delete(NodeClaim).where(NodeClaim.name == name.lower()))
     await db.execute(delete(NodeIdentity).where(NodeIdentity.name == name.lower()))
+
+
+async def name_state(request: Request, db: AsyncSession, name: str) -> dict[str, Any]:
+    """What the portal knows about `name`, for the node's installer (run-node asks before it starts the container, task
+    B2): whether the caller already holds its key (or a claim's), and in Russian what will happen and what the admin clicks."""
+    name = name.lower()
+    row = await db.get(NodeIdentity, name)
+    required = await approval_required(request.app.state)
+    claims = await live_claims(db, name) if row is not None else []
+    key = presented_key(request)
+    digest = key_hash(key) if key is not None else None
+    own = row is not None and _same(digest, row.key_hash)
+    own_claim = any(_same(digest, c.key_hash) for c in claims)
+    if own:
+        message = "" if row.approved else f"Нода «{name}» ждёт подтверждения: страница «Ноды» портала, кнопка «Подтвердить»."
+    elif own_claim:
+        message = f"Заявка этого ПК на имя «{name}» ждёт администратора: страница «Ноды», строка «{name}», «Заявки», «Сделать нодой»."
+    elif row is None:
+        message = (
+            f"Имя «{name}» свободно: после запуска нода появится на странице «Ноды» портала, администратор нажимает «Подтвердить»."
+            if required
+            else f"Имя «{name}» свободно: нода подключится сама (подтверждение новых нод выключено)."
+        )
+    else:
+        message = (
+            f"Имя «{name}» уже есть на главном, а ключа этой ноды на ПК нет. Если это та же машина (переустановка, потерянные "
+            f"данные), ничего удалять не нужно: после запуска на странице «Ноды» в строке «{name}» появится заявка, "
+            "администратор сверяет адрес и нажимает «Сделать нодой». Если это другой ПК, задайте другое имя."
+        )
+    return {
+        "known": row is not None,
+        "own_key": own,
+        "own_claim": own_claim,
+        "approved": bool(row.approved) if row is not None else False,
+        "approval_required": required,
+        "message": message,
+    }

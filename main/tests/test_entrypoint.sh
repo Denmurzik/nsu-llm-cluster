@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Entrypoint and Caddyfile tests against the built image (nsu-llm-main:0.2.0), mostly in dry-run mode: no k3s is started.
-# Build first: docker build --provenance=false -f main/Dockerfile -t nsu-llm-main:0.2.0 .
+# Entrypoint and Caddyfile tests against the built image (nsu-llm-main:0.2.1), mostly in dry-run mode: no k3s is started.
+# Build first: docker build --provenance=false -f main/Dockerfile -t nsu-llm-main:0.2.1 .
 set -uo pipefail
 export MSYS_NO_PATHCONV=1
 
-IMAGE="${IMAGE:-nsu-llm-main:0.2.0}"
+IMAGE="${IMAGE:-nsu-llm-main:0.2.1}"
 VOL="nsu-llm-it14-ep-data-$$"
 CERTS_DIR="$(mktemp -d)"
 CERTS_MOUNT="$CERTS_DIR"; command -v cygpath >/dev/null 2>&1 && CERTS_MOUNT="$(cygpath -m "$CERTS_DIR")"
@@ -353,6 +353,14 @@ out9="$(ep_run "${BASE_ENV[@]}" -- 'grep ^BACKEND_API_KEY= /var/lib/llm/secrets.
 check "portal.env carries the same backend key as secrets.env" $? "$out9"
 grep -q "$(grep -m1 '^BACKEND_API_KEY=' <<<"$out1")" <<<"$out9"
 check "backend key survives a restart" $?
+
+# 9a. the backend key of a split leader on main: own key, in portal.env and in the file the pod mounts, for root only
+grep -Eq '^MAIN_BACKEND_KEY=[0-9a-f]{64}$' <<<"$out1"
+check "main's backend key is 64 hex chars in secrets.env" $? "$out1"
+out9a="$(ep_run "${BASE_ENV[@]}" -- 'grep ^MAIN_BACKEND_KEY= /var/lib/llm/secrets.env; grep ^MAIN_BACKEND_KEY= /run/llm/portal.env; echo "MAIN_BACKEND_KEY=$(cat /var/lib/llm-node/backend/key)"; stat -c "mode=%a" /var/lib/llm-node/backend/key /var/lib/llm-node/backend')"
+[ "$(grep -c '^MAIN_BACKEND_KEY=' <<<"$out9a")" = 3 ] && [ "$(grep '^MAIN_BACKEND_KEY=' <<<"$out9a" | sort -u | wc -l)" = 1 ] \
+  && [ "$(grep -c '^mode=' <<<"$out9a")" = 2 ] && ! grep -q '^mode=[0-9][1-9]' <<<"$out9a"
+check "main's backend key reaches the portal and the file of the leader pod, closed to everyone but root" $? "$out9a"
 
 # 10. a changed Postgres password with an existing data volume is refused (initdb does not run again)
 PGDIR=/var/lib/rancher/k3s/storage/pvc-x_llm_data-postgres-0

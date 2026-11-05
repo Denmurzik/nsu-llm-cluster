@@ -96,6 +96,19 @@ proc_up() {
   echo false
 }
 
+# Free bytes of the Windows disk under the WSL disk: wsl-setup.sh makes the distro write HOST_DISK_FILE (JSON with free_bytes and at, epoch
+# seconds) every minute. Inside WSL df shows the virtual disk (up to 1 TB), not the disk that ext4.vhdx fills, so the host number wins when it is
+# fresh (HOST_DISK_MAX_AGE_S, 15 min). Prints the number; fails without the file, with a stale or malformed one (Docker Desktop, Linux).
+host_free() {
+  local f="${HOST_DISK_FILE:-$STATE_DIR/host-disk}" at free
+  [ -s "$f" ] || return 1
+  at="$(jq -r '.at // empty' <"$f" 2>/dev/null)"
+  free="$(jq -r '.free_bytes // empty' <"$f" 2>/dev/null)"
+  [[ "$at" =~ ^[0-9]+$ ]] && [[ "$free" =~ ^[0-9]+$ ]] || return 1
+  [ $(($(date +%s) - at)) -le "${HOST_DISK_MAX_AGE_S:-900}" ] || return 1
+  echo "$free"
+}
+
 LAST_DISK_AT=-100000
 MODELS_BYTES=null
 DISK_FREE=null
@@ -105,12 +118,15 @@ refresh_disk() {
   LAST_DISK_AT=$SECONDS
   MODELS_BYTES=null
   DISK_FREE=null
+  local size free host
+  if host="$(host_free)"; then DISK_FREE="$host"; fi
   [ -d "$LLAMA_CACHE" ] || return 0
-  local size free
   size="$(timeout "${DU_TIMEOUT_S:-20}" du -sb "$LLAMA_CACHE" 2>/dev/null | cut -f1)"
   [[ "$size" =~ ^[0-9]+$ ]] && MODELS_BYTES="$size"
-  free="$(df -Pk "$LLAMA_CACHE" 2>/dev/null | awk 'NR == 2 {print $4 * 1024}')"
-  [[ "$free" =~ ^[0-9]+$ ]] && DISK_FREE="$free"
+  if [ "$DISK_FREE" = null ]; then
+    free="$(df -Pk "$LLAMA_CACHE" 2>/dev/null | awk 'NR == 2 {print $4 * 1024}')"
+    [[ "$free" =~ ^[0-9]+$ ]] && DISK_FREE="$free"
+  fi
 }
 
 # sample CPU_PCT -> the JSON of one sample on stdout
@@ -175,8 +191,13 @@ push() {
   HTTP_CODE="${out##*$'\n'}"
   # a key the portal refuses (reset by the admin, the node deleted) goes: the registrar registers the node again
   if [ "$HTTP_CODE" = 403 ] && [ -n "$key" ] && [[ "${out%$'\n'*}" == *'"node_key_invalid"'* ]]; then
-    log "the portal refused this node's key: it is dropped, the registrar registers the node again"
-    rm -f "$KEY_FILE" "$STATE_DIR/backend/key"
+    # only the key that was refused: the registrar may have kept a new one while this call was on its way (task B1)
+    local now=""
+    [ -s "$KEY_FILE" ] && IFS= read -r now < "$KEY_FILE"
+    if [ "$now" = "$key" ]; then
+      log "the portal refused this node's key: it is dropped, the registrar registers the node again"
+      rm -f "$KEY_FILE" "$STATE_DIR/backend/key"
+    fi
   fi
   [ "$HTTP_CODE" = 204 ]
 }

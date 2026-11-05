@@ -103,7 +103,7 @@ fi
 
 # ------------------------------------------------------------------ секреты
 SECRET_NAMES=(LITELLM_MASTER_KEY LITELLM_SALT_KEY POSTGRES_PASSWORD LITELLM_DB_PASSWORD PORTAL_DB_PASSWORD CLUSTER_TOKEN AGENT_TOKEN BACKEND_API_KEY
-  HF_MIRROR_TOKEN REDIS_PASSWORD REGISTRY_PASSWORD HF_MIRROR_ADMIN_TOKEN)
+  HF_MIRROR_TOKEN REDIS_PASSWORD REGISTRY_PASSWORD HF_MIRROR_ADMIN_TOKEN MAIN_BACKEND_KEY)
 PG_DATA_GLOB="${PG_DATA_GLOB:-/var/lib/rancher/k3s/storage/pvc-*_llm_data-postgres-*}"
 K3S_TOKEN_FILE=/var/lib/rancher/k3s/server/token
 
@@ -122,7 +122,7 @@ fi
 generate() {
   case "$1" in
     LITELLM_MASTER_KEY|LITELLM_SALT_KEY) echo "sk-$(openssl rand -hex 16)" ;;
-    CLUSTER_TOKEN|AGENT_TOKEN|BACKEND_API_KEY) echo "$(openssl rand -hex 32)" ;;
+    CLUSTER_TOKEN|AGENT_TOKEN|BACKEND_API_KEY|MAIN_BACKEND_KEY) echo "$(openssl rand -hex 32)" ;;
     # вид токена Hugging Face (hf_ и не меньше 34 букв и цифр): только такой llama.cpp отправляет зеркалу
     HF_MIRROR_TOKEN) echo "hf_$(openssl rand -hex 20)" ;;
     *) openssl rand -hex 24 ;;
@@ -194,6 +194,15 @@ if [ ! -f "$SECRETS_FILE" ] || [ "$(cat "$SECRETS_FILE")" != "${content%$'\n'}" 
   printf '%s' "$content" >"$SECRETS_FILE.tmp"
   mv "$SECRETS_FILE.tmp" "$SECRETS_FILE"
 fi
+
+# ------------------------------------------------------------------ ключ бэкенда лидера split на главном
+# Лидер split-группы на главном (SPLIT_LEADER_ON_MAIN) читает ключ из того же файла, что и под на ноде (builders.BACKEND_KEY_HOST_DIR):
+# hostPath пода на llm-main это файловая система этого контейнера. Ключа ноды у главного нет, этот свой, нодам он не выдаётся; его
+# знают только LiteLLM и портал (MAIN_BACKEND_KEY). Каталог только для root (umask 077), файл пишется при каждом старте.
+main_key_dir=/var/lib/llm-node/backend
+mkdir -p "$main_key_dir"
+printf '%s' "$MAIN_BACKEND_KEY" >"$main_key_dir/key.tmp"
+mv "$main_key_dir/key.tmp" "$main_key_dir/key"
 
 # ------------------------------------------------------------------ учётка записи в реестр
 # bcrypt-хеш REGISTRY_PASSWORD (caddy hash-password, пароль через stdin) для Secret llm-registry-auth. Хеш с солью пересчитывается
@@ -285,7 +294,7 @@ for v in OIDC_ISSUER OIDC_CLIENT_ID; do
   [ -n "${!v:-}" ] || echo "ПРЕДУПРЕЖДЕНИЕ: не задана переменная $v: войти в портал нельзя, пока её нет в .env (install-main.sh спрашивает её; пример для NSU ID в .env.example)." >&2
 done
 : "${NODE_IMAGE_REPO:=nsu-llm-node}"
-: "${NODE_IMAGE_TAG:=0.2.0}"
+: "${NODE_IMAGE_TAG:=0.2.1}"
 : "${INFER_PORT:=18080}"
 : "${RPC_PORT:=18050}"
 : "${MAX_KEYS_PER_USER:=5}"
@@ -303,7 +312,7 @@ MIGRATIONS_DIR=/opt/llm/portal
 # requirepass Redis (REDIS_PASSWORD, common-25-redis): тот же адрес у LiteLLM (GATEWAY_STATS_REDIS_URL в common-30-litellm)
 REDIS_URL="redis://:${REDIS_PASSWORD}@127.0.0.1:6379/0"
 
-portal_vars=(DATABASE_URL LITELLM_MASTER_KEY AGENT_TOKEN CLUSTER_TOKEN NODE_LEGACY_TOKEN OIDC_ISSUER OIDC_CLIENT_ID OIDC_CLIENT_SECRET LOGIN_PROVIDER_NAME OIDC_REDIRECT_URI OIDC_POST_LOGOUT_REDIRECT_URI
+portal_vars=(DATABASE_URL LITELLM_MASTER_KEY MAIN_BACKEND_KEY SPLIT_LEADER_ON_MAIN AGENT_TOKEN CLUSTER_TOKEN NODE_LEGACY_TOKEN OIDC_ISSUER OIDC_CLIENT_ID OIDC_CLIENT_SECRET LOGIN_PROVIDER_NAME OIDC_REDIRECT_URI OIDC_POST_LOGOUT_REDIRECT_URI
   BACKEND_API_KEY PUBLIC_HOSTNAME MAIN_ADVERTISE_IP MAIN_OWN_CERT ADMIN_EMAILS ADMIN_REQUIRE_EMAIL_VERIFIED NODE_IMAGE_REPO NODE_IMAGE_TAG INFER_PORT RPC_PORT HF_TOKEN
   MAX_KEYS_PER_USER KEY_RPM_LIMIT KEY_TPM_LIMIT DEFAULT_MODEL_NAME DEFAULT_MODEL_REPO DEFAULT_MODEL_FILE
   DEFAULT_CTX_PER_REQUEST DEFAULT_PARALLEL WEB_DIST MIGRATIONS_DIR REDIS_URL PORTAL_WORKERS LITELLM_WORKERS QUEUE_FACTOR

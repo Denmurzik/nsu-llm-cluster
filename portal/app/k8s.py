@@ -3,7 +3,7 @@
 import asyncio
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -101,6 +101,8 @@ class PodInfo:
     message: str | None
     workload: str | None = None  # the object the pod belongs to (L_NAME)
     started_at: float | None = None  # start of the running container (epoch seconds), None while it does not run
+    # annotation A_PORT of an inference pod: a leader on main has its own (builders.leader_port)
+    port: int | None = field(default=None, compare=False)
 
 
 @dataclass
@@ -208,6 +210,7 @@ def _pod_info(pod) -> PodInfo:
         message=_container_message(pod),
         workload=labels.get(L_NAME),
         started_at=_started_at(pod),
+        port=_int((pod.metadata.annotations or {}).get(A_PORT)),
     )
 
 
@@ -318,6 +321,19 @@ class K8sClient:
             raise
         return True
 
+    async def delete_node_password(self, name: str) -> bool:
+        """Deletes the secret in which k3s keeps the password of the agent `name`. While it stays, an agent with a new
+        password (the PC was reinstalled, its volume lost) is refused: «Node password rejected, duplicate hostname». False:
+        there was none."""
+        core, _ = await self._apis()
+        try:
+            await self._call(core.delete_namespaced_secret, f"{name}.node-password.k3s", "kube-system")
+        except ApiException as exc:
+            if exc.status == 404:
+                return False
+            raise
+        return True
+
     # ---- pods --------------------------------------------------------------------
 
     async def list_endpoints(self, role: str, deployment: str | None = None) -> list[Endpoint]:
@@ -340,7 +356,9 @@ class K8sClient:
                 or port is None
             ):
                 continue
-            ip = node.external_ip or node.internal_ip
+            # llm-main is a container: only the published ports answer on its external address, a hostNetwork pod there
+            # answers on the container's own (InternalIP), which the portal and the LiteLLM pod reach
+            ip = node.internal_ip if node.is_main else node.external_ip or node.internal_ip
             if not ip:
                 continue
             endpoints.append(

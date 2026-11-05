@@ -201,6 +201,15 @@ describe("the result", () => {
     expect(await screen.findByText(/Объект ноды в Kubernetes не удалён: кластер не ответил/)).toBeInTheDocument();
   });
 
+  it("says when the k3s password stayed, what clears it and how to do it by hand", async () => {
+    server.use(http.delete("/api/admin/nodes/:name", () => HttpResponse.json({ ...ANSWER, k3s_password: "left" })));
+    const { user } = await openNodes();
+    await pickDelete(user, "win-laptop-07");
+    await user.click(within(await screen.findByRole("dialog")).getByRole("button", { name: "Удалить" }));
+    expect(await screen.findByText(/Пароль ноды k3s не удалён/)).toBeInTheDocument();
+    expect(screen.getByText(/delete secret win-laptop-07\.node-password\.k3s/)).toBeInTheDocument();
+  });
+
   it("outlives the row: the node leaves the table and the dialog stays", async () => {
     const { user } = await openNodes();
     await pickDelete(user, "win-laptop-07");

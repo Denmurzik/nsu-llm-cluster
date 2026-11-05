@@ -1,7 +1,7 @@
 import { Check, CircleAlert } from "lucide-react";
 import { useRef, useState } from "react";
 import { api, ApiError } from "../api";
-import { waitsForApproval, type Deployment, type NodeInfo } from "../types";
+import { hasClaims, waitsForApproval, type Deployment, type NodeInfo } from "../types";
 import { Confirm, Modal } from "./Modal";
 import { DeleteNote, deleteResultText, heldBy } from "./NodeDelete";
 import { heldText, PurgeNote, purgeResultText } from "./PurgeModels";
@@ -84,7 +84,7 @@ function targetsOf(a: Action, selected: NodeInfo[]): NodeInfo[] {
   if (a.kind === "maintenance") return selected.filter((n) => n.maintenance !== a.on);
   if (a.kind === "wake") return selected.filter((n) => !n.ready);
   if (a.kind === "purge") return selected.filter((n) => n.ready); // a node that is down cannot clean itself
-  if (a.kind === "approve") return selected.filter(waitsForApproval);
+  if (a.kind === "approve") return selected.filter((n) => waitsForApproval(n) && !hasClaims(n)); // claims: look at the row
   return selected;
 }
 

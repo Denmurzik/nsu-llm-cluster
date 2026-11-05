@@ -64,6 +64,23 @@ eq "llama-server is running" "$(field "$out" '.llama_up')" true
 eq "no rpc server" "$(field "$out" '.rpc_up')" false
 eq "no change of the cpu counters is 0 %" "$(field "$out" '.cpu_pct == 0')" true
 
+# the free space of the Windows disk (WSL: the distro writes host-disk every minute, df inside WSL shows the virtual disk)
+printf '{"mount":"/mnt/c","free_bytes":12345678901,"total_bytes":99999999999,"at":%s}
+' "$(date +%s)" > "$TMP/host-disk"
+out="$(HOST_DISK_FILE="$TMP/host-disk" once)"
+eq "host disk: the free space of the Windows disk is what the node reports" "$(field "$out" '.disk_free_bytes')" 12345678901
+out="$(HOST_DISK_FILE="$TMP/host-disk" LLAMA_CACHE="$TMP/no-such-dir" once)"
+eq "host disk: reported without a model cache dir too" "$(field "$out" '.disk_free_bytes')" 12345678901
+printf '{"mount":"/mnt/c","free_bytes":12345678901,"total_bytes":99999999999,"at":%s}
+' "$(($(date +%s) - 3600))" > "$TMP/host-disk-stale"
+out="$(HOST_DISK_FILE="$TMP/host-disk-stale" once)"
+eq "host disk: a stale file (an hour old) is ignored, df of the volume is used" "$(field "$out" '.disk_free_bytes != 12345678901')" true
+printf 'not json' > "$TMP/host-disk-bad"
+out="$(HOST_DISK_FILE="$TMP/host-disk-bad" once)"
+eq "host disk: a malformed file is ignored" "$(field "$out" '.disk_free_bytes | . > 0')" true
+out="$(HOST_DISK_FILE="$TMP/absent" once)"
+eq "host disk: no file (Docker Desktop, Linux): df of the volume" "$(field "$out" '.disk_free_bytes | . > 0')" true
+
 mkdir -p "$PROC/90"; echo ggml-rpc-server > "$PROC/90/comm"
 eq "an rpc server is seen" "$(field "$(once)" '.rpc_up')" true
 rm -rf "$PROC/42"
@@ -196,7 +213,7 @@ printf '#!/usr/bin/env bash\necho "k3s ran with K3S_TOKEN=${K3S_TOKEN-unset} CLU
 printf '#!/usr/bin/env bash\necho cpu\n' > "$TMP/epbin/detect-accel.sh"
 chmod +x "$TMP/epbin/"*
 export K3S_NODE_ETC="$TMP/etc-node" K3S_DATA_DIR="$TMP/k3s-data" K3S_REGISTRIES_FILE="$TMP/etc-k3s/registries.yaml"
-ep() { : > "$TMP/ep.log"; env PATH="$TMP/epbin:$PATH" FAKE_EP_LOG="$TMP/ep.log" ACCEL=cpu NODE_NAME=foo "$@" bash "$BIN/entrypoint.sh" >/dev/null 2>&1; sleep 0.5; cat "$TMP/ep.log"; }
+ep() { : > "$TMP/ep.log"; env PRUNE_IMAGES=0 PATH="$TMP/epbin:$PATH" FAKE_EP_LOG="$TMP/ep.log" ACCEL=cpu NODE_NAME=foo "$@" bash "$BIN/entrypoint.sh" >/dev/null 2>&1; sleep 0.5; cat "$TMP/ep.log"; }
 
 out="$(ep MODE=k3s MAIN_HOST=main.example CLUSTER_TOKEN=tok)"
 contains "k3s mode starts the collector" "$out" "metrics NODE_NAME=foo CLUSTER_TOKEN=tok MAIN_URL=https://main.example"

@@ -16,7 +16,7 @@
 set -euo pipefail
 export MSYS_NO_PATHCONV=1  # Git Bash в Windows: /run и /var/run в аргументах docker не превращать в пути Windows
 
-VERSION="0.2.0"
+VERSION="0.2.1"
 CONTAINER="llm-main"
 IMAGE="nsu-llm-main:$VERSION"
 ENV_FILE=".env"

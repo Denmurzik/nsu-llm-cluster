@@ -7,7 +7,7 @@ set -uo pipefail
 export MSYS_NO_PATHCONV=1
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-IMAGE="${IMAGE:-nsu-llm-main:0.2.0}"
+IMAGE="${IMAGE:-nsu-llm-main:0.2.1}"
 NAME="nsu-llm-it14-main"
 VOL_K3S="nsu-llm-it14-main-k3s"; VOL_KUBELET="nsu-llm-it14-main-kubelet"; VOL_DATA="nsu-llm-it14-main-data"
 BACKEND="nsu-llm-it14-fakebackend"
@@ -149,6 +149,22 @@ grep -q ANON_REFUSED <<<"$reg_out" && grep -q READ_LISTENER_REFUSED <<<"$reg_out
   && pass "registry: no push without the password, registry-push.sh pushes, 127.0.0.1:5000 reads" || fail "registry auth on k3s" "$reg_out"
 tags="$(curl -sk -m 10 -H "Host: $IP" "https://127.0.0.1:$HTTPS_PORT/v2/nsu-llm-node/tags/list")"
 grep -q '"boot-sec2"' <<<"$tags" && pass "registry readable through https /v2/ without credentials" || fail "registry through /v2/" "$tags"
+# the pause image of k3s (what install-main.sh seed_pause puts into the registry so that nodes need no Docker Hub): containerd of main holds
+# the content of linux/amd64 only, so a pushed whole index is refused ("manifest blob unknown"); --amd64-manifest pushes that one manifest
+pause_tag="$(docker exec "$NAME" k3s ctr -n k8s.io images ls -q 2>/dev/null | sed -n 's#^docker\.io/rancher/mirrored-pause:##p' | head -n1)"
+if [ -n "$pause_tag" ]; then
+  docker exec "$NAME" sh -c "k3s ctr -n k8s.io images tag --force docker.io/rancher/mirrored-pause:$pause_tag 127.0.0.1:5000/rancher/mirrored-pause:$pause_tag >/dev/null &&
+    /opt/llm/main/registry-push.sh 127.0.0.1:5000/rancher/mirrored-pause:$pause_tag --amd64-manifest" >"$TMP/pause-push.log" 2>&1; prc=$?
+  acc='Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json'
+  pman="$(curl -sk -m 10 -H "Host: $IP" -H "$acc" "https://127.0.0.1:$HTTPS_PORT/v2/rancher/mirrored-pause/manifests/$pause_tag")"
+  player="$(tr -d ' \n' <<<"$pman" | grep -o '"layers":\[{[^]]*' | grep -o 'sha256:[0-9a-f]*' | head -n1)"
+  pblob="$(curl -sk -m 10 -o /dev/null -w '%{http_code}' -H "Host: $IP" "https://127.0.0.1:$HTTPS_PORT/v2/rancher/mirrored-pause/blobs/$player")"
+  [ "$prc" = 0 ] && [ -n "$player" ] && [ "$pblob" = 200 ] \
+    && pass "registry: the pause image ($pause_tag) is pushed (the linux/amd64 manifest) and manifest and layer are readable through https /v2/" \
+    || fail "pause image in the registry" "push rc=$prc $(cat "$TMP/pause-push.log") layer=$player http=$pblob manifest=$pman"
+else
+  fail "pause image in containerd of main" "$(docker exec "$NAME" k3s ctr -n k8s.io images ls -q 2>&1 | head -20)"
+fi
 # M1: /ca.crt.p7s signed by the k3s CA; the node-side check accepts the genuine main with the join token
 for _ in $(seq 1 30); do [ "$(curl -s -m 5 -o /dev/null -w '%{http_code}' "http://127.0.0.1:$HTTP_PORT/ca.crt.p7s")" = 200 ] && break; sleep 3; done
 join="$(docker exec "$NAME" /opt/llm/main/agent-token.sh 2>/dev/null)"

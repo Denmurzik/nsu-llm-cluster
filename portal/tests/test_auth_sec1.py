@@ -259,6 +259,18 @@ async def test_require_admin_route_with_subs(client, app):
     assert (await client.post("/api/_test/sec1-admin")).json() == {"role": "admin"}
 
 
+def test_a_role_override_keeps_the_admin_role(monkeypatch):
+    from app.auth import roles
+    from app.config import Settings
+
+    address = "pinned@example.org"
+    monkeypatch.setattr(roles, "_ROLE_OVERRIDES", {roles._override_key(address): "admin"})
+    s = Settings(admin_emails="", admin_require_email_verified=True)
+    assert roles.listed_by_email("Pinned@Example.org", False, s) is True
+    assert roles.listed_by_email("Pinned@Example.org", None, s) is True
+    assert roles.listed_by_email("other@example.org", False, s) is False
+
+
 def test_an_admin_email_without_a_confirmed_address_is_warned_about_loudly(caplog):
     """Fix round 1, Important 5: after the upgrade (users unknown until the next login) or with a provider that does not
     confirm addresses, an ADMIN_EMAILS entry loses the role: the log says so once, with the ways out."""

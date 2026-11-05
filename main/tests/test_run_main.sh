@@ -28,7 +28,7 @@ K3S_FILE=k3s-airgap-images-amd64.tar.zst
 out="$(bash "$RUN_MAIN" --dry-run --env-file "$RUN_ENV" --advertise-ip 192.168.3.21 --airgap-dir "$TMP/none" 2>&1)"
 for frag in '--name llm-main' '--hostname llm-main' '--privileged' '--restart unless-stopped' '--tmpfs /run' '--tmpfs /var/run' \
   '-p 0.0.0.0:443:443' '-p 0.0.0.0:80:80' '-p 0.0.0.0:6443:6443' 'llm-main-k3s:/var/lib/rancher/k3s' 'llm-main-kubelet:/var/lib/kubelet' \
-  'llm-main-data:/var/lib/llm' 'llm-main-hf:/var/lib/llm-hf' 'llm-main-registry:/var/lib/llm-registry' '--env-file' 'MAIN_ADVERTISE_IP=192.168.3.21' 'nsu-llm-main:0.2.0' \
+  'llm-main-data:/var/lib/llm' 'llm-main-hf:/var/lib/llm-hf' 'llm-main-registry:/var/lib/llm-registry' '--env-file' 'MAIN_ADVERTISE_IP=192.168.3.21' 'nsu-llm-main:0.2.1' \
   '--ulimit nofile=1048576:1048576' '--log-driver json-file' '--log-opt max-size=50m' '--log-opt max-file=5'; do
   grep -qF -- "$frag" <<<"$out"
   check "run-main.sh --dry-run contains $frag" $? "$out"

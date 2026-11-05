@@ -137,7 +137,7 @@ def _mirror_values(env: Mapping[str, str]) -> dict[str, str]:
 
 
 DEFAULT_NODE_IMAGE_REPO = "nsu-llm-node"
-DEFAULT_NODE_IMAGE_TAG = "0.2.0"
+DEFAULT_NODE_IMAGE_TAG = "0.2.1"
 # registry[:port]/path[:tag][@sha256:digest]: nothing that would leave the quoted YAML value
 _IMAGE = re.compile(r"[a-z0-9]([a-z0-9._/:-]*[a-z0-9])?(@sha256:[0-9a-f]{64})?")
 

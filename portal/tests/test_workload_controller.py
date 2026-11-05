@@ -241,6 +241,164 @@ async def split_setup(db_session, k8s, node_names, group_size=2, accel="cpu", **
         k8s.add_node(n, accel="cpu", internal_ip=f"10.0.0.{i + 1}")
 
 
+# ---------- the split leader on main ----------
+
+
+@pytest.fixture
+def leaders_on_main(settings, monkeypatch):
+    monkeypatch.setattr(settings, "split_leader_on_main", True)
+
+
+def add_main(k8s):
+    k8s.add_node("llm-main", internal_ip="172.17.0.2", external_ip="192.168.1.5", is_main=True)
+
+
+def leader_node(k8s, name="llm-sp-g0"):
+    spec = k8s.workloads[("Deployment", name)]["spec"]["template"]["spec"]
+    return spec["affinity"]["nodeAffinity"]["requiredDuringSchedulingIgnoredDuringExecution"]["nodeSelectorTerms"][0]["matchFields"][0]["values"]
+
+
+async def test_with_the_setting_on_the_leader_of_a_group_runs_on_main(db_session, k8s, controller, leaders_on_main):
+    await split_setup(db_session, k8s, ["a", "b", "c", "d"])
+    add_main(k8s)
+    await controller.reconcile_once()
+    add_rpc_pods(k8s, "sp", "a", "b", "c", "d")
+    await controller.reconcile_once()
+    assert names(k8s) == {"llm-sp-rpc-cpu", "llm-sp-g0", "llm-sp-g1"}
+    assert leader_node(k8s) == leader_node(k8s, "llm-sp-g1") == ["llm-main"]
+    assert env(k8s, "Deployment", "llm-sp-g0")["RPC_SERVERS"] == "10.0.0.1:18050,10.0.0.2:18050"
+    assert env(k8s, "Deployment", "llm-sp-g1")["RPC_SERVERS"] == "10.0.0.3:18050,10.0.0.4:18050"
+    assert env(k8s, "Deployment", "llm-sp-g0")["INFER_PORT"] != env(k8s, "Deployment", "llm-sp-g1")["INFER_PORT"]
+
+
+async def test_switching_the_setting_moves_a_running_leader_and_keeps_its_group(
+    db_session, k8s, controller, settings, monkeypatch
+):
+    await split_setup(db_session, k8s, ["a", "b"])
+    add_main(k8s)
+    await controller.reconcile_once()
+    add_rpc_pods(k8s, "sp", "a", "b")
+    await controller.reconcile_once()
+    assert leader_node(k8s) == ["a"]
+
+    monkeypatch.setattr(settings, "split_leader_on_main", True)
+    await controller.reconcile_once()
+    assert names(k8s) == {"llm-sp-rpc-cpu", "llm-sp-g0"}  # the same object, the same group
+    assert leader_node(k8s) == ["llm-main"]
+
+    monkeypatch.setattr(settings, "split_leader_on_main", False)
+    await controller.reconcile_once()
+    assert leader_node(k8s) == ["a"]
+    assert env(k8s, "Deployment", "llm-sp-g0")["RPC_SERVERS"] == "127.0.0.1:18050,10.0.0.2:18050"
+
+
+async def test_a_leader_on_main_is_not_taken_for_a_pod_on_a_down_node(db_session, k8s, controller, trace, leaders_on_main):
+    """`nodes` leaves main out: an undesired leader there goes the usual way, not by a force delete."""
+    await split_setup(db_session, k8s, ["a", "b"])
+    add_main(k8s)
+    await controller.reconcile_once()
+    add_rpc_pods(k8s, "sp", "a", "b")
+    await controller.reconcile_once()
+    k8s.add_pod("llm-sp-g0-x", "llm-main", "split-leader", "sp", workload="llm-sp-g0")
+    dep = (await service.list_all(db_session))[0]
+    dep.enabled = False
+    await db_session.commit()
+    await controller.reconcile_once()
+    assert ("delete", "llm-sp-g0") in trace
+    assert ("force-delete-pod", "llm-sp-g0-x") not in trace
+
+
+async def test_one_group_of_15_class_pcs_gets_one_leader_on_main_and_the_layers_of_gpt_oss_120b(
+    db_session, k8s, controller, leaders_on_main
+):
+    names_ = [f"pc{i:02d}" for i in range(1, 16)]
+    dep = await service.create(
+        db_session, make_hf(),
+        dep_in(name="big", mode="split", accel="nvidia", group_size=15, nodes=names_, ctx_per_request=8192, parallel=1),
+    )
+    dep.meta = {
+        "weights_bytes": 63387346208, "arch": "gpt-oss", "n_layers": 36, "n_heads": 64, "n_kv_heads": 8, "head_dim": 64,
+        "max_ctx": 131072, "embedding": 2880, "value_dim": 64, "mla": False, "nextn_layers": 0, "layers": [1726212608] * 36,
+        "output_bytes": 615340800, "embd_bytes": 615329280, "max_tensor_bytes": 615329280, "n_vocab": 201088,
+    }
+    await db_session.commit()
+    for i, n in enumerate(names_):
+        k8s.add_node(n, accel="nvidia", internal_ip=f"10.0.1.{i + 1}", vram_mib=8188, mem_mib=8192, ram_mib=8192)
+    add_main(k8s)
+    await controller.reconcile_once()
+    add_rpc_pods(k8s, "big", *names_)
+    await controller.reconcile_once()
+    assert ("Deployment", "llm-big-g0") in k8s.workloads and ("Deployment", "llm-big-g1") not in k8s.workloads
+    assert leader_node(k8s, "llm-big-g0") == ["llm-main"]
+    e = env(k8s, "Deployment", "llm-big-g0")
+    assert e["RPC_SERVERS"].split(",") == [f"10.0.1.{i}:18050" for i in range(1, 16)]
+    counts = [int(n) for n in e["TENSOR_SPLIT"].split(",")]
+    assert sum(counts) == 37 and len(counts) == 30  # CUDA0 and CPU of each PC, in --rpc order
+    assert sum(counts[1::2]) == 0  # no layer in the RAM of a PC
+
+
+async def test_no_room_on_main_holds_the_leader_and_the_status_says_why(db_session, k8s, controller, leaders_on_main, monkeypatch):
+    from app.workloads import builders
+
+    await split_setup(db_session, k8s, ["a", "b"])
+    add_main(k8s)
+    await controller.reconcile_once()
+    add_rpc_pods(k8s, "sp", "a", "b")
+    monkeypatch.setattr(builders, "main_disk_problem", lambda dep: "нет места")
+    monkeypatch.setattr(service, "main_disk_problem", lambda dep: "нет места")
+    await controller.reconcile_once()
+    assert ("Deployment", "llm-sp-g0") not in k8s.workloads
+    dep = (await service.list_all(db_session))[0]
+    status = await service.deployment_status(db_session, k8s, FakeLiteLLM(), dep, leader_on_main=True)
+    assert "нет места" in status["placement_problems"]
+    monkeypatch.setattr(builders, "main_disk_problem", lambda dep: None)
+    await controller.reconcile_once()
+    assert ("Deployment", "llm-sp-g0") in k8s.workloads
+
+
+async def test_a_lost_first_member_is_no_lost_leader_when_the_leader_is_on_main(
+    db_session, k8s, controller, clock, leaders_on_main
+):
+    await split_setup(db_session, k8s, ["a", "b"], regroup_grace_s=600)
+    add_main(k8s)
+    await controller.reconcile_once()
+    add_rpc_pods(k8s, "sp", "a", "b")
+    await controller.reconcile_once()
+    del k8s.pods["rpc-a"]
+    await controller.reconcile_once()
+    assert controller._lost[("sp", 0)].leader_lost is False
+    assert ("Deployment", "llm-sp-g0") in k8s.workloads  # held, the leader on main stays
+
+
+async def test_the_status_lists_a_leader_on_main_with_the_first_node_of_its_group(db_session, k8s, controller, leaders_on_main):
+    await split_setup(db_session, k8s, ["a", "b"])
+    add_main(k8s)
+    await controller.reconcile_once()
+    add_rpc_pods(k8s, "sp", "a", "b")
+    await controller.reconcile_once()
+    k8s.add_pod("llm-sp-g0-x", "llm-main", "split-leader", "sp", ready=False, port=21000, workload="llm-sp-g0")
+    urls = []
+
+    class Progress:
+        async def transfers(self):
+            return {}
+
+        async def health(self, url):
+            urls.append(url)
+            return 503
+
+    dep = (await service.list_all(db_session))[0]
+    status = await service.deployment_status(db_session, k8s, FakeLiteLLM(), dep, progress=Progress(), leader_on_main=True)
+    by_node = {n["name"]: n for n in status["nodes"]}
+    assert set(by_node) == {"a", "b"}  # main is no node of the deployment
+    assert status["groups"] == [["a", "b"]]
+    leader = next(p for p in by_node["a"]["pods"] if p["role"] == "split-leader")
+    assert leader["on_main"] is True
+    assert leader["progress"]["stage"] == "loading"
+    assert by_node["a"]["applied"] is False  # the group is not up while its leader loads
+    assert urls == ["http://172.17.0.2:21000/health"]  # main's own address: 18080 and up are not published
+
+
 # ---------- stale standalone records ----------
 
 

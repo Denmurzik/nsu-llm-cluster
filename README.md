@@ -625,9 +625,9 @@ docker cp ./my-model-Q4_K_M.gguf llm-main:/var/lib/llm-hf/models/     # порт
 
 ```bash
 # образы новой версии скачиваются заранее, главный продолжает работать (нужен IMAGE_SOURCE=pull)
-sudo ./main/install-main.sh --update 0.2.0
+sudo ./main/install-main.sh --update 0.2.1
 # переход: короткий перерыв ~30 с, данные сохраняются
-git fetch --tags && git checkout v0.2.0
+git fetch --tags && git checkout v0.2.1
 sudo ./main/install-main.sh --yes
 ```
 

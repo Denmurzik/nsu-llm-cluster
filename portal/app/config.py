@@ -106,10 +106,13 @@ class Settings(BaseSettings):
     # the shared key of inference backends before per-node keys (task SEC-1): only nodes that have no key of their own
     # yet (old standalone images, app.nodes.identity) still get it; every other backend has its own key
     backend_api_key: SecretStr = SecretStr("")
+    # the backend key of a split leader on main (main/entrypoint.sh writes it for the pod): main has no node key to derive
+    # one from, and no node ever knows this one
+    main_backend_key: SecretStr = SecretStr("")
     kubeconfig: str = "/etc/rancher/k3s/k3s.yaml"
     k8s_namespace: str = "llm"
     node_image_repo: str = "nsu-llm-node"
-    node_image_tag: str = "0.2.0"
+    node_image_tag: str = "0.2.1"
     # Versions and updates of the nodes (task 2-30, app.nodes.versions). The pods run the node image pinned by the digest
     # that main's registry reports for the tag, so a new image under the same tag reaches the nodes by itself; when the
     # registry has no such tag they keep the tag with imagePullPolicy Always. False: the tag and IfNotPresent as before.
@@ -152,7 +155,10 @@ class Settings(BaseSettings):
     # at least an hour; the rate is MB/s from the mirror and over the network to the rpc servers
     model_load_mbps: float = Field(default=40.0, gt=0)
     # size limit of the ggml-rpc-server tensor cache on each node (rpc-cache-gc.sh; 0 = no limit)
-    rpc_cache_max_gib: int = Field(default=64, ge=0)
+    rpc_cache_max_gib: int = Field(default=5, ge=0)
+    # the leader of every split group runs on main and all nodes of the group are rpc servers (builders.split_leader); the
+    # default of the runtime setting of the same name
+    split_leader_on_main: bool = False
     # data directory of the Hugging Face mirror as the portal sees it in the main container (volume llm-main-hf):
     # own model files live in models/local/<name>/ there and reach the nodes as the repository local/<name>
     hf_mirror_data_dir: str = "/var/lib/llm-hf"

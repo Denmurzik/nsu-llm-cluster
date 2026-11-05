@@ -33,6 +33,7 @@ WORKERS = 2
 MASTER_KEY = "sk-it-20b-master"
 SALT_KEY = "sk-it-20b-salt-0123456789"
 BACKEND = "http://127.0.0.1:18080/v1"
+REDIS_PASSWORD = "it20bredispw"  # main requires requirepass since SEC-2; the rendered manifests need the variable
 SATURATED = "Модель slow перегружена: все слоты и очередь заняты. Повторите запрос через 5 с."
 
 
@@ -50,6 +51,9 @@ def _rendered_litellm_config(out: Path) -> list[str]:
         "LITELLM_MASTER_KEY": MASTER_KEY,
         "LITELLM_SALT_KEY": SALT_KEY,
         "BACKEND_API_KEY": "it20bbackendkey",
+        "REDIS_PASSWORD": REDIS_PASSWORD,
+        "HF_MIRROR_ADMIN_TOKEN": "hf_" + "1" * 40,
+        "REGISTRY_HTPASSWD": "nsu-push:$2a$06$" + "a" * 53,
         "HF_MIRROR_TOKEN": "hf_" + "0" * 40,
         "LITELLM_WORKERS": str(WORKERS),
     }
@@ -79,7 +83,7 @@ def scale_stack() -> Iterator[tuple[str, str]]:
         DockerContainer("redis:7-alpine")
         .with_name(owner_name)
         .with_exposed_ports(4000, 18080)
-        .with_command("--bind 127.0.0.1 --port 6379 --save '' --appendonly no")
+        .with_command(f"--bind 127.0.0.1 --port 6379 --save '' --appendonly no --requirepass {REDIS_PASSWORD}")
     )
     pg = (
         DockerContainer("postgres:17-alpine")
@@ -108,6 +112,8 @@ def scale_stack() -> Iterator[tuple[str, str]]:
         .with_env("DATABASE_URL", "postgresql://litellm:litellm-pw@127.0.0.1:5432/litellm")
         .with_env("LITELLM_MASTER_KEY", MASTER_KEY)
         .with_env("LITELLM_SALT_KEY", SALT_KEY)
+        .with_env("REDIS_PASSWORD", REDIS_PASSWORD)
+        .with_env("GATEWAY_STATS_REDIS_URL", f"redis://:{REDIS_PASSWORD}@127.0.0.1:6379/0")
         .with_env("STORE_MODEL_IN_DB", "True")
         .with_env("DISABLE_ADMIN_UI", "True")
         .with_env("LITELLM_LOCAL_MODEL_COST_MAP", "True")

@@ -1,12 +1,15 @@
 """Pure builders of Kubernetes manifests (DaemonSets and Deployments) for model deployments."""
 
+import contextlib
 import copy
 import hashlib
 import json
 import logging
 import math
+import os
 import re
 import shlex
+import shutil
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
@@ -29,6 +32,7 @@ from app.k8s import (
     L_DEPLOYMENT,
     L_NODE_DEPLOYMENT,
     L_ROLE,
+    MAIN_NODE,
 )
 
 VLLM_IMAGE = "vllm/vllm-openai:v0.32.0"
@@ -78,6 +82,25 @@ _SUFFIX = {"cpu": "cpu", "nvidia": "gpu"}
 LEADER_NGL = "999"
 RPC_MEMORY_REQUEST = "256Mi"  # a request equal to the large limit could leave the pod unschedulable
 CLASS_TOLERATION = {"operator": "Equal", **CLASS_TAINT}  # class nodes: llm.nsu/class=true:NoSchedule
+# A split leader on main (setting split_leader_on_main). llm-main is k3s inside a container, so its pods need their own
+# volume, port, image address and toleration:
+# - the taint of main (main/entrypoint.sh) keeps every other portal pod away;
+# - hostNetwork there is the netns of the main container, shared by all leaders: each gets its own port, above the rpc and
+#   inference ports and below the ephemeral range. Stable: it depends on the deployment and the group index only;
+# - the GGUF goes to the volume llm-main-hf (a hostPath on llm-main is the overlay of the container otherwise), in a
+#   directory of its own: the mirror's disk reserve covers it, and the mirror's cache stays closed to the pod;
+# - llama.cpp's threads spin-wait: on main they would take every core from Postgres and LiteLLM, and a leader without layers
+#   computes only the input embeddings, the sampling and a draft model.
+MAIN_TOLERATION = {"key": "node-role.kubernetes.io/control-plane", "operator": "Exists", "effect": "NoSchedule"}
+MAIN_MODELS_DIR = "/var/lib/llm-hf/leader-models"
+MAIN_DISK_FLOOR_PCT = 5  # kubelet of llm-main: DiskPressure below this share free, Postgres and LiteLLM are evicted
+LEADER_PORT_SPAN = 14000  # infer_port + 1 ... : 18081-32080 by default, under the ephemeral ports (32768)
+LEADER_PORTS_PER_DEPLOYMENT = 32
+MAIN_LEADER_THREADS = "8"
+# This pod parses what the rpc servers of the class PCs answer, in the network namespace of Postgres, Redis, LiteLLM and Caddy
+# (their traffic on lo is in the clear): no NET_RAW to read it, no capability at all, no token for the cluster. The key file and
+# the model directory belong to root, the port is above 1024, so it needs none.
+MAIN_LEADER_SECURITY = {"allowPrivilegeEscalation": False, "capabilities": {"drop": ["ALL"]}}
 _GEMMA4_FLAGS = ["--enable-auto-tool-choice", "--tool-call-parser", "gemma4", "--reasoning-parser", "gemma4"]
 
 
@@ -163,6 +186,18 @@ def leader_groups(owned: Iterable, deployment: str) -> dict[int, list[str]]:
     return groups
 
 
+def leader_index(deployment: str, workload: str | None) -> int | None:
+    """The group index of the leader Deployment `llm-<deployment>-g<i>`."""
+    match = re.fullmatch(rf"llm-{re.escape(deployment)}-g(\d+)", workload or "")
+    return int(match.group(1)) if match else None
+
+
+def leader_port(dep, index: int, s) -> int:
+    """The port of a split leader on main (see MAIN_TOLERATION above for why it has its own)."""
+    deployment = getattr(dep, "id", None) or 0  # a form that is not saved yet (command_preview) has no id
+    return s.infer_port + 1 + (deployment * LEADER_PORTS_PER_DEPLOYMENT + index) % LEADER_PORT_SPAN
+
+
 def template_hash(manifest: dict) -> str:
     """12 hex chars over the pod template without its `llm.nsu/spec-hash` annotation."""
     template = copy.deepcopy(manifest["spec"]["template"])
@@ -191,6 +226,15 @@ def _image(s, accel: str) -> str:
     else the tag (versions.Registry knows the digest; the workload controller asks the registry before it builds)."""
     digest = versions.pinned_digest(s, accel)
     return f"{s.node_image_repo}@{digest}" if digest else _tag_image(s, accel)
+
+
+def _main_image(s) -> str:
+    """The cpu node image as llm-main pulls it: straight from main's own registry, on the read-only address only main can
+    reach (http://127.0.0.1:<port>, Caddy adds the password). The nodes have a mirror for it in registries.yaml, main has
+    none, and a pod of main must not depend on the internet. By digest or tag, like `_image`."""
+    host = s.registry_base.partition("://")[2]
+    digest = versions.pinned_digest(s, "cpu")
+    return f"{host}/{s.registry_repo}@{digest}" if digest else f"{host}/{s.registry_repo}:{s.node_image_tag}-cpu"
 
 
 def _pull_policy(s, accel: str) -> str:
@@ -284,12 +328,12 @@ def llama_settings_env(dep) -> list[tuple[str, str]]:
     return env
 
 
-def _llama_env(dep, s, accel: str) -> list[dict]:
+def _llama_env(dep, s, accel: str, port: int | None = None) -> list[dict]:
     env = [
         ("MODEL_REPO", dep.repo),
         ("MODEL_FILE", dep.file),
         ("PUBLIC_MODEL_NAME", dep.name),
-        ("INFER_PORT", str(s.infer_port)),
+        ("INFER_PORT", str(port or s.infer_port)),
         ("CTX_SIZE", str(dep.ctx_per_request * dep.parallel)),
         ("PARALLEL_SLOTS", str(dep.parallel)),
         ("ACCEL", accel),
@@ -328,7 +372,7 @@ def uses_mirror(dep, s) -> bool:
     )
 
 
-def _with_secrets(env: list[dict], s, key_env: str, mirror: bool, dep=None) -> list[dict]:
+def _with_secrets(env: list[dict], s, key_env: str, mirror: bool, dep=None, hf_endpoint: str | None = None) -> list[dict]:
     """Adds the Hugging Face access and the node's own backend key; no secret value is written into the pod object.
 
     With the mirror on main the pod downloads from `<mirror>/c/<node>` (the node name tags its transfers for the
@@ -337,6 +381,7 @@ def _with_secrets(env: list[dict], s, key_env: str, mirror: bool, dep=None) -> l
     real token, if any, as a reference to `llm-node-secrets`.
     The backend key is the file `<key_env>_FILE` names (the node's own, BACKEND_KEY_FILE); the server reads it into its
     own environment variable (`LLAMA_API_KEY` for llama-server, `VLLM_API_KEY` for vLLM), never a command line.
+    `hf_endpoint`: the mirror's address when the pod reaches it otherwise than a node does (a leader on main).
     """
     env = list(env)
     if mirror:
@@ -344,7 +389,7 @@ def _with_secrets(env: list[dict], s, key_env: str, mirror: bool, dep=None) -> l
         token = mirror_tokens.mint(s.hf_mirror_token.get_secret_value(), mirror_tokens.ANY_CLIENT, repos)
         env += [
             {"name": "NODE_NAME", "valueFrom": {"fieldRef": {"fieldPath": "spec.nodeName"}}},
-            {"name": "HF_ENDPOINT", "value": f"{s.node_hf_endpoint}/c/$(NODE_NAME)"},
+            {"name": "HF_ENDPOINT", "value": f"{hf_endpoint or s.node_hf_endpoint}/c/$(NODE_NAME)"},
             {"name": "HF_TOKEN", "value": token},
         ]
     elif s.hf_token.get_secret_value():
@@ -411,6 +456,41 @@ def _models_volume() -> tuple[dict, dict]:
     mount = {"name": "models", "mountPath": MODELS_DIR}
     volume = {"name": "models", "hostPath": {"path": MODELS_DIR, "type": "DirectoryOrCreate"}}
     return mount, volume
+
+
+def _main_models_volume() -> tuple[dict, dict]:
+    mount = {"name": "models", "mountPath": MODELS_DIR}
+    volume = {"name": "models", "hostPath": {"path": MAIN_MODELS_DIR, "type": "DirectoryOrCreate"}}
+    return mount, volume
+
+
+def main_disk_problem(dep) -> str | None:
+    """Why the leader of `dep` must not start on main: its copy of the model would take the volume of the mirror, on the disk
+    of Postgres and k3s, down to where the kubelet evicts them (5 % free). serve-llama.sh downloads until ENOSPC and looks at
+    nothing. Only what is still missing counts, so a download in progress does not stop itself. None: enough room, or nothing
+    to say (size unknown, llama-server's own download of an unpinned own model, the volume not there)."""
+    size = int((dep.meta or {}).get("weights_bytes") or 0)
+    if not size or not (_SHARD.match(dep.file or "") or getattr(dep, "revision", None)):
+        return None
+    missing = size
+    for path in _download_files(dep.repo, dep.file):
+        local = MAIN_MODELS_DIR + path.removeprefix(MODELS_DIR)
+        for name in (local, f"{local}.part"):
+            with contextlib.suppress(OSError):
+                missing -= os.path.getsize(name)
+    if missing <= 0:
+        return None
+    try:
+        disk = shutil.disk_usage(os.path.dirname(MAIN_MODELS_DIR))
+    except OSError:
+        return None
+    need = missing + disk.total * MAIN_DISK_FLOOR_PCT // 100 + 2**30
+    if disk.free >= need:
+        return None
+    return (
+        f"Лидер {dep.name} на главном не запущен: нет места для файла модели "
+        f"(нужно свободно {need / 2**30:.0f} ГиБ, есть {disk.free / 2**30:.0f} ГиБ в томе llm-main-hf)"
+    )
 
 
 def _ca_volume(mirror: bool) -> tuple[list[dict], list[dict]]:
@@ -541,20 +621,30 @@ def rpc_daemonset(dep, accel: str, s, memory_limit_mib: int | None = None) -> di
     )
 
 
-def split_leader(dep, index: int, group: list[RpcWorker], s, tensor_split: list[int] | None = None) -> dict:
+def split_leader(
+    dep, index: int, group: list[RpcWorker], s, tensor_split: list[int] | None = None, on_main: bool = False
+) -> dict:
     """llama-server for one split group, pinned to the first node of the group.
 
     The leader has no GPU of its own: every layer is offloaded to the rpc servers (its own node's one over loopback).
     On an nvidia group it runs the image that node has (`-gpu`) with the nvidia runtime (for libcuda) but
     `NVIDIA_VISIBLE_DEVICES=none` and no GPU limit: the GPU stays with the rpc pod. `tensor_split` (layers per rpc
     device, `placement.plan_split`) becomes `--tensor-split`; without it llama.cpp splits by the devices' free memory.
+
+    `on_main` (setting split_leader_on_main): pinned to llm-main instead, in the cpu image of the same llama.cpp commit,
+    and every node of the group is only an rpc server, reached over the network. The CPU of main is no device of the
+    model (llama.cpp lists the --rpc servers), so it holds no layer and `tensor_split` counts the same devices. The
+    backend key is the file main/entrypoint.sh writes to the same path as a node container does; the mirror is on
+    127.0.0.1 of the same network namespace.
     """
-    accel = group[0].accel
-    mount, volume = _models_volume()
+    accel = "cpu" if on_main else group[0].accel
+    mount, volume = _main_models_volume() if on_main else _models_volume()
     key_mount, key_volume = _backend_key_volume()
     ca_mounts, ca_volumes = _ca_volume(uses_mirror(dep, s))
-    rpc_servers = ",".join([f"127.0.0.1:{s.rpc_port}"] + [f"{w.ip}:{w.port}" for w in group[1:]])
-    env = _llama_env(dep, s, "cpu") + [
+    port = leader_port(dep, index, s) if on_main else s.infer_port
+    local = [] if on_main else [f"127.0.0.1:{s.rpc_port}"]
+    rpc_servers = ",".join(local + [f"{w.ip}:{w.port}" for w in (group if on_main else group[1:])])
+    env = _llama_env(dep, s, "cpu", port) + [
         {"name": "NGL", "value": LEADER_NGL},
         {"name": "RPC_SERVERS", "value": rpc_servers},
     ]
@@ -562,38 +652,45 @@ def split_leader(dep, index: int, group: list[RpcWorker], s, tensor_split: list[
         env.append({"name": "TENSOR_SPLIT", "value": ",".join(str(n) for n in tensor_split)})
     if accel == "nvidia":
         env.append({"name": "NVIDIA_VISIBLE_DEVICES", "value": "none"})
+    if on_main:
+        env.append({"name": "THREADS", "value": MAIN_LEADER_THREADS})
+    hf_endpoint = f"http://127.0.0.1:{s.hf_mirror_port}" if on_main else None
     container = {
         "name": "llama",
-        "image": _image(s, accel),
+        "image": _main_image(s) if on_main else _image(s, accel),
         "imagePullPolicy": _pull_policy(s, accel),
         "command": ["/opt/llm/bin/serve-llama.sh"],
-        "env": _with_secrets(env, s, "LLAMA_API_KEY", uses_mirror(dep, s), dep),
-        "ports": [{"containerPort": s.infer_port, "hostPort": s.infer_port}],
+        "env": _with_secrets(env, s, "LLAMA_API_KEY", uses_mirror(dep, s), dep, hf_endpoint),
+        "ports": [{"containerPort": port, "hostPort": port}],
         "volumeMounts": [mount, key_mount, *ca_mounts],
-        **_http_probes(s.infer_port, startup_budget_s(dep, s)),
+        **_http_probes(port, startup_budget_s(dep, s)),
     }
+    if on_main:
+        container["securityContext"] = dict(MAIN_LEADER_SECURITY)
+    pinned = MAIN_NODE if on_main else group[0].node_name
     pod_spec = {
         "affinity": {
             "nodeAffinity": {
                 "requiredDuringSchedulingIgnoredDuringExecution": {
                     # by the Node's name, which a kubelet cannot choose for another node (a label it can set itself)
-                    "nodeSelectorTerms": [
-                        {"matchFields": [{"key": "metadata.name", "operator": "In", "values": [group[0].node_name]}]}
-                    ]
+                    "nodeSelectorTerms": [{"matchFields": [{"key": "metadata.name", "operator": "In", "values": [pinned]}]}]
                 }
             }
         },
         "hostNetwork": True,
         "dnsPolicy": "Default",
-        "tolerations": [dict(CLASS_TOLERATION)],
+        "tolerations": [dict(MAIN_TOLERATION if on_main else CLASS_TOLERATION)],
         "containers": [container],
         "volumes": [volume, key_volume, *ca_volumes],
     }
     if accel == "nvidia":
         pod_spec["runtimeClassName"] = "nvidia"
+    if on_main:
+        pod_spec["automountServiceAccountToken"] = False
     labels = _labels(dep, ROLE_LEADER)
     annotations = {
         **_inference_annotations(dep, s),
+        A_PORT: str(port),
         A_GROUP_HASH: group_hash(group),
         A_GROUP_MEMBERS: ",".join(w.node_name for w in group),
     }
@@ -765,25 +862,30 @@ def _line(tokens: list[str], env: dict[str, str] | None = None) -> str:
     return " ".join(prefix + [shlex.quote(t) if re.search(r"[^\w@%+=:,./<>$-]", t) else t for t in tokens])
 
 
-def command_preview(dep, s) -> dict[str, Any]:
+def command_preview(dep, s, leader_on_main: bool = False) -> dict[str, Any]:
     """The command of the server pods of a deployment as the admin would read it: `{"leader": str, "rpc": str | None,
-    "notes": [str]}`. Built by the manifest builders' own environment; keys and tokens are masked."""
+    "notes": [str]}`. Built by the manifest builders' own environment; keys and tokens are masked. `leader_on_main`: the
+    setting split_leader_on_main."""
     notes: list[str] = []
     if dep.engine == "vllm":
         args = vllm_daemonset(dep, s)["spec"]["template"]["spec"]["containers"][0]["args"]
         return {"leader": _line(["vllm", "serve", *args], {"VLLM_API_KEY": SECRET_MASK}), "rpc": None, "notes": notes}
     secrets = {"LLAMA_API_KEY": SECRET_MASK}
+    split = dep.mode == "split"
+    on_main = split and leader_on_main
     if uses_mirror(dep, s):
-        secrets |= {"HF_ENDPOINT": f"{s.node_hf_endpoint}/c/<нода>", "HF_TOKEN": SECRET_MASK}
+        endpoint = f"http://127.0.0.1:{s.hf_mirror_port}/c/llm-main" if on_main else f"{s.node_hf_endpoint}/c/<нода>"
+        secrets |= {"HF_ENDPOINT": endpoint, "HF_TOKEN": SECRET_MASK}
     elif s.hf_token.get_secret_value():
         secrets["HF_TOKEN"] = SECRET_MASK
-    split = dep.mode == "split"
     accel = "nvidia" if dep.accel == "nvidia" else "cpu"
-    values = _env_values(_llama_env(dep, s, "cpu" if split else accel))
+    values = _env_values(_llama_env(dep, s, "cpu" if split else accel, leader_port(dep, 0, s) if on_main else None))
     rpc = None
     if split:
         size = max(dep.group_size or 2, 2)
         servers = [f"127.0.0.1:{s.rpc_port}"] + [f"<ip-{i}>:{s.rpc_port}" for i in range(2, size + 1)]
+        if on_main:
+            servers = [f"<ip-{i}>:{s.rpc_port}" for i in range(1, size + 1)]
         values |= {"NGL": LEADER_NGL, "RPC_SERVERS": ",".join(servers), "TENSOR_SPLIT": "<layers>"}
         devices = rpc_devices("nvidia" if dep.accel != "cpu" else "cpu", dep.use_node_ram)
         rpc = _line(
@@ -791,9 +893,13 @@ def command_preview(dep, s) -> dict[str, Any]:
             {"LLAMA_CACHE": MODELS_DIR},
         )
         notes += [
-            "Лидер группы запускается на первой ноде, остальные ноды держат только rpc-сервер.",
+            "Лидер группы запускается на главном сервере, все ноды группы держат только rpc-сервер; у каждого лидера на главном свой порт."
+            if on_main
+            else "Лидер группы запускается на первой ноде, остальные ноды держат только rpc-сервер.",
             "<ip-N> это адрес N-й ноды группы, <layers> раскладка слоёв по устройствам (--tensor-split): портал считает её по памяти нод в момент запуска группы.",
-            "Черновая модель и проектор изображений загружаются только лидером и лежат в RAM его ноды.",
+            "Черновая модель и проектор изображений загружаются только лидером и лежат в RAM главного сервера."
+            if on_main
+            else "Черновая модель и проектор изображений загружаются только лидером и лежат в RAM его ноды.",
         ]
     elif dep.accel == "any":
         notes.append("Показана команда для CPU-ноды; на ноде с видеокартой -ngl 99" + (" и -ngld 99." if getattr(dep, "draft_repo", None) else "."))
@@ -809,4 +915,5 @@ def command_preview(dep, s) -> dict[str, Any]:
             + ", ".join(f"{r}/{f}" for r, f in files)
             + (" через зеркало главного." if uses_mirror(dep, s) else " с Hugging Face.")
         )
-    return {"leader": _line(serve_llama_argv(values), secrets), "rpc": rpc, "notes": notes}
+    argv = serve_llama_argv(values, MAIN_LEADER_THREADS) if on_main else serve_llama_argv(values)
+    return {"leader": _line(argv, secrets), "rpc": rpc, "notes": notes}

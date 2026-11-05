@@ -137,6 +137,12 @@ SETTINGS: dict[str, SettingSpec] = {
             min=60, max=2_592_000, group=G_MODELS,
         ),
         SettingSpec(
+            "split_leader_on_main", "bool", False,
+            "Лидер split-группы работает на главном сервере: файл модели остаётся на главном, все ПК группы только "
+            "считают слои. Смена перезапускает лидеров, модели загружаются заново",
+            group=G_MODELS,
+        ),
+        SettingSpec(
             "node_approval_required", "bool", True,
             "Новая нода ждёт подтверждения администратора на странице «Ноды», прежде чем получит модель и ключи",
             group=G_NODES,

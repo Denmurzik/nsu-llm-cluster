@@ -16,7 +16,7 @@ from kubernetes_asyncio.client.exceptions import ApiException
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app import audit
+from app import audit, settings_store
 from app.api import playground
 from app.auth.sessions import require_admin, require_csrf
 from app.catalog import estimate as est
@@ -260,7 +260,8 @@ async def deployment_status(
 ) -> dict:
     dep = await _one(db, dep_id)
     return await service.deployment_status(
-        db, k8s, litellm, dep, settings.gpu_compute_reserve_mib, progress=progress, infer_port=settings.infer_port
+        db, k8s, litellm, dep, settings.gpu_compute_reserve_mib, progress=progress, infer_port=settings.infer_port,
+        leader_on_main=await _leader_on_main(db, settings),
     )
 
 
@@ -268,7 +269,9 @@ async def deployment_status(
 
 
 @router.post("/deployments/command-preview", dependencies=csrf)
-async def command_preview(data: DeploymentIn, settings: Settings = Depends(get_settings_dep)) -> dict:
+async def command_preview(
+    data: DeploymentIn, db: AsyncSession = Depends(get_session), settings: Settings = Depends(get_settings_dep)
+) -> dict:
     """The command a deployment with these settings would start, for the form that is not saved yet. Validated like a
     create (the 422 text is for the admin to read); the pinned commits do not exist yet, a placeholder stands in."""
     fields = data.model_dump(exclude={"nodes"})
@@ -282,7 +285,7 @@ async def command_preview(data: DeploymentIn, settings: Settings = Depends(get_s
         draft_revision=None if not fields["draft_repo"] or is_local(fields["draft_repo"]) else "<commit>",
         meta=None,
     )
-    return builders.command_preview(dep, settings)
+    return builders.command_preview(dep, settings, await _leader_on_main(db, settings))
 
 
 @router.get("/deployments/{dep_id}/command")
@@ -290,7 +293,7 @@ async def deployment_command(
     dep_id: int, db: AsyncSession = Depends(get_session), settings: Settings = Depends(get_settings_dep)
 ) -> dict:
     """The command of a saved deployment, built by the same code that builds its pods."""
-    return builders.command_preview(await _one(db, dep_id), settings)
+    return builders.command_preview(await _one(db, dep_id), settings, await _leader_on_main(db, settings))
 
 
 class AssignmentIn(BaseModel):
@@ -378,14 +381,14 @@ async def hf_mmproj(repo: str, hf=Depends(get_hf)) -> list[dict]:
     return [{"file": f.path, "size_bytes": f.size, "quant": parse_quant(f.path)} for f in sorted(found, key=lambda f: f.path)]
 
 
-def _placement_view(plan: placement.SplitPlan) -> dict:
+def _placement_view(plan: placement.SplitPlan, leader_on_main: bool = False) -> dict:
     """Per node of the group: bytes and layers on its GPU and in its RAM, with the budgets (null: no such device)."""
     nodes: dict[str, dict] = {}
     for d in plan.devices:
         node = nodes.setdefault(
             d.node,
             {
-                "name": d.node, "leader": not nodes, "vram_bytes": 0, "vram_budget_bytes": None, "gpu_layers": 0,
+                "name": d.node, "leader": not nodes and not leader_on_main, "vram_bytes": 0, "vram_budget_bytes": None, "gpu_layers": 0,
                 "ram_bytes": 0, "ram_budget_bytes": None, "cpu_layers": 0,
             },
         )
@@ -415,6 +418,7 @@ def _first_group_plan(
     parallel: int = 1,
     kv_cache_type: str = "f16",
     leader_extra_bytes: int = 0,
+    leader_on_main: bool = False,
 ) -> placement.SplitPlan | None:
     """Placement of the first group the rules of `plan_groups` form from these nodes. Only an estimate: the
     controller also keeps running groups, spare and held nodes, so it may group them otherwise."""
@@ -425,8 +429,12 @@ def _first_group_plan(
     first = groups[min(groups)]
     return placement.plan_split(
         meta, [memories[w.node_name] for w in first], ctx_total, use_node_ram, pct, reserve_mib, parallel,
-        kv_cache_type, leader_extra_bytes,
+        kv_cache_type, leader_extra_bytes, leader_on_main,
     )
+
+
+async def _leader_on_main(db: AsyncSession, settings: Settings) -> bool:
+    return await settings_store.get(db, "split_leader_on_main", settings)
 
 
 def _need_bytes(estimate: est.Estimate, accel: str | None) -> int:
@@ -497,12 +505,13 @@ async def hf_estimate(
             (name, placement.split_capacity_bytes(m, use_node_ram, ram_budget_pct, reserve) if (m := memories.get(name.lower())) else None)
             for name in names
         ]
+        on_main = await _leader_on_main(db, settings)
         args = (
             ctx_per_request * parallel, use_node_ram, ram_budget_pct, settings.gpu_compute_reserve_mib, parallel,
-            kv_cache_type, estimate.extras_bytes,
+            kv_cache_type, estimate.extras_bytes, on_main,
         )
         plan = _first_group_plan(meta, memories, group_size, *args)
-        plan_view = _placement_view(plan) if plan is not None else None
+        plan_view = _placement_view(plan, on_main) if plan is not None else None
         recommended = _recommend_split(meta, memories, *args)
     else:
         accels = await service.node_capacities(db, k8s, names, with_accel=True)

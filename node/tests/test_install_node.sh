@@ -58,6 +58,7 @@ if [ -f "$SETUP" ]; then
   newroot init; : > "$TMP/setup.log"
   out="$(ACCEL=cpu setup)"; rc=$?
   [ $rc -eq 0 ] && pass "setup fresh distro succeeds" || { fail "setup fresh distro succeeds"; echo "$out"; }
+  contains "setup writes the classic image store before Docker is installed (no second copy of the layers)" "$(cat "$TMP/root/etc/docker/daemon.json" 2>/dev/null)" '"containerd-snapshotter": false'
   contains "setup enables systemd" "$(cat "$TMP/root/etc/wsl.conf" 2>/dev/null)" "systemd=true"
   contains "setup asks for a distro restart when systemd is not PID 1" "$out" "NSU_LLM_RESTART=1"
   log="$(cat "$TMP/setup.log")"
@@ -71,6 +72,69 @@ if [ -f "$SETUP" ]; then
   out="$(ACCEL=cpu setup)"
   contains "setup rerun needs no restart" "$out" "NSU_LLM_RESTART=0"
   lacks "setup rerun installs nothing" "$(cat "$TMP/setup.log")" "apt-get install"
+  # B3: the free space of the Windows disk is written for the node report (a unit and a timer in the distro)
+  hd="$TMP/root/usr/local/sbin/nsu-llm-host-disk"
+  contains "setup: the host-disk script reads df of the Windows disk" "$(cat "$hd" 2>/dev/null)" "df -Pk '/mnt/c'"
+  contains "setup: the host-disk unit runs the script" "$(cat "$TMP/root/etc/systemd/system/nsu-llm-host-disk.service" 2>/dev/null)" "ExecStart=/usr/local/sbin/nsu-llm-host-disk"
+  contains "setup: the host-disk timer fires every minute" "$(cat "$TMP/root/etc/systemd/system/nsu-llm-host-disk.timer" 2>/dev/null)" "OnUnitActiveSec=60"
+  contains "setup: the host-disk timer is enabled" "$(cat "$TMP/setup.log")" "systemctl enable nsu-llm-host-disk.timer"
+  lacks "setup rerun: the host-disk files are unchanged, the timer is not restarted" "$(cat "$TMP/setup.log")" "systemctl restart nsu-llm-host-disk.timer"
+  rm -f "$hd"; : > "$TMP/setup.log"
+  out="$(ACCEL=cpu setup)"
+  contains "setup: systemd is up and the script was missing (an upgrade): the timer is restarted" "$(cat "$TMP/setup.log")" "systemctl restart nsu-llm-host-disk.timer"
+  : > "$TMP/setup.log"
+  out="$(ACCEL=cpu setup)"
+  lacks "setup rerun: the host-disk files are unchanged, the timer is not restarted" "$(cat "$TMP/setup.log")" "systemctl restart nsu-llm-host-disk.timer"
+  mkdir -p "$TMP/hoststate"
+  cat > "$TMP/sbin/df" <<'EOS'
+#!/bin/sh
+echo "Filesystem 1024-blocks Used Available Capacity Mounted on"
+echo 'C:\ 488000000 400000000 88000000 82% /mnt/c'
+EOS
+  chmod +x "$TMP/sbin/df"
+  out="$(HOST_DISK_STATE="$TMP/hoststate/host-disk" ACCEL=cpu setup)"
+  PATH="$TMP/sbin:$PATH" sh "$hd" 2>/dev/null
+  hdj="$(cat "$TMP/hoststate/host-disk" 2>/dev/null)"
+  contains "host-disk script: the free bytes of the Windows disk" "$hdj" '"free_bytes":90112000000'
+  contains "host-disk script: the total bytes" "$hdj" '"total_bytes":499712000000'
+  contains "host-disk script: the mount and a timestamp" "$hdj" '"mount":"/mnt/c","free_bytes"'
+  rm -f "$TMP/hoststate/host-disk"; rmdir "$TMP/hoststate"
+  # B3: Docker keeps the classic image store (overlay2) so an image is not stored twice
+  cat > "$TMP/sbin/docker" <<'EOS'
+#!/bin/sh
+# fake docker: FAKE_DOCKER_DOWN=1 the daemon does not answer; FAKE_DOCKER_IMAGES=1 one image is in the store
+[ "${FAKE_DOCKER_DOWN:-0}" = 1 ] && exit 1
+case "$1 $2" in "image ls") [ "${FAKE_DOCKER_IMAGES:-0}" = 1 ] && echo abc123def456 ;; esac
+exit 0
+EOS
+  chmod +x "$TMP/sbin/docker"
+  printf '{"log-driver":"json-file"}\n' > "$TMP/root/etc/docker/daemon.json"
+  if command -v python3 >/dev/null 2>&1; then
+    out="$(ACCEL=cpu setup)"
+    contains "setup merges the image store setting into an existing daemon.json" "$(cat "$TMP/root/etc/docker/daemon.json")" '"containerd-snapshotter": false'
+    contains "setup keeps the other daemon.json keys" "$(cat "$TMP/root/etc/docker/daemon.json")" '"log-driver": "json-file"'
+  else
+    echo "skip - python3 not found, the daemon.json merge test is skipped"
+  fi
+  rm -f "$TMP/root/etc/docker/daemon.json"
+  out="$(FAKE_DOCKER_DOWN=1 ACCEL=cpu setup)"
+  [ ! -e "$TMP/root/etc/docker/daemon.json" ] && pass "setup does not touch the image store while the daemon does not answer (images unknown)" || fail "setup does not touch the image store while the daemon does not answer"
+  contains "setup says the daemon does not answer" "$out" "демон Docker не отвечает"
+  out="$(FAKE_DOCKER_IMAGES=1 ACCEL=cpu setup)"
+  [ ! -e "$TMP/root/etc/docker/daemon.json" ] && pass "setup leaves the image store alone when Docker already holds images" || fail "setup leaves the image store alone when Docker already holds images"
+  contains "setup says why the image store is not changed" "$out" "в Docker уже есть образы"
+  out="$(ACCEL=cpu setup)"
+  contains "setup sets the classic store when Docker answers and holds no images" "$(cat "$TMP/root/etc/docker/daemon.json" 2>/dev/null)" '"containerd-snapshotter": false'
+  : > "$TMP/setup.log"
+  out="$(ACCEL=cpu setup)"
+  lacks "setup rerun with the store already classic: no restart for it" "$(cat "$TMP/setup.log")" "systemctl restart docker"
+  PATH="$TMP/sbin:$PATH" sh "$hd" 2>/dev/null
+  [ ! -e "$TMP/hoststate/host-disk" ] && pass "host-disk script: no state dir yet (the node was never started): nothing is written" || fail "host-disk script: no state dir yet"
+  out="$(HOST_MOUNT=/mnt/d ACCEL=cpu setup)"
+  contains "setup: HOST_MOUNT=/mnt/d watches the other drive" "$(cat "$hd")" "df -Pk '/mnt/d'"
+  out="$(HOST_MOUNT='/mnt/c; rm -rf /' ACCEL=cpu setup)"
+  contains "setup: a malformed HOST_MOUNT falls back to /mnt/c (it is baked into a script)" "$(cat "$hd")" "df -Pk '/mnt/c'"
+  lacks "setup: and is never written into the script" "$(cat "$hd")" "rm -rf"
   [ "$(grep -c '^systemd=true' "$TMP/root/etc/wsl.conf")" = 1 ] && pass "setup keeps one systemd line" || fail "setup keeps one systemd line"
   # an existing wsl.conf with systemd=false is fixed in place, other settings kept
   printf '[boot]\nsystemd=false\n[network]\nhostname=keepme\n' > "$TMP/root/etc/wsl.conf"
@@ -87,6 +151,37 @@ if [ -f "$SETUP" ]; then
   contains "setup nvidia installs the pinned toolkit" "$log" "nvidia-container-toolkit=1.20.1-1 nvidia-container-toolkit-base=1.20.1-1 libnvidia-container-tools=1.20.1-1 libnvidia-container1=1.20.1-1"
   contains "setup nvidia configures the docker runtime" "$log" "nvidia-ctk runtime configure --runtime=docker"
   contains "setup nvidia restarts docker" "$log" "systemctl restart docker"
+  out="$(ACCEL=nvidia setup)"
+  lacks "setup nvidia: a toolkit that keeps daemon.json intact gives no image store warning" "$out" "пропал ключ"
+  # a rerun on a working node: same daemon.json, the daemon already knows the runtime: Docker (and the node with its model) stays up
+  cp "$TMP/sbin/docker" "$TMP/docker.keep"
+  cat > "$TMP/sbin/docker" <<'EOS'
+#!/bin/sh
+case "$1" in info) echo '{"nvidia":{"path":"nvidia-container-runtime"},"runc":{"path":"runc"}}' ;; esac
+exit 0
+EOS
+  : > "$TMP/setup.log"
+  out="$(FAKE_CTK=1.20.1-1 ACCEL=nvidia setup)"
+  lacks "setup nvidia rerun: nothing changed, Docker is not restarted" "$(cat "$TMP/setup.log")" "systemctl restart docker"
+  cp "$TMP/docker.keep" "$TMP/sbin/docker"
+  : > "$TMP/setup.log"
+  out="$(FAKE_CTK=1.20.1-1 ACCEL=nvidia setup)"
+  contains "setup nvidia rerun: the daemon does not know the runtime yet: Docker is restarted" "$(cat "$TMP/setup.log")" "systemctl restart docker"
+  cat > "$TMP/sbin/nvidia-ctk" <<'EOS'
+#!/usr/bin/env bash
+echo "nvidia-ctk $*" >> "$FAKE_SETUP_LOG"
+printf '{"runtimes":{"nvidia":{"path":"nvidia-container-runtime"}}}\n' > "$ROOT/etc/docker/daemon.json"
+exit 0
+EOS
+  out="$(ACCEL=nvidia setup)"
+  contains "setup nvidia: a toolkit that drops the image store key is noticed" "$out" "пропал ключ features.containerd-snapshotter=false"
+  contains "setup nvidia: and the key is written again" "$(cat "$TMP/root/etc/docker/daemon.json")" '"containerd-snapshotter": false'
+  if command -v python3 >/dev/null 2>&1; then contains "setup nvidia: the toolkit's runtimes key survives the merge" "$(cat "$TMP/root/etc/docker/daemon.json")" '"runtimes"'; fi
+  cat > "$TMP/sbin/nvidia-ctk" <<'EOS'
+#!/usr/bin/env bash
+echo "nvidia-ctk $*" >> "$FAKE_SETUP_LOG"
+exit 0
+EOS
   : > "$TMP/setup.log"
   out="$(FAKE_CTK=1.20.1-1 ACCEL=nvidia setup)"
   lacks "setup nvidia toolkit already pinned: no reinstall" "$(cat "$TMP/setup.log")" "apt-get install"
@@ -219,11 +314,13 @@ EOS
   # hermetic: run-node.ps1 keeps its state (state/labels, ca.crt, airgap) in a temp dir, never in the real C:\ProgramData
   mkdir -p "$TMP/nodedata"; export NSU_LLM_DATA_DIR="$(cygpath -w "$TMP/nodedata")"
   export FAKE_WIN_GPU='NVIDIA GeForce RTX 4070, 576.02, 12282' FAKE_WSL_GPU=1 FAKE_DISTROS='NSU-LLM' FAKE_RUNNING='NSU-LLM' \
-    FAKE_IMAGES='nsu-llm-node:0.2.0-gpu nsu-llm-node:0.2.0-cpu'
+    FAKE_IMAGES='nsu-llm-node:0.2.1-gpu nsu-llm-node:0.2.1-cpu'
   # Docker Desktop is detected by its docker-desktop distro or its exe; the dev machine has the exe, so point it away
   export NSU_LLM_DOCKER_DESKTOP_EXE='C:\no\Docker Desktop.exe'
   # a developer may run the tests over ssh: the installer must not take this session for the remote one unless a test says so
   export NSU_LLM_ASSUME_REMOTE=0
+  # plenty of free space by default (the real disk of the machine running the tests must not matter); the disk tests set their own
+  export NSU_LLM_TEST_FREE_GB=500
   # Network adapters with IPv4 addresses (Get-NetAdapter + Get-NetIPAddress), and Fast Startup, for Wake-on-LAN
   NIC_ETH='{"Name":"Ethernet","Description":"Intel(R) Ethernet Connection I219-V","Mac":"00-1A-2B-3C-4D-5E","Ip":"10.1.2.3","Prefix":24,"Hardware":true,"Virtual":false,"Media":"802.3","PmWake":"Disabled","MagicAdv":"0","S5":"0","Armed":false}'
   NIC_WSL='{"Name":"vEthernet (WSL (Hyper-V firewall))","Description":"Hyper-V Virtual Ethernet Adapter","Mac":"00-15-5D-01-02-03","Ip":"172.20.0.1","Prefix":20,"Hardware":false,"Virtual":true,"Media":"802.3"}'
@@ -252,7 +349,8 @@ EOS
   contains "wslconfig change restarts the WSL VM" "$out" "wsl --shutdown"
   # distro already present: no install
   lacks "existing distro is not reinstalled" "$out" "wsl --install"
-  contains "setup runs inside the distro as root" "$out" "wsl -d NSU-LLM -u root -e env ACCEL=nvidia bash /mnt/"
+  contains "setup runs inside the distro as root" "$out" "wsl -d NSU-LLM -u root -e env ACCEL=nvidia HOST_MOUNT=/mnt/"
+  contains "setup gets the Windows disk of the distro to watch" "$out" "bash /mnt/"
   # power
   contains "standby off on AC" "$out" "powercfg /setacvalueindex SCHEME_CURRENT SUB_SLEEP STANDBYIDLE 0"
   contains "standby off on DC" "$out" "powercfg /setdcvalueindex SCHEME_CURRENT SUB_SLEEP STANDBYIDLE 0"
@@ -276,7 +374,7 @@ EOS
   contains "boot task stores the password (runs without logon)" "$out" "-Password ***"
   # run-node.ps1 -Wsl is reused, not duplicated
   contains "run-node through WSL" "$out" "wsl -d NSU-LLM -u root -e docker run"
-  contains "run-node gpu image" "$out" "nsu-llm-node:0.2.0-gpu"
+  contains "run-node gpu image" "$out" "nsu-llm-node:0.2.1-gpu"
   contains "run-node node ip" "$out" "NODE_IP=10.1.2.3"
   contains "answers file would be saved" "$out" "install.json"
   log="$(cat "$TMP/fake.log")"
@@ -368,23 +466,23 @@ EOS
   lacks "wol: answered н keeps the button" "$out" "PBUTTONACTION"
 
   # fresh machine: no distro, online install; offline source uses --from-file
-  out="$(FAKE_DISTROS='' FAKE_RUNNING='' full -ImageTar 'C:\img\nsu-llm-node-0.2.0-gpu.tar.gz')"
+  out="$(FAKE_DISTROS='' FAKE_RUNNING='' full -ImageTar 'C:\img\nsu-llm-node-0.2.1-gpu.tar.gz')"
   contains "fresh distro install" "$out" "wsl --install Ubuntu-24.04 --name NSU-LLM --location"
   contains "fresh distro without launching the OOBE" "$out" "--no-launch"
-  contains "image tar loaded into the distro" "$out" "docker load -i /mnt/c/img/nsu-llm-node-0.2.0-gpu.tar.gz"
+  contains "image tar loaded into the distro" "$out" "docker load -i /mnt/c/img/nsu-llm-node-0.2.1-gpu.tar.gz"
   out="$(FAKE_DISTROS='' FAKE_RUNNING='' full -DistroSource 'C:\img\ubuntu-24.04.wsl' -ImageTar 'C:\img\n.tar')"
   contains "offline distro install" "$out" "[dry-run] wsl --install --from-file C:\\img\\ubuntu-24.04.wsl --name NSU-LLM"
   # no archive and no image: the image comes from main (registry https://<main>/v2/), pulled inside the distro after Docker is set up
   out="$(FAKE_DISTROS='' FAKE_RUNNING='' full)"; rc=$?
   [ $rc -eq 0 ] && pass "fresh distro without an image tar: dry run succeeds, the image comes from main" || { fail "fresh distro without an image tar: dry run succeeds (rc=$rc)"; echo "$out" | sed 's/^/    | /'; }
-  contains "no archive: the plan pulls the image from main" "$out" "скачать образ ноды nsu-llm-node:0.2.0-gpu с главного: https://10.9.0.5/v2/"
+  contains "no archive: the plan pulls the image from main" "$out" "скачать образ ноды nsu-llm-node:0.2.1-gpu с главного: https://10.9.0.5/v2/"
   contains "pull runs pull-image.sh in the distro as root" "$out" "-u root -e bash /mnt/"
-  contains "pull-image.sh gets the main and the image" "$out" "pull-image.sh --main 10.9.0.5 --image nsu-llm-node:0.2.0-gpu"
+  contains "pull-image.sh gets the main and the image" "$out" "pull-image.sh --main 10.9.0.5 --image nsu-llm-node:0.2.1-gpu"
   lacks "no archive: no docker load" "$out" "docker load"
   # the root of main is checked before Docker pins it (pull-image.sh alone would take it on trust): fingerprint, then --ca
   contains "the root of main is verified before the pull" "$out" "проверить корень CA главного (https://10.9.0.5/ca.crt)"
   contains "the fingerprint question is announced when none is given" "$out" "(не задан: печатается и подтверждается)"
-  contains "the verified root goes to pull-image.sh" "$out" "--image nsu-llm-node:0.2.0-gpu --no-tofu --ca /var/lib/nsu-llm-node/state/ca.crt"
+  contains "the verified root goes to pull-image.sh" "$out" "--image nsu-llm-node:0.2.1-gpu --no-tofu --ca /var/lib/nsu-llm-node/state/ca.crt"
   [ "$(before "$out" 'проверить корень CA главного')" -lt "$(before "$out" 'pull-image.sh --main')" ] && pass "the root is checked before the pull" || fail "the root is checked before the pull"
   out2="$(full -CaSha256 "$(printf 'ab%.0s' $(seq 32))" -ImageSource main)"
   contains "-CaSha256 is shown in the plan of the check" "$out2" "по отпечатку $(printf 'ab%.0s' $(seq 32))"
@@ -393,18 +491,18 @@ EOS
   mkdir -p "$IDIR/scripts"; printf '# pull-image.sh [--record FILE]
 ' > "$IDIR/scripts/pull-image.sh"
   out="$(FAKE_DISTROS='' FAKE_RUNNING='' full)"
-  contains "pull-image.sh with --record: the digest file in the node state" "$out" "--image nsu-llm-node:0.2.0-gpu --no-tofu --ca /var/lib/nsu-llm-node/state/ca.crt --record /var/lib/nsu-llm-node/state/image.digest"
+  contains "pull-image.sh with --record: the digest file in the node state" "$out" "--image nsu-llm-node:0.2.1-gpu --no-tofu --ca /var/lib/nsu-llm-node/state/ca.crt --record /var/lib/nsu-llm-node/state/image.digest"
   rm -rf "$IDIR"
 
   # the tag comes from main (GET /api/node-image = NODE_IMAGE_TAG), not from a constant of the scripts (found on the 122b bed: main ran
-  # 0.1.1, install-node pulled 0.1.1-gpu and run-node then checked the GPU with 0.2.0-gpu)
+  # 0.1.1, install-node pulled 0.1.1-gpu and run-node then checked the GPU with 0.2.1-gpu)
   NI='{"tag":"0.1.1","cpu":"nsu-llm-node:0.1.1-cpu","nvidia":"nsu-llm-node:0.1.1-gpu"}'
   out="$(FAKE_NODE_IMAGE="$NI" FAKE_DISTROS='' FAKE_RUNNING='' full)"; rc=$?
   [ $rc -eq 0 ] && pass "main names another tag: dry run succeeds" || { fail "main names another tag: dry run succeeds (rc=$rc)"; echo "$out" | sed 's/^/    | /'; }
   contains "main's tag: the pull is for the image main names" "$out" "pull-image.sh --main 10.9.0.5 --image nsu-llm-node:0.1.1-gpu"
   contains "main's tag: the plan says so" "$out" "скачать образ ноды nsu-llm-node:0.1.1-gpu с главного"
   contains "main's tag: run-node starts that very image" "$out" "nsu-llm-node:0.1.1-gpu"
-  lacks "main's tag: no stale 0.2.0 image anywhere in the plan" "$out" "nsu-llm-node:0.2.0"
+  lacks "main's tag: no stale 0.2.1 image anywhere in the plan" "$out" "nsu-llm-node:0.2.1"
   contains "the installer asked main without a token" "$(cat "$TMP/fake.log")" "https://10.9.0.5/api/node-image"
   lacks "the token is not sent to the public endpoint" "$(grep 'api/node-image' "$TMP/fake.log")" "SECRETTOKEN7"
   lacks "main names no digest: the pull is by tag, as before" "$out" "--digest"
@@ -415,8 +513,8 @@ EOS
   out="$(FAKE_NODE_IMAGE='{"cpu":"nsu-llm-node:0.1.1-cpu","nvidia":"nsu-llm-node:0.1.1-gpu","digest":{"nvidia":"sha256:zz"}}' FAKE_DISTROS='' FAKE_RUNNING='' full)"
   lacks "a malformed digest is ignored" "$out" "--digest"
   out="$(FAKE_NODE_IMAGE='{"cpu":"evil:1","nvidia":"nsu-llm-node:../x"}' FAKE_DISTROS='' FAKE_RUNNING='' full)"
-  contains "a name that is not ours is ignored: IMAGE_VERSION of the scripts" "$out" "pull-image.sh --main 10.9.0.5 --image nsu-llm-node:0.2.0-gpu"
-  [ "$(head -n1 "$NODE/IMAGE_VERSION" | tr -d '[:space:]')" = "0.2.0" ] && pass "IMAGE_VERSION is the one shared fallback" || fail "IMAGE_VERSION is the one shared fallback"
+  contains "a name that is not ours is ignored: IMAGE_VERSION of the scripts" "$out" "pull-image.sh --main 10.9.0.5 --image nsu-llm-node:0.2.1-gpu"
+  [ "$(head -n1 "$NODE/IMAGE_VERSION" | tr -d '[:space:]')" = "0.2.1" ] && pass "IMAGE_VERSION is the one shared fallback" || fail "IMAGE_VERSION is the one shared fallback"
   for f in install-node.ps1 run-node.ps1 run-node.sh; do
     ! grep -nE '^[$]Version = .[0-9]|^VERSION="[0-9]' "$NODE/$f" >/dev/null && pass "$f has no version constant of its own" || fail "$f has no version constant of its own"
   done
@@ -426,8 +524,8 @@ EOS
   [ $rc -ne 0 ] && pass "-ImageSource tar without an archive fails" || fail "-ImageSource tar without an archive fails"
   contains "-ImageSource tar: the fix names -ImageTar" "$out" "-ImageTar"
   # -ImageSource main pulls even when the image is already there (refresh after an update of main) and ignores archives
-  out="$(full -ImageSource main -ImageTar 'C:\img\nsu-llm-node-0.2.0-gpu.tar.gz')"
-  contains "-ImageSource main pulls although the image exists" "$out" "pull-image.sh --main 10.9.0.5 --image nsu-llm-node:0.2.0-gpu"
+  out="$(full -ImageSource main -ImageTar 'C:\img\nsu-llm-node-0.2.1-gpu.tar.gz')"
+  contains "-ImageSource main pulls although the image exists" "$out" "pull-image.sh --main 10.9.0.5 --image nsu-llm-node:0.2.1-gpu"
   lacks "-ImageSource main ignores the archive" "$out" "docker load"
   contains "-ImageSource main is saved with the answers" "$out" "ImageSource=main"
   out="$(full)"
@@ -444,12 +542,12 @@ EOS
 
   # GPU: driver too old / no GPU in WSL -> cpu with an explanation; -Accel nvidia then fails
   out="$(FAKE_WIN_GPU='NVIDIA GeForce RTX 4070, 552.44, 12282' full)"
-  contains "old driver falls back to cpu" "$out" "nsu-llm-node:0.2.0-cpu"
+  contains "old driver falls back to cpu" "$out" "nsu-llm-node:0.2.1-cpu"
   contains "old driver explained" "$out" "570"
   out="$(FAKE_WIN_GPU='NVIDIA GeForce RTX 4070, 552.44, 12282' full -Accel nvidia)"; rc=$?
   [ $rc -ne 0 ] && pass "-Accel nvidia with an old driver fails" || fail "-Accel nvidia with an old driver fails"
   out="$(FAKE_WIN_GPU='' full)"
-  contains "no nvidia-smi -> cpu" "$out" "nsu-llm-node:0.2.0-cpu"
+  contains "no nvidia-smi -> cpu" "$out" "nsu-llm-node:0.2.1-cpu"
   lacks "cpu node gets no toolkit" "$out" "ACCEL=nvidia"
   out="$(FAKE_WSL_GPU=0 full)"
   contains "no GPU in WSL -> cpu" "$out" "ACCEL=cpu"
@@ -534,8 +632,8 @@ EOS
   contains "secured dir: owner Administrators, protected DACL" "$out" "владелец Administrators, SYSTEM и Administrators полный доступ, Users чтение, без наследования от ProgramData"
   # dry run lists the saved answers with absolute paths and the node address (task mode loses nothing)
   contains "saved answers keep the node address" "$out" "NodeIp=10.1.2.3"
-  out="$(FAKE_DISTROS='' FAKE_RUNNING='' full -ImageTar 'rel\nsu-llm-node-0.2.0-gpu.tar.gz' -DistroSource 'rel\ubuntu.wsl')"
-  contains "ImageTar saved absolute" "$out" "ImageTar=$(cygpath -w "$PWD")\\rel\\nsu-llm-node-0.2.0-gpu.tar.gz"
+  out="$(FAKE_DISTROS='' FAKE_RUNNING='' full -ImageTar 'rel\nsu-llm-node-0.2.1-gpu.tar.gz' -DistroSource 'rel\ubuntu.wsl')"
+  contains "ImageTar saved absolute" "$out" "ImageTar=$(cygpath -w "$PWD")\\rel\\nsu-llm-node-0.2.1-gpu.tar.gz"
   contains "DistroSource saved absolute" "$out" "DistroSource=$(cygpath -w "$PWD")\\rel\\ubuntu.wsl"
 
   # ---------------------------------------------------------------- secure-dir.ps1 (shared with class-deploy): unit checks as a normal user
@@ -692,41 +790,41 @@ EOS
   rm -rf "$IDIR"
 
   # wsl\ is created admin-only BEFORE wsl --install --location (otherwise ext4.vhdx would inherit Users read)
-  out="$(FAKE_DISTROS='' FAKE_RUNNING='' full -ImageTar 'C:\img\nsu-llm-node-0.2.0-gpu.tar.gz')"
+  out="$(FAKE_DISTROS='' FAKE_RUNNING='' full -ImageTar 'C:\img\nsu-llm-node-0.2.1-gpu.tar.gz')"
   mk="$(echo "$out" | grep -n 'New-SecureDir .*wsl -NoUsers' | head -1 | cut -d: -f1)"; wi="$(echo "$out" | grep -n 'dry-run\] wsl --install Ubuntu' | head -1 | cut -d: -f1)"
   [ -n "$mk" ] && [ -n "$wi" ] && [ "$mk" -lt "$wi" ] && pass "wsl dir created admin-only before wsl --install" || fail "wsl dir created admin-only before wsl --install ($mk, $wi)"
 
   # Find-ImageTar looks only next to the script, and only at archives an administrator controls
   NC="$TMP/nodecopy"; mkdir -p "$NC/node"
   cp "$NODE"/install-node.ps1 "$NODE"/run-node.ps1 "$NODE"/node-boot.ps1 "$NODE"/wsl-setup.sh "$NODE"/pull-image.sh "$NODE"/secure-dir.ps1 "$NODE"/class-run.ps1 "$NODE"/IMAGE_VERSION "$NC/node/"
-  echo img > "$NC/nsu-llm-node-0.2.0-gpu.tar.gz"                     # the parent (C:\ProgramData from the stage): not searched
-  echo img > "$NC/node/nsu-llm-node-0.2.0-gpu.tar.gz"
-  icacls "$(cygpath -w "$NC/node/nsu-llm-node-0.2.0-gpu.tar.gz")" /grant '*S-1-1-0:(M)' >/dev/null
+  echo img > "$NC/nsu-llm-node-0.2.1-gpu.tar.gz"                     # the parent (C:\ProgramData from the stage): not searched
+  echo img > "$NC/node/nsu-llm-node-0.2.1-gpu.tar.gz"
+  icacls "$(cygpath -w "$NC/node/nsu-llm-node-0.2.1-gpu.tar.gz")" /grant '*S-1-1-0:(M)' >/dev/null
   NCI="$(cygpath -w "$NC/node/install-node.ps1")"
   ncrun() { PATH="$FB:$PATH" FAKE_LOG="$(cygpath -w "$TMP/fake.log")" "$PS" -NoProfile -ExecutionPolicy Bypass -File "$NCI" \
       -InstallDir "$(cygpath -w "$IDIR")" -WslConfigPath "$(cygpath -w "$TMP/wslconfig")" -DryRun -NonInteractive -Main 10.9.0.5 -Token T -NodeIp 10.1.2.3 -Name pc01 -MemoryGB 28 -TaskPassword pw "$@" 2>&1; }
   out="$(FAKE_DISTROS='' FAKE_RUNNING='' ncrun)"
   contains "image tar writable by others is skipped" "$out" "пропущен: его создал или может менять не администратор"
-  lacks "image tar in the parent dir is never used" "$out" "nodecopy/nsu-llm-node-0.2.0-gpu.tar.gz"
+  lacks "image tar in the parent dir is never used" "$out" "nodecopy/nsu-llm-node-0.2.1-gpu.tar.gz"
   lacks "no untrusted image loaded" "$out" "docker load"
-  icacls "$(cygpath -w "$NC/node/nsu-llm-node-0.2.0-gpu.tar.gz")" /remove:g '*S-1-1-0' >/dev/null
+  icacls "$(cygpath -w "$NC/node/nsu-llm-node-0.2.1-gpu.tar.gz")" /remove:g '*S-1-1-0' >/dev/null
   out="$(FAKE_DISTROS='' FAKE_RUNNING='' ncrun)"
   contains "trusted image tar next to the script is used" "$out" "docker load -i /mnt/"
-  icacls "$(cygpath -w "$NC/node/nsu-llm-node-0.2.0-gpu.tar.gz")" /grant '*S-1-1-0:(M)' >/dev/null
+  icacls "$(cygpath -w "$NC/node/nsu-llm-node-0.2.1-gpu.tar.gz")" /grant '*S-1-1-0:(M)' >/dev/null
   fsout="$(NSU_LLM_TEST_FS=exFAT FAKE_DISTROS='' FAKE_RUNNING='' ncrun)"
   contains "image tar on FAT/exFAT: says to copy it to NTFS" "$fsout" "скопируйте архив на NTFS-диск (например, C:\\)"
-  contains "trusted image tar: the one next to the script" "$out" "nodecopy/node/nsu-llm-node-0.2.0-gpu.tar.gz"
+  contains "trusted image tar: the one next to the script" "$out" "nodecopy/node/nsu-llm-node-0.2.1-gpu.tar.gz"
   # an archive of another version than main's image (NODE_IMAGE_TAG): docker load would give the wrong name, so main's image is pulled
-  icacls "$(cygpath -w "$NC/node/nsu-llm-node-0.2.0-gpu.tar.gz")" /remove:g '*S-1-1-0' >/dev/null
+  icacls "$(cygpath -w "$NC/node/nsu-llm-node-0.2.1-gpu.tar.gz")" /remove:g '*S-1-1-0' >/dev/null
   out="$(FAKE_NODE_IMAGE='{"tag":"0.1.1","cpu":"nsu-llm-node:0.1.1-cpu","nvidia":"nsu-llm-node:0.1.1-gpu"}' FAKE_DISTROS='' FAKE_RUNNING='' ncrun)"; rc=$?
   [ $rc -eq 0 ] && pass "archive of another version: the dry run succeeds" || { fail "archive of another version: the dry run succeeds (rc=$rc)"; echo "$out" | sed 's/^/    | /'; }
   contains "archive of another version: says it is not used" "$out" "архив не используется, образ nsu-llm-node:0.1.1-gpu будет скачан с главного"
   contains "archive of another version: main's image is pulled" "$out" "pull-image.sh --main 10.9.0.5 --image nsu-llm-node:0.1.1-gpu"
   lacks "archive of another version: nothing is loaded" "$out" "docker load"
-  out="$(FAKE_NODE_IMAGE='{"tag":"0.1.1","cpu":"nsu-llm-node:0.1.1-cpu","nvidia":"nsu-llm-node:0.1.1-gpu"}' FAKE_DISTROS='' FAKE_RUNNING='' ncrun -ImageTar "$(cygpath -w "$NC/node/nsu-llm-node-0.2.0-gpu.tar.gz")")"; rc=$?
+  out="$(FAKE_NODE_IMAGE='{"tag":"0.1.1","cpu":"nsu-llm-node:0.1.1-cpu","nvidia":"nsu-llm-node:0.1.1-gpu"}' FAKE_DISTROS='' FAKE_RUNNING='' ncrun -ImageTar "$(cygpath -w "$NC/node/nsu-llm-node-0.2.1-gpu.tar.gz")")"; rc=$?
   [ $rc -ne 0 ] && pass "archive of another version named with -ImageTar: an error" || fail "archive of another version named with -ImageTar: an error"
   contains "archive of another version named with -ImageTar: names the file that is needed" "$out" "nsu-llm-node-0.1.1-gpu.tar.gz"
-  out="$(FAKE_NODE_IMAGE='{"tag":"0.2.0","cpu":"nsu-llm-node:0.2.0-cpu","nvidia":"nsu-llm-node:0.2.0-gpu"}' FAKE_DISTROS='' FAKE_RUNNING='' ncrun)"
+  out="$(FAKE_NODE_IMAGE='{"tag":"0.2.1","cpu":"nsu-llm-node:0.2.1-cpu","nvidia":"nsu-llm-node:0.2.1-gpu"}' FAKE_DISTROS='' FAKE_RUNNING='' ncrun)"
   contains "archive of main's version is loaded as before" "$out" "docker load -i /mnt/"
   rm -rf "$NC" "$IDIR"
 
@@ -845,12 +943,12 @@ EOS
   contains "desktop: power still set" "$out" "powercfg /hibernate off"
   contains "desktop: engine checked" "$(cat "$TMP/fake.log")" "docker info"
   # image archive goes to the Windows docker
-  out="$(FAKE_DISTROS="$DD" FAKE_IMAGES='' inst -DryRun -NonInteractive -Main 10.9.0.5 -Token T -NodeIp 10.1.2.3 -Name pc01 -ImageTar 'C:\img\nsu-llm-node-0.2.0-gpu.tar.gz')"
-  contains "desktop: image loaded by the Windows docker" "$out" "[dry-run] docker load -i C:\\img\\nsu-llm-node-0.2.0-gpu.tar.gz"
+  out="$(FAKE_DISTROS="$DD" FAKE_IMAGES='' inst -DryRun -NonInteractive -Main 10.9.0.5 -Token T -NodeIp 10.1.2.3 -Name pc01 -ImageTar 'C:\img\nsu-llm-node-0.2.1-gpu.tar.gz')"
+  contains "desktop: image loaded by the Windows docker" "$out" "[dry-run] docker load -i C:\\img\\nsu-llm-node-0.2.1-gpu.tar.gz"
   # Docker Desktop: the Windows docker pulls itself, only when Windows already trusts the certificate of main; the installer never fetches or writes a CA there
   out="$(FAKE_DISTROS="$DD" FAKE_IMAGES='' inst -DryRun -NonInteractive -Main 10.9.0.5 -Token T -NodeIp 10.1.2.3 -Name pc01)"
-  contains "desktop: the image is pulled from main" "$out" "[dry-run] docker pull 10.9.0.5/nsu-llm-node:0.2.0-gpu"
-  contains "desktop: retagged to the local name" "$out" "[dry-run] docker tag 10.9.0.5/nsu-llm-node:0.2.0-gpu nsu-llm-node:0.2.0-gpu"
+  contains "desktop: the image is pulled from main" "$out" "[dry-run] docker pull 10.9.0.5/nsu-llm-node:0.2.1-gpu"
+  contains "desktop: retagged to the local name" "$out" "[dry-run] docker tag 10.9.0.5/nsu-llm-node:0.2.1-gpu nsu-llm-node:0.2.1-gpu"
   lacks "desktop: no CA is fetched with -k and nothing is written to certs.d" "$out" "certs.d"
   contains "desktop: Windows trust is probed first" "$out" "https://10.9.0.5/v2/ (сертификат главного должен приниматься Windows"
   # engine not running: clear message with the fix
@@ -940,6 +1038,10 @@ EOS
   out="$(NSU_LLM_TEST_INSTALL_TASK=Running inst -Status -Main 127.0.0.1 -Name pc01)"
   contains "status: the running install is shown" "$out" "идёт установка в разовой задаче NSU-LLM-Install"
   contains "status: with the last log lines" "$out" "последняя строка"
+  # inside the task the output of -Status IS this log: reading its tail would feed the log into itself without end
+  out="$(NSU_LLM_TEST_INSTALL_TASK=Running inst -Status -FromTask -Main 127.0.0.1 -Name pc01)"
+  lacks "status inside the task itself: its own log is not read back" "$out" "последняя строка"
+  lacks "status inside the task itself: does not report itself as a running task" "$out" "идёт установка в разовой задаче"
   printf '1' > "$IDIR/run/run.done"
   out="$(inst -Status -Main 127.0.0.1 -Name pc01)"
   contains "status: a failed last run is a problem" "$out" "завершился с кодом 1"
@@ -975,7 +1077,7 @@ EOS
   contains "old driver: how to update" "$out" "nvidia.com/Download"
   out="$(printf '10.9.0.5\nTOKEN9\n\n\n\nд\nд\n' | FAKE_WIN_GPU="$OLD" inst -DryRun -NodeIp 10.1.2.3 -Name pc01 -TaskPassword pw)"; rc=$?
   [ $rc -eq 0 ] && pass "old driver: accepting continues" || { fail "old driver: accepting continues (rc=$rc)"; echo "$out" | sed 's/^/    | /'; }
-  contains "old driver: accepted -> cpu image" "$out" "nsu-llm-node:0.2.0-cpu"
+  contains "old driver: accepted -> cpu image" "$out" "nsu-llm-node:0.2.1-cpu"
   out="$(FAKE_WIN_GPU="$OLD" full)"
   lacks "old driver: non-interactive never asks" "$out" "Продолжить как CPU-нода"
   contains "old driver: non-interactive says how to update" "$out" "nvidia.com/Download"
@@ -988,7 +1090,7 @@ EOS
 
   # ---------------------------------------------------------------- the saved image tar was deleted after install (class-deploy)
   mkdir -p "$IDIR"
-  printf '{"Main":"10.9.0.5","Mode":"k3s","Name":"pc01","ImageTar":"C:\\\\staged\\\\gone\\\\nsu-llm-node-0.2.0-gpu.tar.gz"}' > "$IDIR/install.json"
+  printf '{"Main":"10.9.0.5","Mode":"k3s","Name":"pc01","ImageTar":"C:\\\\staged\\\\gone\\\\nsu-llm-node-0.2.1-gpu.tar.gz"}' > "$IDIR/install.json"
   out="$(CLUSTER_TOKEN=T inst -DryRun -NonInteractive -NodeIp 10.1.2.3 -TaskPassword pw)"; rc=$?
   [ $rc -eq 0 ] && pass "gone tar + loaded image: re-run succeeds" || { fail "gone tar + loaded image: re-run succeeds (rc=$rc)"; echo "$out" | sed 's/^/    | /'; }
   contains "gone tar + loaded image: tar skipped" "$out" "уже загружен"
@@ -1053,7 +1155,7 @@ EOS
   # desktop uninstall also removes the node images
   mkdir -p "$IDIR"; printf '{"Main":"10.9.0.5","Name":"pc01","Mode":"k3s","Docker":"desktop"}' > "$IDIR/install.json"
   out="$(FAKE_DISTROS="NSU-LLM docker-desktop" inst -DryRun -NonInteractive -Uninstall)"
-  contains "desktop uninstall removes the node images" "$out" "docker rmi nsu-llm-node:0.2.0-gpu"
+  contains "desktop uninstall removes the node images" "$out" "docker rmi nsu-llm-node:0.2.1-gpu"
   rm -rf "$IDIR"
 
   # -Uninstall: reverse of the install, using the saved state
@@ -1109,6 +1211,221 @@ EOS
   contains "status wol adapter" "$out" "Wake-on-LAN: Ethernet"
   contains "status wol magic packet off is a problem" "$out" "Wake on Magic Packet выключен"
   contains "status fast startup on is a problem" "$out" "быстрый запуск Windows включён"
+
+
+  # ---------------------------------------------------------------- B3: the system disk must not fill up because of the node
+  # the check before the install
+  out="$(NSU_LLM_TEST_FREE_GB=12 FAKE_IMAGES='' full)"; rc=$?
+  [ $rc -ne 0 ] && pass "disk: 12 GB free and an image to fetch stops the install" || fail "disk: 12 GB free and an image to fetch stops the install"
+  contains "disk: the error names the free space and the floor" "$out" "свободно 12 ГБ, а для установки ноды нужно не меньше 14 ГБ"
+  contains "disk: the error tells what happens on a full disk" "$out" "ошибками ввода-вывода"
+  contains "disk: the fix names the option and the cleanup" "$out" "-MinFreeGB"
+  contains "disk: the fix points at Windows storage cleanup" "$out" "Временные файлы"
+  lacks "disk: nothing is planned after the error" "$out" "Будет сделано"
+  out="$(NSU_LLM_TEST_FREE_GB=12 FAKE_DISTROS='' FAKE_RUNNING='' full)"; rc=$?
+  [ $rc -ne 0 ] && pass "disk: 12 GB free and no distro stops the install" || fail "disk: 12 GB free and no distro stops the install"
+  out="$(NSU_LLM_TEST_FREE_GB=12 full)"; rc=$?
+  [ $rc -eq 0 ] && pass "disk: a node that is already installed is not blocked by low space" || { fail "disk: a node that is already installed is not blocked by low space"; echo "$out" | sed 's/^/    | /'; }
+  contains "disk: the installed node only gets a warning" "$out" "меньше порога 14 ГБ"
+  out="$(NSU_LLM_TEST_FREE_GB=16 FAKE_IMAGES='' full)"; rc=$?
+  [ $rc -eq 0 ] && pass "disk: 16 GB free is enough" || fail "disk: 16 GB free is enough"
+  contains "disk: 16 GB free warns about the recommended 18" "$out" "рекомендуется не меньше 18 ГБ"
+  out="$(full)"
+  contains "disk: the free space is printed" "$out" "Свободно на диске"
+  lacks "disk: plenty of space: no warning" "$out" "рекомендуется не меньше"
+  out="$(NSU_LLM_TEST_FREE_GB=1 FAKE_IMAGES='' full -MinFreeGB 0)"; rc=$?
+  [ $rc -eq 0 ] && pass "disk: -MinFreeGB 0 switches the check off" || fail "disk: -MinFreeGB 0 switches the check off"
+  lacks "disk: switched off: no warning either" "$out" "рекомендуется не меньше"
+  out="$(NSU_LLM_TEST_FREE_GB=12 FAKE_IMAGES='' full -MinFreeGB 10 -WarnFreeGB 15)"; rc=$?
+  [ $rc -eq 0 ] && pass "disk: -MinFreeGB 10 lets 12 GB through" || fail "disk: -MinFreeGB 10 lets 12 GB through"
+  contains "disk: the thresholds are saved with the answers" "$out" "MinFreeGB=10; WarnFreeGB=15"
+  # -Status
+  out="$(NSU_LLM_TEST_FREE_GB=12 inst -Status -Main 127.0.0.1 -Name pc01)"; rc=$?
+  contains "disk status: below the floor is a problem" "$out" "[!!] на диске"
+  contains "disk status: names the free space and the floor" "$out" "свободно 12 ГБ, меньше порога 14 ГБ"
+  [ $rc -ne 0 ] && pass "disk status: exit code is not 0" || fail "disk status: exit code is not 0"
+  out="$(NSU_LLM_TEST_FREE_GB=16 inst -Status -Main 127.0.0.1 -Name pc01)"
+  contains "disk status: between the floor and the recommendation: a note" "$out" "[--] на диске"
+  contains "disk status: the note names the recommendation" "$out" "меньше рекомендованных 18 ГБ"
+  out="$(NSU_LLM_TEST_FREE_GB=500 inst -Status -Main 127.0.0.1 -Name pc01)"
+  contains "disk status: plenty of space is ok" "$out" "[ok] на диске"
+  contains "disk status: no sparse disk yet is said" "$out" "диск дистрибутива не разреженный"
+  mkdir -p "$IDIR"; printf '{"DistroSparse":true}' > "$IDIR/state.json"
+  out="$(inst -Status -Main 127.0.0.1 -Name pc01)"
+  contains "disk status: a sparse disk is said" "$out" "диск дистрибутива разреженный"
+  mkdir -p "$IDIR/tmp"; head -c 2048 /dev/zero > "$IDIR/tmp/wsl-rootfs.tar"
+  out="$(inst -Status -Main 127.0.0.1 -Name pc01)"
+  contains "disk status: leftovers of an interrupted install are shown" "$out" "остатки установки в"
+  rm -rf "$IDIR"
+  # the footprint of the node against the 16 GB limit
+  mkdir -p "$IDIR"; head -c 4096 /dev/zero > "$IDIR/some.bin"
+  out="$(NSU_LLM_TEST_FOOTPRINT_GB=21.4 inst -Status -Main 127.0.0.1 -Name pc01)"; rc=$?
+  contains "footprint status: above 16 GB is a problem" "$out" "[!!] нода занимает на диске 21.4 ГБ"
+  contains "footprint status: names the limit" "$out" "больше лимита 16 ГБ для ПК класса"
+  contains "footprint status: and what to remove" "$out" "docker image prune -a"
+  out="$(NSU_LLM_TEST_FOOTPRINT_GB=9.5 inst -Status -Main 127.0.0.1 -Name pc01)"
+  contains "footprint status: below the limit is ok" "$out" "[ok] нода занимает на диске 9.5 ГБ из 16 ГБ"
+  out="$(inst -Status -Main 127.0.0.1 -Name pc01)"
+  contains "footprint status: measured from the install dir" "$out" "[ok] нода занимает на диске 0 ГБ из 16 ГБ"
+  # a sparse disk of the distro keeps its length after a model is removed: the limit counts the space on the disk
+  mkdir -p "$IDIR/wsl"; sp="$(cygpath -w "$IDIR/wsl/ext4.vhdx")"
+  if fsutil file createnew "$sp" 20000000000 >/dev/null 2>&1 && fsutil sparse setflag "$sp" >/dev/null 2>&1 && fsutil sparse setrange "$sp" 0 20000000000 >/dev/null 2>&1; then
+    out="$(inst -Status -Main 127.0.0.1 -Name pc01)"
+    contains "footprint status: a hole in a sparse disk does not count" "$out" "[ok] нода занимает на диске 0 ГБ из 16 ГБ"
+  fi
+  rm -f "$IDIR/wsl/ext4.vhdx"
+  rm -rf "$IDIR"
+  # the sparse disk of the distro
+  out="$(full)"
+  contains "sparse: an existing distro without the flag gets a step" "$out" "сделать диск дистрибутива NSU-LLM разреженным"
+  contains "sparse: the distro is stopped first" "$out" "[dry-run] wsl --terminate NSU-LLM"
+  contains "sparse: wsl --manage --set-sparse true" "$out" "[dry-run] wsl --manage NSU-LLM --set-sparse true"
+  out="$(full -NoSparse)"
+  lacks "sparse: -NoSparse: no set-sparse step" "$out" "--set-sparse"
+  mkdir -p "$IDIR"; printf '{"DistroSparse":true}' > "$IDIR/state.json"
+  out="$(full)"
+  lacks "sparse: already done (state): not repeated" "$out" "--set-sparse"
+  rm -rf "$IDIR"
+  out="$(FAKE_DISTROS='' FAKE_RUNNING='' full)"
+  contains "sparse: a new distro is made sparse right after it is installed" "$out" "сделать диск дистрибутива разреженным"
+  pos_inst="$(before "$out" "[dry-run] wsl --install")"; pos_sp="$(before "$out" "[dry-run] wsl --manage")"; pos_run="$(before "$out" "[dry-run] wsl -d NSU-LLM -u root -e true")"
+  [ "$pos_inst" -lt "$pos_sp" ] && [ "$pos_sp" -lt "$pos_run" ] && pass "sparse: after the install and before the distro is started" || fail "sparse: order ($pos_inst $pos_sp $pos_run)"
+  out="$(FAKE_DISTROS="$DD" full -Docker desktop)"
+  lacks "sparse: Docker Desktop has no distro of ours: no set-sparse" "$out" "--set-sparse"
+  # the helpers run for real against stubs: the functions are taken from install-node.ps1 itself
+  cat > "$TMP/b3fn.ps1" <<'EOS'
+param([string]$Script, [string]$Dir, [string]$What)
+$ErrorActionPreference = 'Stop'
+$t = $null; $e = $null
+$ast = [Management.Automation.Language.Parser]::ParseFile($Script, [ref]$t, [ref]$e)
+function Get-FnText([string]$n) {
+    $f = $ast.Find({ param($x) $x -is [Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq $n }, $true)
+    if (-not $f) { throw "no function $n" }
+    return $f.Extent.Text
+}
+$DryRun = $false
+function Show-Dry($x) { Write-Host "[dry-run] $x" }
+function Say($x) { Write-Host $x }
+function Warn($x) { Write-Host "Внимание: $x" }
+function Initialize-InstallDir { }
+if ($What -eq 'temp') {
+    . ([scriptblock]::Create((Get-FnText 'Remove-InstallerTemp')))
+    . ([scriptblock]::Create((Get-FnText 'Invoke-WithInstallerTemp')))
+    $TmpDir = Join-Path $Dir 'tmp'; $ImagesDir = Join-Path $Dir 'images'
+    New-Item -ItemType Directory -Force -Path $ImagesDir | Out-Null; Set-Content (Join-Path $ImagesDir 'stale.tar') 'x'
+    Set-Content (Join-Path $Dir 'other.txt') 'keep me'
+    $before = $env:TEMP
+    $ret = Invoke-WithInstallerTemp { Write-Host "inside: TEMP=$env:TEMP TMP=$env:TMP"; Set-Content (Join-Path $env:TEMP 'wsl-rootfs.tar') 'data'; Write-Host "inside: stale images gone=$(-not (Test-Path (Join-Path $Dir 'images')))"; return 7 }
+    Write-Host "ok: returned=$ret tmp exists=$(Test-Path $TmpDir) images exists=$(Test-Path $ImagesDir) temp restored=$($env:TEMP -eq $before) other kept=$(Test-Path (Join-Path $Dir 'other.txt'))"
+    try { Invoke-WithInstallerTemp { Set-Content (Join-Path $env:TEMP 'partial.tar') 'data'; New-Item -ItemType Directory -Force -Path $ImagesDir | Out-Null; throw 'boom' } } catch { Write-Host "failed: $($_.Exception.Message)" }
+    Write-Host "after error: tmp exists=$(Test-Path $TmpDir) images exists=$(Test-Path $ImagesDir) temp restored=$($env:TEMP -eq $before) other kept=$(Test-Path (Join-Path $Dir 'other.txt'))"
+    $DryRun = $true
+    Invoke-WithInstallerTemp { Write-Host "dry body ran, TEMP unchanged=$($env:TEMP -eq $before)" } | Out-Null
+}
+elseif ($What -eq 'deltar-unc') {
+    . ([scriptblock]::Create((Get-FnText 'Remove-LoadedImageTar')))
+    $script:removed = 0
+    function Remove-Item { $script:removed++ }
+    $ImageTar = '\\srv\share\nsu-llm-node-0.2.1-cpu.tar.gz'
+    $DeleteImageTar = [switch]$true
+    Remove-LoadedImageTar
+    Write-Host "removed=$script:removed"
+}
+elseif ($What -like 'deltar*') {
+    . ([scriptblock]::Create((Get-FnText 'Remove-LoadedImageTar')))
+    $ImageTar = Join-Path $Dir 'nsu-llm-node-0.2.1-cpu.tar.gz'
+    Set-Content $ImageTar 'img'
+    $DeleteImageTar = [switch]($What -ne 'deltar-off')
+    if ($What -eq 'deltar-dry') { $DryRun = $true }
+    Remove-LoadedImageTar
+    Write-Host "archive exists=$(Test-Path $ImageTar)"
+}
+else {
+    . ([scriptblock]::Create((Get-FnText 'Set-DistroSparse')))
+    $Distro = 'NSU-LLM'; $MinWslSparse = [version]'2.0.0'; $NoSparse = [switch]$false
+    $script:calls = @()
+    function Get-WslVersion { return [version]$env:FAKE_WSLVER }
+    function Set-State($n, $v) { Write-Host "state $n=$v" }
+    function Save-State { }
+    function Invoke-Change([string[]]$c, [string]$what, [string]$fix = '', [switch]$AllowFail) {
+        Write-Host "run: $($c -join ' ')"
+        if ($c -contains '--shutdown') { $script:wslDown = $true }
+        if ($c -contains '--set-sparse') {
+            switch ($env:FAKE_SPARSE) {
+                'ok' { return [pscustomobject]@{ Code = 0; Out = '' } }
+                'busy' { if ($c -notcontains '--allow-unsafe') { return [pscustomobject]@{ Code = 1; Out = 'use --allow-unsafe' } }; if ($script:wslDown) { return [pscustomobject]@{ Code = 0; Out = '' } }; return [pscustomobject]@{ Code = -1; Out = 'Wsl/Service/ERROR_SHARING_VIOLATION' } }
+                'stuck' { return [pscustomobject]@{ Code = -1; Out = 'Wsl/Service/ERROR_SHARING_VIOLATION' } }
+                'unsafe' { if ($c -contains '--allow-unsafe') { return [pscustomobject]@{ Code = 0; Out = '' } }; return [pscustomobject]@{ Code = 1; Out = 'Sparse VHD support is currently disabled due to potential data corruption. To force a distribution to use a sparse vhd, please run: wsl.exe --manage <distro> --set-sparse true --allow-unsafe' } }
+                default { return [pscustomobject]@{ Code = 1; Out = 'Invalid command line argument: --set-sparse' } }
+            }
+        }
+        return [pscustomobject]@{ Code = 0; Out = '' }
+    }
+    if ($What -eq 'dry') { $DryRun = $true }
+    if ($What -eq 'nosparse') { $NoSparse = [switch]$true }
+    Set-DistroSparse
+}
+EOS
+  fnrun() { PATH="$FB:$PATH" "$PS" -NoProfile -ExecutionPolicy Bypass -File "$(cygpath -w "$TMP/b3fn.ps1")" -Script "$INST" -Dir "$(cygpath -w "$TMP/b3dir")" -What "$1" 2>&1; }
+  rm -rf "$TMP/b3dir"; mkdir -p "$TMP/b3dir"
+  out="$(fnrun temp)"
+  contains "temp: during the steps TEMP and TMP point into the installer's own dir" "$out" "inside: TEMP=$(cygpath -w "$TMP/b3dir")\\tmp TMP=$(cygpath -w "$TMP/b3dir")\\tmp"
+  contains "temp: the leftovers of an interrupted run are removed before the steps" "$out" "inside: stale images gone=True"
+  contains "temp: the body's result is returned" "$out" "ok: returned=7"
+  contains "temp: after a successful run the dir is gone and TEMP is back" "$out" "returned=7 tmp exists=False images exists=False temp restored=True other kept=True"
+  contains "temp: after an error the dir is gone, TEMP is back, other files are untouched" "$out" "after error: tmp exists=False images exists=False temp restored=True other kept=True"
+  contains "temp: the error still reaches the caller" "$out" "failed: boom"
+  contains "temp: a dry run does not move TEMP" "$out" "dry body ran, TEMP unchanged=True"
+  out="$(fnrun deltar)"
+  contains "image tar: -DeleteImageTar removes the archive right after the load" "$out" "archive exists=False"
+  contains "image tar: and says so" "$out" "удалён: образ уже загружен"
+  out="$(fnrun deltar-unc)"
+  contains "image tar: a network path is never deleted (only the installer's own copy)" "$out" "removed=0"
+  contains "image tar: the one-time task gets -DeleteImageTar (a session without credentials runs the steps there)" "$(cat "$NODE/install-node.ps1")" 'if ($DeleteImageTar) { $ta.DeleteImageTar = $true }'
+  out="$(fnrun deltar-off)"
+  contains "image tar: without -DeleteImageTar a foreign archive is never touched" "$out" "archive exists=True"
+  out="$(fnrun deltar-dry)"
+  contains "image tar: a dry run deletes nothing" "$out" "archive exists=True"
+  out="$(FAKE_WSLVER=2.6.1.0 FAKE_SPARSE=ok fnrun real)"
+  contains "sparse run: the distro is stopped first" "$out" "run: wsl --terminate NSU-LLM"
+  contains "sparse run: set-sparse true" "$out" "run: wsl --manage NSU-LLM --set-sparse true"
+  lacks "sparse run: no allow-unsafe when WSL accepts it" "$out" "--allow-unsafe"
+  contains "sparse run: remembered in the state" "$out" "state DistroSparse=True"
+  out="$(FAKE_WSLVER=2.6.1.0 FAKE_SPARSE=unsafe fnrun real)"
+  contains "sparse run: WSL asks for --allow-unsafe: repeated with it" "$out" "run: wsl --manage NSU-LLM --set-sparse true --allow-unsafe"
+  contains "sparse run: and said so" "$out" "повторяю с ним"
+  contains "sparse run: remembered after the retry" "$out" "state DistroSparse=True"
+  out="$(FAKE_WSLVER=2.6.1.0 FAKE_SPARSE=busy fnrun real)"
+  contains "sparse run: the disk is busy after terminate: wsl --shutdown" "$out" "run: wsl --shutdown"
+  [ "$(grep -c 'run: wsl --manage NSU-LLM --set-sparse true --allow-unsafe' <<<"$out")" = 2 ] && pass "sparse run: repeated with --allow-unsafe after the shutdown" || fail "sparse run: repeated with --allow-unsafe after the shutdown"
+  contains "sparse run: remembered after the shutdown" "$out" "state DistroSparse=True"
+  out="$(FAKE_WSLVER=2.6.1.0 FAKE_SPARSE=ok fnrun real)"
+  lacks "sparse run: no wsl --shutdown when the disk is free" "$out" "wsl --shutdown"
+  out="$(FAKE_WSLVER=2.6.1.0 FAKE_SPARSE=stuck fnrun real)"
+  contains "sparse run: still busy after the shutdown: a warning" "$out" "Вручную: wsl --manage NSU-LLM --set-sparse true"
+  lacks "sparse run: still busy: not remembered" "$out" "state DistroSparse"
+  out="$(FAKE_WSLVER=2.6.1.0 FAKE_SPARSE=fail fnrun real)"
+  contains "sparse run: a refusal is a warning with the manual command" "$out" "Вручную: wsl --manage NSU-LLM --set-sparse true"
+  lacks "sparse run: a refusal is not remembered" "$out" "state DistroSparse"
+  out="$(FAKE_WSLVER=1.2.5.0 FAKE_SPARSE=ok fnrun real)"
+  contains "sparse run: an old WSL is skipped with a note" "$out" "не умеет делать диск разреженным"
+  lacks "sparse run: an old WSL: no command" "$out" "run: wsl --manage"
+  out="$(FAKE_WSLVER=2.6.1.0 FAKE_SPARSE=ok fnrun nosparse)"
+  contains "sparse run: -NoSparse says it" "$out" "отключён (-NoSparse)"
+  lacks "sparse run: -NoSparse runs nothing" "$out" "run:"
+  out="$(FAKE_WSLVER=2.6.1.0 FAKE_SPARSE=ok fnrun dry)"
+  contains "sparse run: dry run prints both commands" "$out" "run: wsl --terminate NSU-LLM"
+  rm -rf "$TMP/b3dir"
+  # the copy of an image from a network path is deleted in a finally block, the steps run inside the temp wrapper
+  src="$(cat "$NODE/install-node.ps1")"
+  contains "temp: the copy from a network path is removed whatever happens" "$src" 'finally { if ($copied) { Remove-Item -LiteralPath $ImagesDir -Recurse -Force'
+  contains "temp: the install steps run inside the temp wrapper" "$src" "Invoke-WithInstallerTemp { foreach (\$s in \$steps)"
+  contains "image tar: deleted right after docker load when asked (-DeleteImageTar), in both Docker paths" "$(grep -c '^                    Remove-LoadedImageTar' "$NODE/install-node.ps1")" "2"
+  out="$(full)"
+  contains "temp: the plan says where the temp files go" "$out" "[dry-run] TEMP и TMP шагов установки:"
+  contains "images: the old versions of the node image are removed after the node starts" "$out" "[dry-run] wsl -d NSU-LLM -u root -e docker rmi nsu-llm-node:0.2.1-cpu"
+  contains "images: dangling layers are pruned" "$out" "docker image prune -f"
+  lacks "images: the current image is never removed" "$out" "docker rmi nsu-llm-node:0.2.1-gpu"
 
   # node-boot.ps1: starts docker, keeps the distro alive, logs
   : > "$TMP/fake.log"

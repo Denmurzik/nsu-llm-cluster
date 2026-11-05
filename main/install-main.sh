@@ -51,7 +51,7 @@ umask 077
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/.." && pwd)"
 RUN_MAIN="$HERE/run-main.sh"
-IMAGE="nsu-llm-main:0.2.0"
+IMAGE="nsu-llm-main:0.2.1"
 CONTAINER="llm-main"
 PORTS=(80 443 6443)
 MIN_RAM_GIB=4
@@ -61,7 +61,7 @@ POLL_S=5
 # Только для тестов: корень, от которого читаются /etc/os-release, /proc/meminfo и пишется /etc/apt.
 SYSROOT="${NSU_LLM_SYSROOT:-}"
 ENV_SECRET="${OIDC_CLIENT_SECRET:-}"
-INSTALLER_KEYS=" CERT_MODE CERTS_DIR AIRGAP FIREWALL IMAGE_SOURCE IMAGE_TAR NODE_IMAGE_TAR_CPU NODE_IMAGE_TAR_GPU GHCR_OWNER IMAGE_REF NODE_IMAGE_SOURCE GHCR_TOKEN_FILE PENDING_IMAGE_VERSION INSTALL_DOCKER HAIRPIN_RULE HAIRPIN_SUBNET "
+INSTALLER_KEYS=" CERT_MODE CERTS_DIR AIRGAP FIREWALL IMAGE_SOURCE IMAGE_TAR NODE_IMAGE_TAR_CPU NODE_IMAGE_TAR_GPU GHCR_OWNER IMAGE_REF NODE_IMAGE_SOURCE GHCR_TOKEN_FILE PENDING_IMAGE_VERSION NODE_IMAGE_TAG_KEEP INSTALL_DOCKER HAIRPIN_RULE HAIRPIN_SUBNET "
 ENV_OWNER="${GHCR_OWNER:-}"
 GHCR=ghcr.io
 DEFAULT_REGISTRY_PORT=5000
@@ -116,7 +116,7 @@ while [ $# -gt 0 ]; do
   esac
 done
 [[ "$TIMEOUT" =~ ^[0-9]+$ ]] || die "--timeout должен быть числом секунд, получено: $TIMEOUT"
-[ -z "$UPDATE_VERSION" ] || [[ "$UPDATE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]] || die "--update: нужна версия вида 0.2.0, получено: $UPDATE_VERSION"
+[ -z "$UPDATE_VERSION" ] || [[ "$UPDATE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]] || die "--update: нужна версия вида 0.2.1, получено: $UPDATE_VERSION"
 [ -z "$UPDATE_VERSION" ] || [ "$UNINSTALL" = 0 ] || die "--update и --uninstall вместе не используются"
 [ -d "$(dirname "$ENV_FILE")" ] || die "каталог для $ENV_FILE не существует"
 ENV_FILE="$(cd "$(dirname "$ENV_FILE")" && pwd)/$(basename "$ENV_FILE")"
@@ -681,6 +681,46 @@ write_env() { # write_env TARGET: .env (или шаблон .env.example) с п�
   mv "$target.tmp" "$target"
 }
 
+main_running() { [ "$EXISTING" = 1 ] && [ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null || echo false)" = true ]; }
+# Образы нод этого запуска окажутся в реестре: pull или архивы обоих видов.
+source_seeds_both() {
+  [ "${ANS[IMAGE_SOURCE]:-}" = pull ] || { [ "${ANS[IMAGE_SOURCE]:-}" = load ] && [ -n "${ANS[NODE_IMAGE_TAR_CPU]:-}" ] && [ -n "${ANS[NODE_IMAGE_TAR_GPU]:-}" ]; }
+}
+# NODE_IMAGE_TAG в .env переживает обновление: на стенде 0.2.0 он так и остался 0.1.1, и главный велел нодам запускать старый образ.
+# Значение старше версии чекаута заменяется ею, но только когда образы новой версии уже в реестре: иначе поды всех ПК разом уйдут в
+# ImagePullBackOff, а старый тег работал (docs/release.md: сначала реестр, потом перезапуск). Поэтому вызов идёт после наполнения
+# реестра и до run-main. Главный не запущен: старый тег сейчас никто не использует, реестр наполнится сразу после старта.
+# Только простая версия (x.y.z): свой тег вроде <версия>-fat и версия новее чекаута заданы нарочно. Нарочно старая версия задаётся
+# строкой NODE_IMAGE_TAG в файле ответов и запоминается в NODE_IMAGE_TAG_KEEP: следующий запуск без --answers её тоже не тронет.
+refresh_node_tag() {
+  local tag="${ANS[NODE_IMAGE_TAG]:-}" ready=0
+  [[ "$tag" =~ ^[0-9]+(\.[0-9]+)+$ ]] && [ "$tag" != "$CHECKOUT_VERSION" ] || return 0
+  [ "$(printf '%s\n%s\n' "$tag" "$CHECKOUT_VERSION" | sort -V | head -n1)" = "$tag" ] || return 0
+  if [ "${SRC[NODE_IMAGE_TAG]:-}" = "файл ответов" ] || [ "${ANS[NODE_IMAGE_TAG_KEEP]:-}" = "$tag" ]; then
+    warn "NODE_IMAGE_TAG=$tag задан вами и старше этой версии ($CHECKOUT_VERSION): оставлен, ноды будут запускать образ $tag"
+    ANS[NODE_IMAGE_TAG_KEEP]="$tag"
+    [ "$DRY" = 1 ] || write_config
+    return 0
+  fi
+  if [ "$DRY" = 0 ] && main_running; then
+    [ -z "$(registry_digest "$CHECKOUT_VERSION-cpu")" ] || [ -z "$(registry_digest "$CHECKOUT_VERSION-gpu")" ] || ready=1
+  elif source_seeds_both; then
+    ready=1
+  fi
+  if [ "$ready" = 0 ]; then
+    warn "NODE_IMAGE_TAG=$tag старше этой версии ($CHECKOUT_VERSION), но в реестре главного нет образов $CHECKOUT_VERSION-cpu и $CHECKOUT_VERSION-gpu: тег оставлен, иначе поды не запустятся. Положите образы (install-main.sh --update $CHECKOUT_VERSION или IMAGE_SOURCE=pull) и запустите установщик снова."
+    return 0
+  fi
+  if [ "$DRY" = 1 ]; then
+    say "  [dry-run] NODE_IMAGE_TAG в $ENV_FILE: $tag заменился бы на $CHECKOUT_VERSION, когда образы окажутся в реестре"
+    return 0
+  fi
+  say "NODE_IMAGE_TAG в $ENV_FILE был $tag, это старая версия: записан $CHECKOUT_VERSION. Оставить старый тег нарочно: строка NODE_IMAGE_TAG в файле ответов (--answers)."
+  ANS[NODE_IMAGE_TAG]="$CHECKOUT_VERSION"
+  EXTRA_KEYS+=(NODE_IMAGE_TAG)
+  write_env "$ENV_FILE"
+}
+
 # После --update VERSION запуск на чекауте этой версии берёт скачанный образ (keep) один раз: сохранённый способ (build, load, pull)
 # при этом не меняется, а метка PENDING_IMAGE_VERSION снимается после успешного запуска.
 PENDING_USED=0
@@ -856,10 +896,12 @@ pull_main_image() { # pull_main_image VERSION: образ главного с gh
 ctr() { run docker exec "$CONTAINER" k3s ctr -n k8s.io "$@"; }
 
 # registry_digest VERSION-VARIANT: digest манифеста в реестре главного (пусто: тега нет)
-registry_digest() {
+registry_digest() { registry_repo_digest nsu-llm-node "$1"; }
+# registry_repo_digest РЕПОЗИТОРИЙ ТЕГ: то же для любого репозитория реестра (pause: rancher/mirrored-pause)
+registry_repo_digest() {
   docker exec "$CONTAINER" curl -fsSI -m 10 \
     -H 'Accept: application/vnd.oci.image.manifest.v1+json, application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.v2+json, application/vnd.docker.distribution.manifest.list.v2+json' \
-    "http://127.0.0.1:$(registry_port)/v2/nsu-llm-node/manifests/$1" </dev/null 2>/dev/null \
+    "http://127.0.0.1:$(registry_port)/v2/$1/manifests/$2" </dev/null 2>/dev/null \
     | tr -d '\r' | sed -n 's/^[Dd]ocker-[Cc]ontent-[Dd]igest: *//p' | head -n1 || true
 }
 # release_digest VERSION KEY: digest образа из release/<версия>.json (его пишет release.sh): KEY main, cpu или gpu (образ ноды);
@@ -879,6 +921,46 @@ node_tar_default() {
 }
 # tar_stream FILE: архив образа в stdout (.gz распаковывается)
 tar_stream() { case "$1" in *.gz|*.tgz) gunzip -c "$1" ;; *) cat "$1" ;; esac; }
+
+# Образ pause (песочница каждого пода) нода k3s берёт с docker.io: зеркало главного для docker.io отвечает 404 на всё, кроме nsu-llm-node,
+# и k3s идёт на Docker Hub. Если из подсети класса Hub не достать, ни один под не стартует (ContainerCreating, failed to pull sandbox
+# image). Поэтому pause из containerd главного кладётся в реестр главного под тем же путём rancher/mirrored-pause:<тег>. Тег берётся
+# из списка образов главного, не из константы: версия k3s у главного и у ноды одна (K3S_VERSION в обоих Dockerfile), а тег pause
+# зашит в k3s. Уже лежащий пропускается; любая неудача только предупреждает, установка из-за неё не останавливается.
+# Pause это индекс из нескольких платформ, а в containerd главного лежит содержимое только linux/amd64: ctr images push отправил бы индекс
+# целиком, и реестр отклонил бы его (manifest blob unknown). registry-push.sh --amd64-manifest кладёт манифест linux/amd64 под тем же тегом.
+seed_pause() {
+  local port tags tag src dst
+  if [ "$DRY" = 1 ]; then
+    say "  [dry-run] образ pause из containerd главного (docker.io/rancher/mirrored-pause:<тег>) в реестр главного (rancher/mirrored-pause:<тег>)"
+    return 0
+  fi
+  port="$(registry_port)"
+  tags="$(docker exec "$CONTAINER" k3s ctr -n k8s.io images ls -q </dev/null 2>/dev/null \
+    | tr -d '\r' | sed -n 's#^docker\.io/rancher/mirrored-pause:\([A-Za-z0-9_][A-Za-z0-9._-]*\)$#\1#p' | sort -u || true)"
+  if [ -z "$tags" ]; then
+    warn "в containerd главного нет образа docker.io/rancher/mirrored-pause: в реестр он не кладётся, ноды возьмут pause с Docker Hub, и если подсеть класса его не достаёт, поды не стартуют (проверка: docker exec $CONTAINER k3s ctr -n k8s.io images ls -q | grep pause)"
+    return 0
+  fi
+  for tag in $tags; do
+    src="docker.io/rancher/mirrored-pause:$tag"; dst="127.0.0.1:$port/rancher/mirrored-pause:$tag"
+    if [ -n "$(registry_repo_digest rancher/mirrored-pause "$tag")" ]; then
+      ok "в реестре уже есть rancher/mirrored-pause:$tag: не кладётся заново"
+      continue
+    fi
+    say "  $src -> $dst"
+    if ! docker exec "$CONTAINER" k3s ctr -n k8s.io images tag --force "$src" "$dst" </dev/null >/dev/null; then
+      warn "k3s ctr images tag $src $dst не удался: pause в реестр не положен, ноды возьмут его с Docker Hub"
+      continue
+    fi
+    # образ главного старше 0.2.1 не знает --amd64-manifest (registry-push.sh отвечает «использование»): запись не удаётся, это то же предупреждение
+    docker exec "$CONTAINER" /opt/llm/main/registry-push.sh "$dst" --amd64-manifest </dev/null >/dev/null \
+      || warn "запись $dst в реестр главного не удалась (registry-push.sh --amd64-manifest; образ главного старше 0.2.1 его не знает: после --update и перезапуска повторите установщик): pause не положен, ноды возьмут его с Docker Hub; журнал реестра: docker exec $CONTAINER k3s kubectl -n llm logs deploy/registry"
+    docker exec "$CONTAINER" k3s ctr -n k8s.io images rm --sync "$dst" </dev/null >/dev/null 2>&1 || true
+    if [ -n "$(registry_repo_digest rancher/mirrored-pause "$tag")" ]; then ok "реестр главного: rancher/mirrored-pause:$tag"
+    else warn "после записи в реестре нет rancher/mirrored-pause:$tag: ноды возьмут pause с Docker Hub"; fi
+  done
+}
 
 # Реестр главного (под registry в k3s, том llm-main-registry). Образы нод попадают в него с 127.0.0.1:<порт> этого же контейнера:
 # писать в реестр может только главный, класс читает через Caddy. Публичные образы пуллятся прямо в k3s главного (ctr, digest
@@ -986,6 +1068,7 @@ seed_registry() { # seed_registry VERSION [load]
     if [ "${#seeded[@]}" = 2 ]; then ok "реестр главного: nsu-llm-node:$ver-cpu и $ver-gpu"; else ok "реестр главного: nsu-llm-node:$ver-${seeded[0]}"; fi
     SEEDED=1
   fi
+  seed_pause
 }
 
 # IMAGE_SOURCE=load и есть хотя бы один архив образа ноды: образы нод кладутся в реестр главного из архивов
@@ -1223,12 +1306,23 @@ main() {
     "$BASH" "$RUN_MAIN" "${rm_args[@]}" --dry-run </dev/null
     if [ "${ANS[IMAGE_SOURCE]}" = pull ]; then seed_registry "$CHECKOUT_VERSION"; fi
     if load_seeds_registry; then seed_registry "$CHECKOUT_VERSION" load; fi
+    refresh_node_tag
     return
   fi
+  # Работающий главный: образы новой версии в реестр до его перезапуска, как --update. Иначе новый портал минуты ждёт образы и поды
+  # переходят на недоступный тег, а потом на digest: модели грузятся дважды. Сбой здесь оставляет главный работать как работал.
+  local seeded_first=0
+  if main_running; then
+    if [ "${ANS[IMAGE_SOURCE]}" = pull ]; then seed_registry "$CHECKOUT_VERSION"; seeded_first=1; fi
+    if load_seeds_registry; then seed_registry "$CHECKOUT_VERSION" load; seeded_first=1; fi
+  fi
+  refresh_node_tag
   "$BASH" "$RUN_MAIN" "${rm_args[@]}" </dev/null || die "run-main.sh завершился с ошибкой (см. вывод выше); повторите установщик после исправления"
   wait_ready
-  if [ "${ANS[IMAGE_SOURCE]}" = pull ]; then seed_registry "$CHECKOUT_VERSION"; fi
-  if load_seeds_registry; then seed_registry "$CHECKOUT_VERSION" load; fi
+  if [ "$seeded_first" = 0 ]; then
+    if [ "${ANS[IMAGE_SOURCE]}" = pull ]; then seed_registry "$CHECKOUT_VERSION"; fi
+    if load_seeds_registry; then seed_registry "$CHECKOUT_VERSION" load; fi
+  fi
   if [ "$PENDING_USED" = 1 ]; then SEEDED=1; PENDING_DONE=1; write_config; fi   # образы нод --update уже положил в реестр
   print_result
   check_hairpin

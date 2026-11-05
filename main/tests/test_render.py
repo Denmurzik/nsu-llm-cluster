@@ -200,7 +200,7 @@ def test_documents_parse_and_follow_conventions(out):
     # nvcr.io answers 403 from Russia: the plugin (v0.19.3, built from source) runs from the GPU node image, which
     # every GPU node already has in its k3s images dir (run-node saves it): taken from there, pulled from main only when the tag is new
     c = dps["containers"][0]
-    assert (c["image"], c["imagePullPolicy"], c["command"]) == ("nsu-llm-node:0.2.0-gpu", "IfNotPresent", ["nvidia-device-plugin"])
+    assert (c["image"], c["imagePullPolicy"], c["command"]) == ("nsu-llm-node:0.2.1-gpu", "IfNotPresent", ["nvidia-device-plugin"])
     # a missing image halts the roll-out at one node, it does not switch the plugin off everywhere
     assert dp["spec"]["updateStrategy"] == {"type": "RollingUpdate", "rollingUpdate": {"maxUnavailable": 1}}
     env = {e["name"]: e["value"] for e in c["env"]}
@@ -219,7 +219,7 @@ def test_device_plugin_follows_the_node_image_or_a_mirror(tmp_path):
         c = dp["spec"]["template"]["spec"]["containers"][0]
         return c["image"], c["imagePullPolicy"]
 
-    assert plugin(NODE_IMAGE_REPO="reg.nsu.ru/nsu-llm-node", NODE_IMAGE_TAG="0.2.0") == ("reg.nsu.ru/nsu-llm-node:0.2.0-gpu", "IfNotPresent")
+    assert plugin(NODE_IMAGE_REPO="reg.nsu.ru/nsu-llm-node", NODE_IMAGE_TAG="0.2.1") == ("reg.nsu.ru/nsu-llm-node:0.2.1-gpu", "IfNotPresent")
     # the official image from a mirror registry of nvcr.io (its entrypoint is the same nvidia-device-plugin)
     mirror = "mirror.nsu.ru/nvidia/k8s-device-plugin:v0.19.3"
     assert plugin(DEVICE_PLUGIN_IMAGE=mirror) == (mirror, "IfNotPresent")
@@ -711,6 +711,8 @@ def test_registry_push_keeps_the_password_out_of_argv():
     code = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
     assert "--user" not in code and "-u " not in code
     assert "--hosts-dir" in code and 'Authorization = "Basic' in code and "umask 077" in code
+    # the pause image of k3s is an index with the content of linux/amd64 only: --amd64-manifest pushes that manifest over the registry API
+    assert "--amd64-manifest" in code and "push_amd64_manifest" in code and 'user = "%s:%s"' in code and "-K " in code
 
 
 def test_a_new_registry_password_restarts_the_registry(tmp_path):

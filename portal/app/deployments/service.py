@@ -29,7 +29,16 @@ from app.k8s import MAIN_NODE, K8sUnavailable
 from app.litellm_client import LiteLLMError, LiteLLMUnavailable
 from app.localmodels.store import is_local, local_repo, name_of, name_problem
 from app.models import ModelDeployment, NodeAssignment, PortalFlag, StandaloneNode
-from app.workloads.builders import ROLE_INFERENCE, ROLE_LEADER, RpcWorker, leader_groups, llama_settings_env, plan_groups
+from app.workloads.builders import (
+    ROLE_INFERENCE,
+    ROLE_LEADER,
+    RpcWorker,
+    leader_groups,
+    leader_index,
+    llama_settings_env,
+    main_disk_problem,
+    plan_groups,
+)
 
 log = logging.getLogger(__name__)
 
@@ -1098,7 +1107,7 @@ async def _load_progress(dep: ModelDeployment, pods: list, node_ips: dict[str, s
     if not any(not p.ready for p in inference):
         return {p.name: pod_progress(dep, ready=True, phase=p.phase, health=None, transfers=None) for p in inference}
     transfers, *codes = await asyncio.gather(
-        progress.transfers(), *(progress.health(f"http://{node_ips[p.node_name]}:{port}/health") for p in probed)
+        progress.transfers(), *(progress.health(f"http://{node_ips[p.node_name]}:{p.port or port}/health") for p in probed)
     )
     health = {p.name: code for p, code in zip(probed, codes, strict=True)}
     return {
@@ -1115,16 +1124,22 @@ def node_memory(n) -> placement.NodeMemory:
 
 
 def placement_problems(
-    dep: ModelDeployment, groups: list[list[str]], memory: dict[str, placement.NodeMemory], reserve_mib: int
+    dep: ModelDeployment,
+    groups: list[list[str]],
+    memory: dict[str, placement.NodeMemory],
+    reserve_mib: int,
+    leader_on_main: bool = False,
 ) -> list[str]:
     """Why split groups have no leader: those the controller holds because the model does not fit (same decision)."""
     problems = []
     for names in groups:
         if any(n not in memory for n in names):
             continue
-        plan = placement.plan_for(dep, [memory[n] for n in names], reserve_mib)
+        plan = placement.plan_for(dep, [memory[n] for n in names], reserve_mib, leader_on_main)
         if placement.decide(plan) == placement.HOLD:
             problems.append(placement.misfit_message(plan))
+    if leader_on_main and groups and (problem := main_disk_problem(dep)):
+        problems.append(problem)
     return problems
 
 
@@ -1136,9 +1151,11 @@ async def deployment_status(
     reserve_mib: int = placement.DEFAULT_GPU_COMPUTE_RESERVE_MIB,
     progress=None,
     infer_port: int = 18080,
+    leader_on_main: bool = False,
 ) -> dict[str, Any]:
     """Pods per assigned node; with a `progress` source (ProgressSource) each inference pod also carries its load
-    stage: downloading with a percentage, loading the weights, ready."""
+    stage: downloading with a percentage, loading the weights, ready. A split leader on main is no node's pod: it is
+    listed with the first node of its group, where it would run otherwise, and says `on_main`."""
     h = spec_hash(dep)
     rows = (
         await db.scalars(
@@ -1157,7 +1174,11 @@ async def deployment_status(
         cluster = await k8s.list_nodes()
         accels = {n.name: n.accel for n in cluster}
         memory = {n.name.lower(): node_memory(n) for n in cluster if not n.is_main}
-        node_ips = {n.name: n.external_ip or n.internal_ip for n in cluster if n.external_ip or n.internal_ip}
+        node_ips = {
+            n.name: n.internal_ip if n.is_main else n.external_ip or n.internal_ip
+            for n in cluster
+            if n.external_ip or n.internal_ip
+        }
         if dep.mode == "split":
             existing = leader_groups(await k8s.list_owned(), dep.name)
     except _K8S_ERRORS:
@@ -1165,6 +1186,10 @@ async def deployment_status(
     loads: dict[str, Any] = {}
     if progress is not None:
         loads = await _load_progress(dep, [p for ps in pods_by_node.values() for p in ps], node_ips, progress, infer_port)
+    for pod in pods_by_node.pop(MAIN_NODE, []):
+        members = existing.get(leader_index(dep.name, pod.workload))
+        if members:
+            pods_by_node.setdefault(members[0], []).append(pod)
     nodes = []
     for row in rows:
         pods = []
@@ -1186,6 +1211,7 @@ async def deployment_status(
                     "message": pod.message or "",
                     "last_log": last_log,
                     "progress": loads.get(pod.name),
+                    **({"on_main": True} if pod.node_name == MAIN_NODE else {}),
                 }
             )
         sa = None if row.node_name in accels else standalone.get(row.node_name)  # a cluster node wins over the record
@@ -1209,7 +1235,7 @@ async def deployment_status(
         "spec_hash": h,
         "nodes": nodes,
         "groups": groups,
-        "placement_problems": placement_problems(dep, groups, memory, reserve_mib),
+        "placement_problems": placement_problems(dep, groups, memory, reserve_mib, leader_on_main),
         "ready_backends": None if counts is None else counts.get(dep.name, 0),
     }
 

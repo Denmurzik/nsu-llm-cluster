@@ -75,6 +75,8 @@ case "$1" in
   exec)
     case "$*" in
       *"get nodes"*) [ -f "${FAKE_NODES:-/nonexistent}" ] && cat "$FAKE_NODES" ;;
+      *NODE_IMAGE_TAG*portal.env*) [ -z "${FAKE_NODE_TAG:-}" ] || echo "$FAKE_NODE_TAG" ;;
+      *tags/list*) [ -z "${FAKE_REG_TAGS:-}" ] || echo "$FAKE_REG_TAGS" ;;
       *"-n kube-system get pods"*) [ -f "${FAKE_PODS:-/nonexistent}" ] && cat "$FAKE_PODS" ;;
     esac ;;
   info) exit 0 ;;
@@ -94,7 +96,7 @@ set_nodes() { printf 'class01 10.0.1.11 \nclass02 10.0.1.12 \nllm-main 10.0.0.5 
 set_nodes
 good_tcp() {
   : >"$FAKE_TCP"
-  for ip in 10.0.1.11 10.0.1.12; do printf '%s:18080 open\n%s:10250 open\n' "$ip" "$ip" >>"$FAKE_TCP"; done
+  for ip in 10.0.1.11 10.0.1.12; do printf '%s:18080 open\n%s:18050 open\n%s:10250 open\n' "$ip" "$ip" "$ip" >>"$FAKE_TCP"; done
 }
 good_tcp
 tcp_set() { grep -v "^$1 " "$FAKE_TCP" >"$FAKE_TCP.n"; echo "$1 $2" >>"$FAKE_TCP.n"; mv "$FAKE_TCP.n" "$FAKE_TCP"; }
@@ -139,6 +141,32 @@ good_tcp; tcp_set 10.0.1.11:18080 refused
 out="$(d --yes --hostname llm.nsu.test --ip 10.0.0.5)"; rc=$?
 eq "18080 отказ соединения (нода есть, порт никто не слушает): код 0" "$rc" 0
 has "18080 отказ: сеть проходит" "$out" "class01 (10.0.1.11): 18080/tcp сеть доходит, порт никто не слушает"
+# ------------------------------------------------------------------ реестр главного: образы с тегом NODE_IMAGE_TAG
+good_tcp
+export FAKE_NODE_TAG=0.2.1 FAKE_REG_TAGS='{"name":"nsu-llm-node","tags":["0.2.1-cpu","0.2.1-gpu"]}'
+out="$(d --yes --hostname llm.nsu.test --ip 10.0.0.5)"; rc=$?
+eq "образы с тегом в реестре: код 0" "$rc" 0
+has "образы с тегом: cpu" "$out" "реестр главного: образ ноды 0.2.1-cpu есть"
+has "образы с тегом: gpu" "$out" "реестр главного: образ ноды 0.2.1-gpu есть"
+export FAKE_NODE_TAG=0.1.1 FAKE_REG_TAGS='{"name":"nsu-llm-node","tags":["0.1.1-gpu","0.2.1-cpu","0.2.1-gpu"]}'
+out="$(d --yes --hostname llm.nsu.test --ip 10.0.0.5)"; rc=$?
+eq "устаревший тег: предупреждение, не провал" "$rc" 0
+has "устаревший тег: чего нет" "$out" "реестр главного: нет образа ноды 0.1.1-cpu (NODE_IMAGE_TAG=0.1.1)"
+has "устаревший тег: что есть" "$out" "реестр главного: образ ноды 0.1.1-gpu есть"
+has "устаревший тег: как исправить" "$out" "install-main.sh --yes"
+export FAKE_NODE_TAG=0.2.1 FAKE_REG_TAGS=
+out="$(d --yes --hostname llm.nsu.test --ip 10.0.0.5)"; rc=$?
+has "реестр молчит: не проверено, без тревоги" "$out" "реестр главного не ответил"
+unset FAKE_NODE_TAG FAKE_REG_TAGS
+
+good_tcp; tcp_set 10.0.1.11:18050 blocked
+out="$(d --yes --hostname llm.nsu.test --ip 10.0.0.5)"; rc=$?
+eq "18050 заблокирован: предупреждение, не провал (нода может быть standalone)" "$rc" 0
+has "18050 заблокирован: нода названа" "$out" "class01 (10.0.1.11): 18050/tcp недоступен с главного"
+has "18050: проверка адреса источника" "$out" "ip -4 route get 10.0.1.11"
+good_tcp; tcp_set 10.0.1.11:18050 refused
+out="$(d --yes --hostname llm.nsu.test --ip 10.0.0.5)"; rc=$?
+has "18050 отказ соединения: сеть проходит" "$out" "class01 (10.0.1.11): 18050/tcp сеть доходит"
 
 # ------------------------------------------------------------------ 10250 не проверяется
 : >"$TMP/tcplog"

@@ -191,6 +191,8 @@ export interface PodStatus {
   last_log: string | null;
   /** null for rpc pods and pods that are not running */
   progress: LoadProgress | null;
+  /** a split leader that runs on main: it is listed with the first node of its group */
+  on_main?: boolean;
 }
 
 export interface DeploymentStatus {
@@ -274,7 +276,8 @@ export interface Placement {
 
 export interface NodeInfo {
   name: string;
-  source: "k8s" | "standalone";
+  /** enrolled: registered with the portal, not in the cluster yet (only with `?enrolled=1`, the «Ноды» page) */
+  source: "k8s" | "standalone" | "enrolled";
   accel: "cpu" | "nvidia";
   ip: string | null;
   ready: boolean;
@@ -315,8 +318,9 @@ export interface NodeClaim {
   known: boolean;
 }
 
-/** a waiting new node: approved by «Подтвердить», also in bulk */
-export const waitsForApproval = (n: Pick<NodeInfo, "approved" | "claims">) => n.approved === false && !n.claims?.length;
+/** a waiting new node, it has its key: approved by «Подтвердить» (in bulk unless it has claims). Without a key there is nothing to approve yet
+ * (the node has not registered, or not again after a reset: its registration comes as a claim) */
+export const waitsForApproval = (n: Pick<NodeInfo, "approved" | "has_key">) => n.approved === false && n.has_key !== false;
 /** someone else registered a known name: the admin picks one claim in the row, never in bulk */
 export const hasClaims = (n: Pick<NodeInfo, "claims">) => (n.claims?.length ?? 0) > 0;
 
@@ -339,6 +343,8 @@ export interface NodeDeleteResult {
   online: boolean;
   /** the Kubernetes Node object: deleted, was not there, or the cluster did not answer */
   k8s: "deleted" | "absent" | "unavailable";
+  /** left: the cluster did not answer, k3s refuses a PC reinstalled under this name until «Подтвердить» clears it */
+  k3s_password?: "deleted" | "left";
   /** the deployments the node was taken off */
   unassigned: string[];
   /** commands that uninstall the node on the PC itself (no token in them) */
