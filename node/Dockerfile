@@ -10,6 +10,11 @@ ARG K3S_VERSION=v1.36.5+k3s1
 # the release tag (github.com, vendored Go modules) and runs from this image (main/manifests/common-45).
 ARG DEVICE_PLUGIN_TAG=v0.19.3
 ARG DEVICE_PLUGIN_COMMIT=570e776d6813cb9f3e9c8c105cf8d79989db6650
+# Base of the GPU image (the lecturer's limit: the whole node footprint fits 16 GB on a class PC):
+#   slim (default)  ubuntu:24.04 + only the CUDA libraries the two binaries link (libcudart, libcublas, libcublasLt; NCCL is off)
+#   fat             the former nvidia/cuda runtime base (2.8 GB of CUDA libraries). Fallback if a slim image fails on a class PC:
+#                   docker build --target gpu --build-arg GPU_BASE=fat --build-arg JOBS=16 ... (docs/deploy-class.md, "GPU-образ ноды: slim и fat")
+ARG GPU_BASE=slim
 
 # ---------------------------------------------------------------- build-cpu
 FROM ubuntu:24.04@sha256:fe81560990fae86dc4743202b2cb4d3df98d0bcf949173cecef15ce1127ef852 AS build-cpu
@@ -57,13 +62,15 @@ RUN grep -n add_executable tools/rpc/CMakeLists.txt
 COPY llama/patch-llama.sh /usr/local/bin/patch-llama.sh
 RUN bash /usr/local/bin/patch-llama.sh /src
 # sm_86 (3090/A-series), sm_89 (4070), sm_120 (RTX 5090, needs CUDA >= 12.8 and driver >= 570).
+# GGML_CUDA_NCCL=OFF: NCCL (libnccl, 380 MB) only speeds up several GPUs inside ONE process; a node has one GPU and the split goes
+# over RPC, so the library would be dead weight in every copy of the image on a class PC (16 GB limit).
 RUN cmake -B build \
       -DCMAKE_BUILD_TYPE=Release \
       -DGGML_RPC=ON -DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON \
       -DBUILD_SHARED_LIBS=OFF -DLLAMA_OPENSSL=ON \
       -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF \
       -DCMAKE_CXX_FLAGS=-DGGML_SCHED_MAX_BACKENDS=64 -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
-      -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="86;89;120" \
+      -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="86;89;120" -DGGML_CUDA_NCCL=OFF \
       -DCMAKE_EXE_LINKER_FLAGS=-Wl,--allow-shlib-undefined \
  && bash /usr/local/bin/patch-llama.sh --check-build build \
  && cmake --build build --config Release -j"${JOBS}" --target llama-server ggml-rpc-server \
@@ -120,8 +127,44 @@ LABEL org.opencontainers.image.version=$VERSION org.opencontainers.image.revisio
 ENV NODE_VERSION=$VERSION NODE_REVISION=$GIT_COMMIT
 ENTRYPOINT ["/opt/llm/bin/entrypoint.sh"]
 
+# ---------------------------------------------------------------- gpu-libs
+# The CUDA libraries the binaries really need, read from `ldd` of the freshly built llama-server and ggml-rpc-server (not a
+# hand-kept list: a library that a llama.cpp bump starts to link comes along, a missing one fails the build). libcuda.so.1 is the
+# driver: the nvidia runtime mounts it from the host, so it is the only library allowed to stay "not found". Each file is copied
+# dereferenced under its soname.
+FROM build-gpu AS gpu-libs
+RUN set -eu; mkdir -p /out; \
+    for b in llama-server ggml-rpc-server; do \
+      ldd "/src/build/bin/$b" > "/tmp/ldd-$b"; \
+      while read -r name arrow path _; do \
+        [ "$arrow" = "=>" ] || continue; \
+        if [ "$path" = not ]; then \
+          [ "$name" = libcuda.so.1 ] || { echo "$b needs $name, which is not in the build image" >&2; exit 1; }; \
+          continue; \
+        fi; \
+        case "$path" in \
+          /usr/local/cuda*|*/libnccl.so.*) cp -L "$path" "/out/$name" ;; \
+        esac; \
+      done < "/tmp/ldd-$b"; \
+    done; \
+    for l in libcudart.so.12 libcublas.so.12 libcublasLt.so.12; do \
+      [ -s "/out/$l" ] || { echo "$l missing from ldd of the binaries" >&2; exit 1; }; \
+    done; \
+    ls -l /out; du -sh /out
+
+# ---------------------------------------------------------------- gpu-base-slim / gpu-base-fat
+FROM ubuntu:24.04@sha256:fe81560990fae86dc4743202b2cb4d3df98d0bcf949173cecef15ce1127ef852 AS gpu-base-slim
+COPY --from=gpu-libs /out/ /usr/local/cuda/lib64/
+# What the nvidia/cuda base sets and the nvidia runtime and the device plugin rely on (checked on the 12.8.1 runtime image):
+# visible devices and capabilities (compute for libcuda, utility for NVML/nvidia-smi), the library path, the CUDA requirement.
+RUN printf '/usr/local/cuda/lib64\n' > /etc/ld.so.conf.d/000_cuda.conf && ldconfig
+ENV NVIDIA_VISIBLE_DEVICES=all NVIDIA_DRIVER_CAPABILITIES=compute,utility NVIDIA_REQUIRE_CUDA="cuda>=12.8" \
+    LD_LIBRARY_PATH=/usr/local/cuda/lib64
+
+FROM nvidia/cuda:12.8.1-runtime-ubuntu24.04@sha256:ebef3c171eeef0298e4eb2e4be843105edf3b8b0ac45e0b43acee358e8046867 AS gpu-base-fat
+
 # ---------------------------------------------------------------- gpu
-FROM nvidia/cuda:12.8.1-runtime-ubuntu24.04@sha256:ebef3c171eeef0298e4eb2e4be843105edf3b8b0ac45e0b43acee358e8046867 AS gpu
+FROM gpu-base-${GPU_BASE} AS gpu
 RUN apt-get update \
  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
       ca-certificates curl jq iptables iproute2 libcurl4 libssl3 libgomp1 gnupg \

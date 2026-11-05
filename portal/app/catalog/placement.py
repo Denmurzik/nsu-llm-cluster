@@ -138,7 +138,8 @@ def layer_costs(meta: dict[str, Any], ctx_total: int, parallel: int = 1, kv_cach
 
 
 def _devices(
-    nodes: list[NodeMemory], use_node_ram: bool, ram_pct: int, embd_bytes: int, gpu_reserve: int, leader_extra: int = 0
+    nodes: list[NodeMemory], use_node_ram: bool, ram_pct: int, embd_bytes: int, gpu_reserve: int, leader_extra: int = 0,
+    leader_on_main: bool = False,
 ) -> list[DevicePlan] | None:
     devices: list[DevicePlan] = []
     for i, node in enumerate(nodes):
@@ -147,7 +148,7 @@ def _devices(
                 budget = _gpu_budget(node, gpu_reserve)
             else:
                 budget = None if node.ram_mib is None else ram_budget_bytes(node.ram_mib, ram_pct)
-                if budget is not None and i == 0:
+                if budget is not None and i == 0 and not leader_on_main:
                     budget = max(0, budget - embd_bytes - LEADER_OVERHEAD - leader_extra)  # the leader runs on this node
                 if budget is not None and i == len(nodes) - 1 and node.accel == "nvidia":
                     budget = 0  # so the output layer lands on the last GPU, not on its CPU
@@ -225,16 +226,20 @@ def plan_split(
     parallel: int = 1,
     kv_cache_type: str | None = "f16",
     leader_extra_bytes: int = 0,
+    leader_on_main: bool = False,
 ) -> SplitPlan | None:
     """Placement of one group (`nodes` in `--rpc` order, leader first). None when the model or a needed memory size
     is unknown; a plan that does not fit has `fits = False` and zero counts.
 
     `leader_extra_bytes`: the draft model (weights and KV) and the image projector, which only the leader loads, into
-    the RAM of the leader's node (the leader has no GPU of its own: its draft runs with `-ngld 0`)."""
+    the RAM of the leader's node (the leader has no GPU of its own: its draft runs with `-ngld 0`). `leader_on_main` (setting
+    split_leader_on_main): the leader is on main, so all of that stays out of the budget of the group's first node."""
     if meta is None or not nodes:
         return None
     reserve = gpu_compute_reserve_bytes(meta, gpu_compute_reserve_mib)
-    devices = _devices(nodes, use_node_ram, ram_pct, int(meta.get("embd_bytes") or 0), reserve, leader_extra_bytes)
+    devices = _devices(
+        nodes, use_node_ram, ram_pct, int(meta.get("embd_bytes") or 0), reserve, leader_extra_bytes, leader_on_main
+    )
     if devices is None:
         return None
     costs = layer_costs(meta, ctx_total, parallel, kv_cache_type)
@@ -248,11 +253,13 @@ def plan_split(
     return SplitPlan(devices, fits=True, need_bytes=sum(costs))
 
 
-def plan_for(dep, nodes: list[NodeMemory], gpu_compute_reserve_mib: int = DEFAULT_GPU_COMPUTE_RESERVE_MIB) -> SplitPlan | None:
+def plan_for(
+    dep, nodes: list[NodeMemory], gpu_compute_reserve_mib: int = DEFAULT_GPU_COMPUTE_RESERVE_MIB, leader_on_main: bool = False
+) -> SplitPlan | None:
     """`plan_split` with the settings of a deployment; the controller and the status page use the same one."""
     return plan_split(
         dep.meta, nodes, dep.ctx_per_request * dep.parallel, dep.use_node_ram, dep.ram_budget_pct,
-        gpu_compute_reserve_mib, dep.parallel, getattr(dep, "kv_cache_type", None), sum(dep_extras(dep)),
+        gpu_compute_reserve_mib, dep.parallel, getattr(dep, "kv_cache_type", None), sum(dep_extras(dep)), leader_on_main,
     )
 
 

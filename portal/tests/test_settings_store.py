@@ -13,7 +13,7 @@ from app.models import AuditLog, SystemSetting, User
 CONTRACT_KEYS = {
     "key_rpm_limit", "key_tpm_limit", "max_keys_per_user", "wol_enabled", "wol_delay_s", "wol_max_tries",
     "hf_mirror_max_gib", "model_cache_idle_s", "node_auto_update", "metrics_retention_days",
-    "session_max_days", "node_approval_required", "node_key_migration_days",
+    "session_max_days", "node_approval_required", "node_key_migration_days", "split_leader_on_main",
 }
 
 

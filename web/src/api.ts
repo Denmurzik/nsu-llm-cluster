@@ -246,7 +246,7 @@ export const api = {
   deploymentCommand: (id: number) => get<CommandPreview>(`/api/admin/deployments/${id}/command`),
   /** the command a form that is not saved yet would start; the server validates it like a create (422) */
   commandPreview: (body: DeploymentBody) => post<CommandPreview>("/api/admin/deployments/command-preview", body),
-  nodes: () => get<NodesResponse>("/api/admin/nodes"),
+  nodes: (enrolled = false) => get<NodesResponse>(enrolled ? "/api/admin/nodes?enrolled=1" : "/api/admin/nodes"),
   assignNode: (name: string, deployment_id: number | null) =>
     put<unknown>(`/api/admin/nodes/${encodeURIComponent(name)}/assignment`, { deployment_id }),
   setMaintenance: (name: string, maintenance: boolean) =>

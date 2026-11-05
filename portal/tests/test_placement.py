@@ -1,5 +1,7 @@
 """Layer placement of a split group over GPU and RAM of its nodes (`--tensor-split` counts)."""
 
+import pytest
+
 from app.catalog import placement as pl
 from app.catalog.estimate import NVIDIA_RESERVE
 
@@ -195,3 +197,45 @@ def test_a_group_with_ram_that_does_not_fit_is_held_with_the_reason():
     # no RAM devices (VRAM only) or memory unknown: llama.cpp splits by itself and reports the error itself
     assert pl.decide(pl.plan_split(meta(n_layers=200), nodes, 1024, False, 70)) == pl.AUTO
     assert pl.decide(None) == pl.AUTO
+
+
+def test_a_leader_on_main_takes_nothing_from_the_ram_of_the_first_node():
+    nodes = [cpu("a", 16384), cpu("b", 16384)]
+    full = pl.ram_budget_bytes(16384, 70)
+    m = meta(embd=2 * GiB)
+    on_node = pl.plan_split(m, nodes, 1024, True, 70, leader_extra_bytes=GiB)
+    on_main = pl.plan_split(m, nodes, 1024, True, 70, leader_extra_bytes=GiB, leader_on_main=True)
+    assert on_node.devices[0].budget_bytes == full - 2 * GiB - pl.LEADER_OVERHEAD - GiB
+    assert [d.budget_bytes for d in on_main.devices] == [full, full]
+    assert len(on_main.tensor_split) == len(on_node.tensor_split)  # the same devices: main's CPU is none of them
+
+
+# ggml-org/gpt-oss-120b-GGUF, gpt-oss-120b-MXFP4.gguf as the portal reads it (59 GiB), on the class of 2026-11-06: 15 PCs with
+# 8 GB of VRAM and 12 GB of RAM, of which WSL gets 8 GB (install-node.ps1: RAM minus 4)
+GPT_OSS = meta(
+    n_layers=36, layer=1726212608, output=615340800, embd=615329280, n_vocab=201088, weights_bytes=63387346208, n_heads=64,
+    n_kv_heads=8, head_dim=64, max_ctx=131072, embedding=2880, value_dim=64, arch="gpt-oss", max_tensor_bytes=615329280,
+)
+CLASS = [gpu(f"pc{i:02d}", vram_mib=8188, ram_mib=8192) for i in range(1, 16)]
+
+
+@pytest.mark.parametrize("use_node_ram", [True, False])
+@pytest.mark.parametrize("ctx,parallel", [(8192, 1), (16384, 2)])
+def test_one_group_of_the_class_holds_gpt_oss_120b_in_vram_with_the_leader_on_main(use_node_ram, ctx, parallel):
+    plan = pl.plan_split(GPT_OSS, CLASS, ctx * parallel, use_node_ram, 70, parallel=parallel, leader_on_main=True)
+    assert plan.fits and pl.decide(plan) == pl.SPLIT
+    assert len(plan.nodes) == 15
+    assert sum(plan.tensor_split) == 37  # 36 layers and the output layer, nothing left to the leader
+    assert len(plan.tensor_split) == (30 if use_node_ram else 15)
+    assert plan.ram_bytes == 0  # all of it on the GPUs: RAM layers would be computed by the CPU
+    gpus = [d for d in plan.devices if d.device == pl.GPU_DEVICE]
+    assert len(gpus) == 15 and all(1 <= d.layers <= 3 for d in gpus)
+    room = (8188 - 1536 - 1024) * MiB  # VRAM without the reserve and the compute buffer
+    assert all(d.budget_bytes == room and d.bytes < room for d in gpus)
+    assert max(d.bytes for d in gpus) < 5.1 * GiB  # weights and KV of the fullest card
+
+
+def test_with_a_context_beyond_the_vram_of_the_class_the_ram_of_the_pcs_takes_the_rest():
+    plan = pl.plan_split(GPT_OSS, CLASS, 32768 * 4, True, 70, parallel=4, leader_on_main=True)
+    assert plan.fits and plan.ram_bytes > 0
+    assert not pl.plan_split(GPT_OSS, CLASS, 32768 * 4, False, 70, parallel=4, leader_on_main=True).fits

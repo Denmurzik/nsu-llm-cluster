@@ -27,6 +27,35 @@ async function openNodes() {
 
 const rowOf = (name: RegExp) => screen.getByRole("row", { name });
 
+describe("the disk of the PC", () => {
+  const GiB = 1024 ** 3;
+  const live = (disks: Record<string, number | null>) =>
+    http.get("/api/admin/metrics/live", () =>
+      HttpResponse.json({
+        at: "2026-11-05T10:00:00Z",
+        available: true,
+        models: [],
+        nodes: Object.entries(disks).map(([name, disk_free_bytes]) => ({ name, disk_free_bytes })),
+      }),
+    );
+
+  it("below 3 ГБ free the row warns in Russian with the free space, at 3 ГБ and with no sample it says nothing", async () => {
+    server.use(live({ "aud-101-pc01": 2.5 * GiB, "aud-101-pc02": 3 * GiB, "aud-204-gpu01": null, "llm-main": 1 * GiB }));
+    await openNodes();
+    const warning = await within(rowOf(/aud-101-pc01/)).findByRole("alert");
+    expect(warning).toHaveTextContent(/Мало места на диске ПК: свободно 2,5\sГБ, нода остановится при заполнении диска/);
+    for (const row of [/aud-101-pc02/, /aud-204-gpu01/, /win-laptop-07/, /llm-main/]) {
+      expect(within(rowOf(row)).queryByText(/Мало места на диске ПК/)).not.toBeInTheDocument();
+    }
+  });
+
+  it("a page without the live samples still shows the nodes", async () => {
+    server.use(http.get("/api/admin/metrics/live", () => HttpResponse.json({ detail: "нет" }, { status: 503 })));
+    await openNodes();
+    expect(screen.queryByText(/Мало места на диске ПК/)).not.toBeInTheDocument();
+  });
+});
+
 describe("a node waiting for approval", () => {
   it("is marked with the address it called from and is approved by its own button", async () => {
     const approved: string[] = [];
@@ -50,6 +79,52 @@ describe("a node waiting for approval", () => {
     expect(approved).toEqual([]);
     await user.click(within(dialog).getByRole("button", { name: "Подтвердить" }));
     await waitFor(() => expect(approved).toEqual(["win-laptop-07"]));
+  });
+
+  it("without a key there is nothing to approve yet: the row says it waits for the node, a registered name out of the cluster has a row", async () => {
+    server.use(
+      http.get("/api/admin/nodes", () =>
+        HttpResponse.json({
+          ...fixtures.nodes,
+          nodes: fixtures.nodes.nodes.map((n) =>
+            n.name === "win-laptop-07"
+              ? { ...n, approved: false, has_key: false, claims: [] }
+              : n.name === "aud-101-pc02"
+                ? { ...n, source: "enrolled", approved: false, has_key: true, claims: [] }
+                : n,
+          ),
+        }),
+      ),
+    );
+    await openNodes();
+    const row = rowOf(/win-laptop-07/);
+    expect(within(row).getByText("Ждёт регистрации ноды")).toBeInTheDocument();
+    expect(within(row).queryByRole("button", { name: "Подтвердить" })).not.toBeInTheDocument();
+    const enrolled = rowOf(/aud-101-pc02/);
+    expect(within(enrolled).getByText("ещё не в кластере")).toBeInTheDocument();
+    expect(within(enrolled).getByRole("button", { name: "Подтвердить" })).toBeInTheDocument();
+  });
+
+  it("a claim on a waiting node leaves its «Подтвердить» in the row, the bulk action leaves the row out", async () => {
+    const claim = { id: 7, ip: "10.66.66.66", at: "2026-11-05T10:00:00Z", known: false };
+    server.use(
+      http.get("/api/admin/nodes", () =>
+        HttpResponse.json({
+          ...fixtures.nodes,
+          nodes: fixtures.nodes.nodes.map((n) =>
+            n.name === "win-laptop-07" ? { ...n, approved: false, has_key: true, claims: [claim], deployment: null } : n,
+          ),
+        }),
+      ),
+    );
+    const { user } = await openNodes();
+    const row = rowOf(/win-laptop-07/);
+    expect(within(row).getByRole("button", { name: "Подтвердить" })).toBeInTheDocument();
+    expect(within(row).getByRole("button", { name: "Заявки: 1" })).toBeInTheDocument();
+    expect(within(row).getByText("Попытка перерегистрации известного имени")).toBeInTheDocument();
+    await user.click(screen.getByRole("checkbox", { name: "Выбрать win-laptop-07" }));
+    const toolbar = screen.getByRole("toolbar", { name: "Действия над выбранными нодами" });
+    expect(within(toolbar).getByRole("button", { name: "Подтвердить" })).toBeDisabled();
   });
 
   it("claims on a known name are a warning of their own, picked one by one against the known addresses, never in bulk", async () => {

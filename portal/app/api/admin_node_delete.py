@@ -127,18 +127,21 @@ async def delete_node(
             status_code=409,
         )
 
-    async def log_it(found: bool, k8s_state: str) -> None:
+    async def log_it(found: bool, k8s_state: str, password_gone: bool) -> None:
         details = {
             "source": source, "forced": force, "online": online, "deployments": sorted(held), "k8s": k8s_state,
         }
+        if not password_gone:
+            details["k3s_cleanup"] = "left"  # (a key with «password» in it the audit log drops)
         await audit.record(db, user, "node.delete", "node", name, details, audit.client_ip(request))
 
-    _, k8s_state = await remove_node(request.app.state, db, name, log_it)
+    _, k8s_state, password_gone = await remove_node(request.app.state, db, name, log_it)
     log.info("node %s removed from the cluster by %s (%s, online=%s, forced=%s)", name, user.email, source, online, force)
     return {
         "node": name,
         "online": online,
         "k8s": k8s_state,
+        "k3s_password": "deleted" if password_gone else "left",
         "unassigned": sorted(held),
         "uninstall": uninstall_commands(settings, name),
     }

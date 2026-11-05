@@ -11,15 +11,16 @@ import re
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
+from kubernetes_asyncio.client import ApiException
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import audit
 from app.auth.sessions import require_admin, require_csrf
 from app.db import get_session
-from app.k8s import MAIN_NODE
-from app.models import User
-from app.nodes import identity
+from app.k8s import MAIN_NODE, K8sUnavailable
+from app.models import StandaloneNode, User
+from app.nodes import identity, registry
 
 log = logging.getLogger(__name__)
 
@@ -46,19 +47,39 @@ def _normal(name: str) -> str:
     return name
 
 
+async def _k3s_password_cleared(k8s, name: str, picked: bool, in_cluster: set[str] | None) -> tuple[bool, set[str] | None]:
+    """The node password of an agent that is about to join under `name`: a picked claim is a machine of its own, its new
+    password would be refused; a waiting node that is not in the cluster may be the PC of a name deleted while the cluster
+    was down. A node the cluster lists has joined: its password is right. Returns (nothing stays in the way, the names the
+    cluster listed, read once per request)."""
+    if not picked and in_cluster is None:
+        try:
+            in_cluster = {n.name.lower() for n in await k8s.list_nodes()}
+        except (K8sUnavailable, ApiException) as exc:
+            log.warning("approve %s: the cluster does not answer: %s", name, exc)
+            return False, None
+    if not picked and name in in_cluster:
+        return True, in_cluster
+    return await registry.delete_node_password(k8s, name), in_cluster
+
+
 async def _approve(
     db: AsyncSession, request: Request, user: User, names: list[str], claim_id: int | None = None
 ) -> list[str]:
     done = []
+    k8s = getattr(request.app.state, "k8s", None)
+    in_cluster: set[str] | None = None
     for name in dict.fromkeys(_normal(n) for n in names):
         claims = await identity.live_claims(db, name)
         picked = next((c for c in claims if c.id == claim_id), None)
         try:
-            row = await identity.approve(db, name, user.email, getattr(request.app.state, "k8s", None), claim_id)
+            row = await identity.approve(db, name, user.email, claim_id)
         except identity.NotRegistered:
             await db.rollback()
             raise HTTPException(
-                404, f"Нода «{name}» не регистрировалась (или ещё не зарегистрировалась после сброса ключа): подтверждать нечего"
+                404,
+                f"Нода «{name}» ещё не получила свой ключ: подтверждать пока нечего. Контейнер ноды регистрируется сам при старте, "
+                "после этого здесь появится кнопка «Подтвердить» или заявка. Если их нет, перезапустите ноду на ПК (run-node)",
             ) from None
         except identity.ClaimsPending:
             await db.rollback()
@@ -71,6 +92,17 @@ async def _approve(
         details: dict[str, Any] = {"has_key": row.key_hash is not None}
         if picked is not None:
             details |= {"claim_ip": picked.ip, "rejected": [c.ip for c in claims if c.id != picked.id]}
+        # before the commit: if the cluster does not answer nothing is spent, the claim and the button stay for a repeat. A
+        # standalone node has nothing to do with k3s.
+        if k8s is not None and (picked is not None or await db.get(StandaloneNode, name) is None):
+            cleared, in_cluster = await _k3s_password_cleared(k8s, name, picked is not None, in_cluster)
+            if not cleared:
+                await db.rollback()
+                raise HTTPException(
+                    503,
+                    f"Кластер не ответил, нода «{name}» не подтверждена: пароль k3s этого имени не удалён, и k3s не принял бы её. "
+                    "Повторите, когда кластер вернётся",
+                )
         await audit.record(db, user, "node.approve", "node", name, details, audit.client_ip(request))
         done.append(name)
     await db.commit()

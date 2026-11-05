@@ -10,6 +10,8 @@ trap 'rm -rf "$TMP"' EXIT
 # the monitoring collector (node-metrics.sh, started by entrypoint.sh) would run on in the background of every entrypoint test
 # below: it has its own tests (test_node_metrics.sh)
 export NODE_METRICS=0
+# the image prune of entrypoint.sh (prune-node-images.sh, sleeps 5 minutes) would also hold the stdout of every entrypoint test
+export PRUNE_IMAGES=0
 FAILS=0
 
 pass() { echo "ok   - $1"; }
@@ -569,6 +571,9 @@ RPC_CACHE_DIR="$TMP/rpccache/missing" bash "$BIN/rpc-cache-gc.sh" && pass "rpc g
   || fail "rpc gc without a cache dir is a no-op"
 RPC_CACHE_DIR="$G" RPC_CACHE_MAX_GIB=lots bash "$BIN/rpc-cache-gc.sh" >/dev/null 2>&1; rc=$?
 [ "$rc" = 2 ] && pass "rpc gc rejects a bad limit" || fail "rpc gc rejects a bad limit (rc $rc)"
+# 16 GB limit of a class PC: the default cache limit is 5 GiB (a 64 GiB default cannot fit), in the script and in .env.example
+grep -q 'MAX_GIB="${RPC_CACHE_MAX_GIB:-5}"' "$BIN/rpc-cache-gc.sh" && pass "rpc gc: default limit is 5 GiB" || fail "rpc gc: default limit is 5 GiB"
+[ "$(grep -c '^RPC_CACHE_MAX_GIB=5$' "$NODE/../.env.example")" = 1 ] && pass ".env.example: RPC_CACHE_MAX_GIB=5" || fail ".env.example: RPC_CACHE_MAX_GIB=5"
 reset_rpc
 RPC_CACHE_DIR="$G" RPC_CACHE_MAX_BYTES=1500 RPC_CACHE_MIN_FREE_PCT=0 RPC_CACHE_GC_INTERVAL_S=1 \
   bash "$BIN/rpc-cache-gc.sh" --loop >/dev/null 2>&1 &
@@ -711,6 +716,9 @@ export PROC_MEMINFO="$TMP/meminfo" CGROUP_MEMORY_MAX="$TMP/absent"
 # --- entrypoint.sh ---
 # the background report of the size of the models volume would run on for ever in these tests; the two tests of it start it
 export MODELS_REPORT_S=0
+# entrypoint.sh supervises its background helpers (restarts them when they end, task B1): the stubs below end at once, and a
+# supervisor that restarts them would keep the command substitutions of these tests open; its own test sets a limit of 2
+export SUPERVISE_RESTARTS=0
 printf '#!/usr/bin/env bash
 echo "k3s $*"
 echo "K3S_TOKEN=${K3S_TOKEN-unset} CLUSTER_TOKEN=${CLUSTER_TOKEN-unset}"
@@ -754,6 +762,14 @@ sleep 1
   && grep -qx "registrar --models-report CLUSTER_TOKEN=tok WOL_MAC=unset" "$TMP/reg-bg.log" \
   && pass "entrypoint k3s without a NIC still reports the image and the models volume" \
   || fail "entrypoint k3s without a NIC still reports the image and the models volume: $(cat "$TMP/reg-bg.log")"
+# the registrar is supervised: when it ends it is started again (with a backoff) and the container log says how it ended
+: > "$TMP/reg-bg.log"
+out="$(PATH="$TMP/wolbin:$TMP/fakebin:$BIN:$PATH" FAKE_REG_LOG="$TMP/reg-bg.log" MODE=k3s MAIN_HOST=main.example CLUSTER_TOKEN=tok   NODE_NAME=foo ACCEL=cpu SUPERVISE_RESTARTS=2 SUPERVISE_DELAY_S=0 timeout 10 bash "$BIN/entrypoint.sh" 2>&1)"
+sleep 1
+[ "$(grep -c '^registrar --report CLUSTER_TOKEN=tok' "$TMP/reg-bg.log")" = 3 ]   && pass "entrypoint restarts registrar --report when it ends (supervised)"   || fail "entrypoint restarts registrar --report when it ends (supervised): $(cat "$TMP/reg-bg.log")"
+contains "the supervisor logs how the registrar ended" "$out" "entrypoint: registrar.sh --report ended (exit code 0), starting it again in 0s"
+contains "the supervisor logs the last end too" "$out" "not started again (SUPERVISE_RESTARTS=2)"
+lacks "the supervisor log has no token" "$out" "CLUSTER_TOKEN=tok"
 out="$(PATH="$TMP/fakebin:$BIN:$PATH" MODE=k3s MAIN_HOST=main.example CLUSTER_TOKEN=tok NODE_NAME=foo RAM_MIB=27000 ACCEL=cpu bash "$BIN/entrypoint.sh" 2>&1)"
 contains "entrypoint ram label from run-node" "$out" "--node-label llm.nsu/ram-mib=27000"
 out="$(PATH="$TMP/fakebin:$BIN:$PATH" MODE=k3s MAIN_HOST=main.example CLUSTER_TOKEN=tok NODE_NAME=foo RAM_MIB=junk ACCEL=cpu bash "$BIN/entrypoint.sh" 2>&1)"
@@ -823,14 +839,14 @@ out="$(PATH="$BIN:$PATH" MODE=bogus bash "$BIN/entrypoint.sh" 2>&1)"; rc=$?
 # --- run-node.sh ---
 RN="$NODE/run-node.sh"
 out="$(bash "$RN" --dry-run --main 192.168.3.21 --node-ip 192.168.3.200 --name Test-Node --token T --accel cpu 2>&1)"
-contains "run docker save" "$out" "docker save --platform linux/amd64 nsu-llm-node:0.2.0-cpu"
+contains "run docker save" "$out" "docker save --platform linux/amd64 nsu-llm-node:0.2.1-cpu"
 contains "run docker run" "$out" "docker run -d --name llm-node"
 contains "run -p 18080" "$out" "-p 18080:18080"
 contains "run -p 18050 only on the node address" "$out" "-p 192.168.3.200:18050:18050"
 lacks "run 18050 is not published on every address (127.0.0.1 stays closed)" "$out" "-p 18050:18050"
 contains "run privileged" "$out" "--privileged"
 contains "run hostname" "$out" "--hostname test-node"
-contains "run image" "$out" "nsu-llm-node:0.2.0-cpu"
+contains "run image" "$out" "nsu-llm-node:0.2.1-cpu"
 contains "run MODE" "$out" "MODE=k3s"
 contains "run restart" "$out" "--restart unless-stopped"
 contains "run volume models" "$out" "-v llm-models:/var/lib/llm-models"
@@ -848,7 +864,7 @@ out="$(MODELS_REPORT_S=0 bash "$RN" --dry-run --main 192.168.3.21 --node-ip 192.
 contains "run passes MODELS_REPORT_S through" "$out" "-e MODELS_REPORT_S"
 
 out="$(bash "$RN" --dry-run --main 192.168.3.21 --node-ip 192.168.3.200 --name n1 --token T --accel nvidia --network host 2>&1)"
-contains "run nvidia image" "$out" "nsu-llm-node:0.2.0-gpu"
+contains "run nvidia image" "$out" "nsu-llm-node:0.2.1-gpu"
 contains "run nvidia gpus" "$out" "--gpus all"
 contains "run host network" "$out" "--network host"
 lacks "run host no -p" "$out" "-p 18080:18080"
@@ -964,8 +980,8 @@ EOS
   out="$(psun -Network bridge)"
   contains "ps1 uninstall DELETE reads the token from a header file" "$out" "-H '@<файл заголовков>'"
   lacks "ps1 uninstall token not on the command line" "$out" "Bearer"
-  out="$(psun -Network host -Image nsu-llm-node:0.2.0-cpu)"
-  contains "ps1 host cleanup runs" "$out" "--entrypoint bash nsu-llm-node:0.2.0-cpu -c"
+  out="$(psun -Network host -Image nsu-llm-node:0.2.1-cpu)"
+  contains "ps1 host cleanup runs" "$out" "--entrypoint bash nsu-llm-node:0.2.1-cpu -c"
   lacks "ps1 native arguments carry no double quotes" "$out" '"'
   grep -qF "'--format=csv,noheader,nounits'" "$NODE/run-node.ps1" \
     && pass "ps1 nvidia-smi --format is quoted (PowerShell splits on commas)" || fail "ps1 nvidia-smi --format is quoted"
@@ -990,9 +1006,9 @@ EOS
   : > "$TMP/psdocker.log"
   out="$(FAKE_FAIL=save FAKE_LOG="$(cygpath -w "$TMP/psdocker.log")" PSDATA=psdata-gpu PSACCEL=auto psreal)"
   log="$(cat "$TMP/psdocker.log")"
-  contains "ps1 gpu probe runs the local gpu image" "$log" "run --rm --pull never --gpus all --entrypoint nvidia-smi nsu-llm-node:0.2.0-gpu"
+  contains "ps1 gpu probe runs the local gpu image" "$log" "run --rm --pull never --gpus all --entrypoint nvidia-smi nsu-llm-node:0.2.1-gpu"
   lacks "ps1 gpu probe pulls nothing from Docker Hub" "$log" "nvidia/cuda"
-  contains "ps1 gpu probe success selects the gpu image" "$log" "save --platform linux/amd64 nsu-llm-node:0.2.0-gpu"
+  contains "ps1 gpu probe success selects the gpu image" "$log" "save --platform linux/amd64 nsu-llm-node:0.2.1-gpu"
 fi
 
 unset MODELS_REPORT_S
@@ -1155,7 +1171,8 @@ out="$(reg 404)"
 lacks "registrar without a NIC sends no wake" "$(cat "$TMP/curl.log")" '"wake"'
 out="$(WOL_MAC=00-1A-2B-3C-4D-5E WOL_IP=10.1.2.3 WOL_PREFIX=junk reg 404)"
 lacks "registrar ignores a malformed prefix" "$(cat "$TMP/curl.log")" '"wake"'
-# k3s mode: --wake-report posts the NIC once (no NODE_IP needed, no register), the token from a header file
+# k3s mode: --wake-report posts the NIC once (no NODE_IP needed, no register), the token from a header file; the process is the
+# identity keeper of the container (task B1): it stays after the reports (timeout ends it here: rc 124)
 wr() {
   : > "$TMP/curl.log"; : > "$TMP/curl.log.hdr"; rm -f "$TMP/regstate/ca.crt"
   FAKE_CA_CODE=404 FAKE_API_CODE="${1:-200}" FAKE_CURL_LOG="$TMP/curl.log" PATH="$TMP/regbin:$BIN:$PATH" CLUSTER_TOKEN=clustersecret42 \
@@ -1163,7 +1180,7 @@ wr() {
     WAKE_RETRY_S=1 timeout 5 bash "$BIN/registrar.sh" --wake-report 2>&1
 }
 out="$(wr)"; rc=$?
-[ $rc -eq 0 ] && pass "wake report exits once the portal took it" || { fail "wake report exits once the portal took it (rc=$rc)"; echo "$out"; }
+[ $rc -eq 124 ] && pass "wake report: the keeper stays once the portal took it" || { fail "wake report: the keeper stays once the portal took it (rc=$rc)"; echo "$out"; }
 log="$(cat "$TMP/curl.log")"
 contains "wake report posts to /api/nodes/wake" "$log" "https://main.example/api/nodes/wake"
 contains "wake report payload" "$log" '{"name":"pc01","mac":"00-1A-2B-3C-4D-5E","ip":"10.1.2.3","prefix":24}'
@@ -1172,23 +1189,26 @@ lacks "wake report token not on the command line" "$log" "clustersecret42"
 contains "wake report token from a header file" "$(cat "$TMP/curl.log.hdr")" "Authorization: Bearer clustersecret42"
 contains "wake report says it is done" "$out" "reported"
 out="$(wr 422)"; rc=$?
-[ $rc -ne 0 ] && pass "wake report refused data: stops" || fail "wake report refused data: stops"
+# 422 on the enrolment too (a name the portal refuses): nothing to keep, the process ends (entrypoint.sh starts it again later)
+[ $rc -ne 124 ] && pass "wake report refused data: stops" || fail "wake report refused data: stops (rc=$rc)"
 [ "$(grep -c '/api/nodes/wake' "$TMP/curl.log")" = 1 ] && pass "wake report refused data: no retry" || fail "wake report refused data: no retry"
-out="$(wr 503)"
-[ "$(grep -c '/api/nodes/wake' "$TMP/curl.log")" -ge 2 ] && pass "wake report retries while the portal is down" || fail "wake report retries while the portal is down"
+out="$(ENROLL_RETRY_S=1 wr 503)"
+# the portal does not answer: the enrolment is retried and no report goes before it (they need the node's key)
+[ "$(grep -c '/api/nodes/enroll' "$TMP/curl.log")" -ge 2 ] && pass "wake report retries while the portal is down" || fail "wake report retries while the portal is down"
+lacks "wake report waits for the enrolment" "$(cat "$TMP/curl.log")" "/api/nodes/wake"
 : > "$TMP/curl.log"; rm -f "$TMP/regstate/ca.crt"
 out="$(FAKE_CA_CODE=404 FAKE_CURL_LOG="$TMP/curl.log" PATH="$TMP/regbin:$BIN:$PATH" CLUSTER_TOKEN=t MAIN_HOST=main.example STATE_DIR="$TMP/regstate" timeout 5 bash "$BIN/registrar.sh" --wake-report 2>&1)"; rc=$?
-[ $rc -eq 0 ] && pass "wake report without a NIC exits quietly" || fail "wake report without a NIC exits quietly (rc=$rc)"
+[ $rc -eq 124 ] && pass "wake report without a NIC: the keeper stays quietly" || fail "wake report without a NIC: the keeper stays quietly (rc=$rc)"
 lacks "wake report without a NIC posts no NIC" "$(cat "$TMP/curl.log")" "/api/nodes/wake"
 contains "wake report without a NIC still reports the image (the old flag is the same mode)" "$(cat "$TMP/curl.log")" "/image"
 # Versions (task 2-30): the image this container runs goes to POST /api/nodes/<name>/image, in both modes
 DIGEST_A="sha256:$(printf 'ab%.0s' $(seq 32))"
-out="$(NODE_VERSION=0.2.0 NODE_REVISION=abc1234 NODE_IMAGE=nsu-llm-node:0.2.0-gpu NODE_IMAGE_DIGEST="$DIGEST_A" reg 404)"
+out="$(NODE_VERSION=0.2.1 NODE_REVISION=abc1234 NODE_IMAGE=nsu-llm-node:0.2.1-gpu NODE_IMAGE_DIGEST="$DIGEST_A" reg 404)"
 img="$(grep -- '/api/nodes/reg-test/image' "$TMP/curl.log" | head -n1)"
-contains "registrar reports the image after registering" "$img" '"version":"0.2.0","revision":"abc1234","digest":"'"$DIGEST_A"'","tag":"nsu-llm-node:0.2.0-gpu"'
+contains "registrar reports the image after registering" "$img" '"version":"0.2.1","revision":"abc1234","digest":"'"$DIGEST_A"'","tag":"nsu-llm-node:0.2.1-gpu"'
 [ "$(grep -n -- '/api/nodes/register' "$TMP/curl.log" | head -n1 | cut -d: -f1)" -lt "$(grep -n -- '/image' "$TMP/curl.log" | head -n1 | cut -d: -f1)" ] \
   && pass "registrar reports the image after the registration, not before" || fail "registrar reports the image after the registration, not before"
-contains "registrar registers with the version of the image" "$(grep -- '/api/nodes/register' "$TMP/curl.log")" '"version":"0.2.0"'
+contains "registrar registers with the version of the image" "$(grep -- '/api/nodes/register' "$TMP/curl.log")" '"version":"0.2.1"'
 out="$(NODE_IMAGE_DIGEST='sha256:junk' reg 404)"
 contains "registrar drops a malformed digest instead of sending it" "$(grep -- '/image' "$TMP/curl.log" | head -n1)" '"digest":""'
 out="$(reg 404)"
@@ -1199,14 +1219,14 @@ contains "registrar says that the report was not taken" "$out" "image report fai
 wr() {
   : > "$TMP/curl.log"; : > "$TMP/curl.log.hdr"; rm -f "$TMP/regstate/ca.crt"
   FAKE_CA_CODE=404 FAKE_API_CODE="${1:-200}" FAKE_CURL_LOG="$TMP/curl.log" PATH="$TMP/regbin:$BIN:$PATH" CLUSTER_TOKEN=clustersecret42 \
-    NODE_NAME=PC01 MAIN_HOST=main.example STATE_DIR="$TMP/regstate" WAKE_RETRY_S=1 NODE_VERSION=0.2.0 NODE_REVISION=abc1234 \
-    NODE_IMAGE=nsu-llm-node:0.2.0-cpu NODE_IMAGE_DIGEST="$DIGEST_A" timeout 5 bash "$BIN/registrar.sh" --report 2>&1
+    NODE_NAME=PC01 MAIN_HOST=main.example STATE_DIR="$TMP/regstate" WAKE_RETRY_S=1 NODE_VERSION=0.2.1 NODE_REVISION=abc1234 \
+    NODE_IMAGE=nsu-llm-node:0.2.1-cpu NODE_IMAGE_DIGEST="$DIGEST_A" timeout 5 bash "$BIN/registrar.sh" --report 2>&1
 }
 out="$(wr)"; rc=$?
-[ $rc -eq 0 ] && pass "image report exits once the portal took it" || { fail "image report exits once the portal took it (rc=$rc)"; echo "$out"; }
+[ $rc -eq 124 ] && pass "image report: the keeper stays once the portal took it" || { fail "image report: the keeper stays once the portal took it (rc=$rc)"; echo "$out"; }
 log="$(cat "$TMP/curl.log")"
 contains "image report posts to /api/nodes/<name>/image" "$log" "https://main.example/api/nodes/pc01/image"
-contains "image report payload" "$log" '{"version":"0.2.0","revision":"abc1234","digest":"'"$DIGEST_A"'","tag":"nsu-llm-node:0.2.0-cpu"}'
+contains "image report payload" "$log" '{"version":"0.2.1","revision":"abc1234","digest":"'"$DIGEST_A"'","tag":"nsu-llm-node:0.2.1-cpu"}'
 lacks "image report does not register" "$log" "/api/nodes/register"
 lacks "image report without a NIC posts no NIC" "$log" "/api/nodes/wake"
 lacks "image report token not on the command line" "$log" "clustersecret42"
@@ -1214,7 +1234,7 @@ contains "image report token from a header file" "$(cat "$TMP/curl.log.hdr")" "A
 contains "image report says it is done" "$out" "reported to the portal"
 out="$(FAKE_IMAGE_CODE=404 wr)"; rc=$?
 [ "$(grep -c '/pc01/image' "$TMP/curl.log")" = 1 ] && pass "image report: a portal without the endpoint is not asked again" || fail "image report: a portal without the endpoint is not asked again"
-out="$(FAKE_IMAGE_CODE=503 wr)"
+out="$(FAKE_IMAGE_CODE=503 ENROLL_RETRY_S=1 wr)"
 [ "$(grep -c '/pc01/image' "$TMP/curl.log")" -ge 2 ] && pass "image report retries while the portal is down" || fail "image report retries while the portal is down"
 out="$(WOL_MAC=00-1A-2B-3C-4D-5E WOL_IP=10.1.2.3 WOL_PREFIX=24 wr)"
 contains "image report goes with the NIC report" "$(cat "$TMP/curl.log")" "/api/nodes/wake"
@@ -1340,23 +1360,23 @@ EOS
 chmod +x "$TMP/dockerbin/docker"
 unin() { PATH="$TMP/dockerbin:$PATH" bash "$RN" --dry-run --uninstall --main 192.168.3.21 --name test-node --token T "$@" 2>&1; }
 
-out="$(FAKE_INSPECT=nsu-llm-node:0.2.0-gpu FAKE_IMAGES="nsu-llm-node:0.2.0-cpu" unin --network host)"
+out="$(FAKE_INSPECT=nsu-llm-node:0.2.1-gpu FAKE_IMAGES="nsu-llm-node:0.2.1-cpu" unin --network host)"
 contains "uninstall host chains" "$out" "KUBE-"
 contains "uninstall host links" "$out" "flannel.1"
-contains "uninstall host image from container" "$out" "--entrypoint bash nsu-llm-node:0.2.0-gpu"
+contains "uninstall host image from container" "$out" "--entrypoint bash nsu-llm-node:0.2.1-gpu"
 contains "uninstall host never pulls" "$out" "--pull never"
-out="$(FAKE_INSPECT=nsu-llm-node:0.2.0-gpu unin --network host --image my/img:1)"
+out="$(FAKE_INSPECT=nsu-llm-node:0.2.1-gpu unin --network host --image my/img:1)"
 contains "uninstall host --image wins" "$out" "--entrypoint bash my/img:1"
-lacks "uninstall host --image wins (no gpu)" "$out" "nsu-llm-node:0.2.0-gpu"
+lacks "uninstall host --image wins (no gpu)" "$out" "nsu-llm-node:0.2.1-gpu"
 out="$(FAKE_INSPECT= FAKE_IMAGES="other:1
-nsu-llm-node:0.2.0-gpu
-nsu-llm-node:0.2.0-cpu" unin --network host)"
-contains "uninstall host image from local images" "$out" "--entrypoint bash nsu-llm-node:0.2.0-gpu"
+nsu-llm-node:0.2.1-gpu
+nsu-llm-node:0.2.1-cpu" unin --network host)"
+contains "uninstall host image from local images" "$out" "--entrypoint bash nsu-llm-node:0.2.1-gpu"
 out="$(FAKE_INSPECT= FAKE_IMAGES="other:1" unin --network host)"
 contains "uninstall host without image warns" "$out" "Предупреждение: образ ноды не найден локально"
 lacks "uninstall host without image skips cleanup" "$out" "--entrypoint"
 contains "uninstall host without image still removes container" "$out" "docker rm -f llm-node"
-out="$(FAKE_INSPECT=nsu-llm-node:0.2.0-gpu unin)"
+out="$(FAKE_INSPECT=nsu-llm-node:0.2.1-gpu unin)"
 lacks "uninstall bridge has no host cleanup" "$out" "--entrypoint"
 
 # a data dir with root-owned files (rm without root fails) is removed through the node image
@@ -1364,7 +1384,7 @@ mkdir -p "$TMP/rootbin" "$TMP/rootdata/state"
 cat > "$TMP/rootbin/docker" <<'EOS'
 #!/usr/bin/env bash
 echo "docker $*" >> "$DOCKER_LOG"
-case "$1" in inspect) echo nsu-llm-node:0.2.0-cpu; exit 0 ;; esac
+case "$1" in inspect) echo nsu-llm-node:0.2.1-cpu; exit 0 ;; esac
 exit 0
 EOS
 cat > "$TMP/rootbin/rm" <<'EOS'
@@ -1375,7 +1395,7 @@ chmod +x "$TMP/rootbin/docker" "$TMP/rootbin/rm"
 : > "$TMP/rootdocker.log"
 out="$(DOCKER_LOG="$TMP/rootdocker.log" PATH="$TMP/rootbin:$PATH" bash "$RN" --uninstall --main 192.168.3.21 --name test-node --data-dir "$TMP/rootdata" 2>&1)"
 log="$(cat "$TMP/rootdocker.log")"
-contains "uninstall removes a root-owned data dir through the node image" "$log" "run --rm --pull never -v $TMP:/p --entrypoint rm nsu-llm-node:0.2.0-cpu -rf /p/rootdata"
+contains "uninstall removes a root-owned data dir through the node image" "$log" "run --rm --pull never -v $TMP:/p --entrypoint rm nsu-llm-node:0.2.1-cpu -rf /p/rootdata"
 contains "uninstall warns when the data dir is still there" "$out" "sudo rm -rf $TMP/rootdata"
 rm -rf "$TMP/rootdata"
 
@@ -1397,7 +1417,7 @@ case "$1" in
     [ -n "${FAKE_CONTAINER:-}" ] || exit 1
     case "$*" in
       *"range .Config.Env"*) cat "$FAKE_ENV" ;;
-      *".Config.Image"*) echo nsu-llm-node:0.2.0-cpu ;;
+      *".Config.Image"*) echo nsu-llm-node:0.2.1-cpu ;;
       *NetworkMode*) echo host ;;
       *Mounts*) echo "$FAKE_STATE_SRC" ;;
     esac; exit 0 ;;
@@ -1415,6 +1435,7 @@ case "${*: -1}" in
   *"/desired?"*) [ "${FAKE_CURL_FAIL:-0}" = 1 ] && { echo "curl: (7) Failed to connect" >&2; exit 7; }; cat "$FAKE_PLAN"; exit 0 ;;
   *"/v2/") printf '%s' "${FAKE_V2_CODE-200}"; exit 0 ;;
   *"/api/node-image") [ -n "${FAKE_NODE_IMAGE:-}" ] && { cat "$FAKE_NODE_IMAGE"; exit 0; }; exit 22 ;;
+  *"/known") [ -n "${FAKE_KNOWN:-}" ] || exit 22; for ((i = 1; i <= $#; i++)); do [ "${!i}" = "-o" ] && { j=$((i + 1)); printf '%s' "$FAKE_KNOWN" > "${!j}"; }; done; printf '%s' "${FAKE_KNOWN_CODE:-200}"; exit 0 ;;
   *"/api/nodes/pc01") if [ -n "${FAKE_DELETE_CODE:-}" ]; then for ((i = 1; i <= $#; i++)); do [ "${!i}" = "-o" ] && { j=$((i + 1)); printf '%s' "${FAKE_DELETE_BODY:-}" > "${!j}"; }; done; printf '%s' "$FAKE_DELETE_CODE"; fi; exit 0 ;;
   *"/ca.crt") for ((i = 1; i <= $#; i++)); do [ "${!i}" = "-o" ] && { j=$((i + 1)); cp "${FAKE_CA:-/dev/null}" "${!j}" 2>/dev/null || echo CERT > "${!j}"; }; done; exit 0 ;;
 esac
@@ -1460,7 +1481,7 @@ NODE_IMAGE_DIGEST=$OLD_DIGEST
 PATH=/usr/local/sbin:/usr/bin
 EOS2
 printf 'llm.nsu/accel=cpu' > "$TMP/upddata/state/labels"; echo CERT > "$TMP/upddata/state/ca.crt"
-plan() { printf 'go=%s\nimage=nsu-llm-node:0.2.0-cpu\ndigest=%s\nmode=requested\nwhen=now\nreason=%s\n' "$1" "${2:-$NEW_DIGEST}" "${3:-}" > "$TMP/upd.plan"; }
+plan() { printf 'go=%s\nimage=nsu-llm-node:0.2.1-cpu\ndigest=%s\nmode=requested\nwhen=now\nreason=%s\n' "$1" "${2:-$NEW_DIGEST}" "${3:-}" > "$TMP/upd.plan"; }
 upd() { # [VAR=value ...] -> output of run-node.sh --update [args]; the docker/curl calls land in $TMP/upd.log
   : > "$TMP/upd.log"; : > "$TMP/upd.log.hdr"
   env PATH="$TMP/updbin:$PATH" DOCKER_LOG="$TMP/upd.log" FAKE_CONTAINER="${FAKE_CONTAINER-1}" FAKE_ENV="$TMP/upd.env" FAKE_STATE_SRC="$TMP/upddata/state" \
@@ -1489,16 +1510,16 @@ plan 1
 out="$(upd)"; rc=$?
 if [ $rc -eq 0 ]; then pass "update: main says go, the container is replaced"; else fail "update: main says go, the container is replaced (rc=$rc)"; echo "$out"; fi
 log="$(updlog)"
-contains "update pulls from main with the pinned CA and records the digest" "$log" "pull-image --main main.example --image nsu-llm-node:0.2.0-cpu --digest $NEW_DIGEST --no-tofu --ca $TMP/upddata/state/ca.crt --record $TMP/upddata/state/image.digest"
+contains "update pulls from main with the pinned CA and records the digest" "$log" "pull-image --main main.example --image nsu-llm-node:0.2.1-cpu --digest $NEW_DIGEST --no-tofu --ca $TMP/upddata/state/ca.crt --record $TMP/upddata/state/image.digest"
 [ "$(before "$log" "pull-image")" -lt "$(before "$log" "docker rm -f llm-node")" ] && [ "$(before "$log" "docker rm -f llm-node")" -lt "$(before "$log" "docker run")" ] \
   && pass "update: pull, then remove, then run" || fail "update: pull, then remove, then run"
 run="$(grep 'docker run' "$TMP/upd.log")"
 for want in "--hostname pc01" "--restart unless-stopped" "--network host" "-e MODE=k3s" "-e MAIN_HOST=main.example" "-e NODE_NAME=pc01" "-e NODE_IP=10.1.2.3" "-e ACCEL=cpu" \
-    "-e NODE_IMAGE=nsu-llm-node:0.2.0-cpu" "-e NODE_IMAGE_DIGEST=$NEW_DIGEST" "-v $TMP/upddata/state:/var/lib/llm-node" "[CLUSTER_TOKEN=clustersecret42]"; do
+    "-e NODE_IMAGE=nsu-llm-node:0.2.1-cpu" "-e NODE_IMAGE_DIGEST=$NEW_DIGEST" "-v $TMP/upddata/state:/var/lib/llm-node" "[CLUSTER_TOKEN=clustersecret42]"; do
   contains "update re-creates the container with the same parameter: $want" "$run" "$want"
 done
 lacks "update: the token is not on the docker command line" "${run%\[CLUSTER_TOKEN*}" "clustersecret42"
-contains "update: the new image id is saved for the k3s agent" "$log" "docker save --platform linux/amd64 nsu-llm-node:0.2.0-cpu -o $TMP/upddata/airgap/node.tar"
+contains "update: the new image id is saved for the k3s agent" "$log" "docker save --platform linux/amd64 nsu-llm-node:0.2.1-cpu -o $TMP/upddata/airgap/node.tar"
 contains "update says what happened" "$out" "Нода pc01 запущена"
 
 # a record that belongs to another image id is not handed to the container (an archive loaded over the tag)
@@ -1530,7 +1551,7 @@ if [ $rc -ne 0 ]; then pass "update: a failed pull fails"; else fail "update: a 
 lacks "update: a failed pull leaves the container alone" "$(updlog)" "docker rm"
 contains "update: a failed pull is reported to main" "$(updlog)" "-X POST"
 contains "update: the report goes to the image endpoint" "$(updlog)" "/api/nodes/pc01/image"
-contains "update: the reason is in Russian and says the container was not touched" "$(updlog)" 'update_error":"образ nsu-llm-node:0.2.0-cpu не удалось скачать с главного'
+contains "update: the reason is in Russian and says the container was not touched" "$(updlog)" 'update_error":"образ nsu-llm-node:0.2.1-cpu не удалось скачать с главного'
 
 out="$(upd FAKE_RUN_FAIL=1)"; rc=$?
 if [ $rc -ne 0 ]; then pass "update: a failed docker run fails"; else fail "update: a failed docker run fails"; fi
@@ -1546,7 +1567,7 @@ out="$(upd)"; rc=$?
 if [ $rc -ne 0 ]; then pass "update refuses an image name that is not ours"; else fail "update refuses an image name that is not ours"; fi
 contains "update names the bad image" "$out" "недопустимый образ"
 lacks "update: a foreign image is not pulled" "$(updlog)" "pull-image"
-printf 'go=1\nimage=nsu-llm-node:0.2.0-cpu\ndigest=sha256:short\n' > "$TMP/upd.plan"
+printf 'go=1\nimage=nsu-llm-node:0.2.1-cpu\ndigest=sha256:short\n' > "$TMP/upd.plan"
 out="$(upd)"; rc=$?
 if [ $rc -ne 0 ]; then pass "update refuses a malformed digest"; else fail "update refuses a malformed digest"; fi
 contains "update names the bad digest" "$out" "недопустимый digest"
@@ -1562,7 +1583,7 @@ UPD_ARGS="--dry-run"
 out="$(upd)"; rc=$?
 UPD_ARGS=""
 if [ $rc -eq 0 ]; then pass "update --dry-run exits 0"; else fail "update --dry-run exits 0 (rc=$rc)"; echo "$out"; fi
-contains "update --dry-run prints the pull" "$out" "pull-image.sh --main main.example --image nsu-llm-node:0.2.0-cpu"
+contains "update --dry-run prints the pull" "$out" "pull-image.sh --main main.example --image nsu-llm-node:0.2.1-cpu"
 contains "update --dry-run prints docker run" "$out" "docker run -d --name llm-node"
 lacks "update --dry-run pulls nothing" "$(updlog)" "pull-image"
 lacks "update --dry-run removes nothing" "$(updlog)" "docker rm"
@@ -1597,13 +1618,13 @@ contains "--image wins" "$(runline)" " nsu-llm-node:custom"
 lacks "--image wins: main is not asked which image to run" "$(cat "$TMP/upd.log")" "docker image inspect nsu-llm-node:0.1.1"
 IMG_ARGS="--accel cpu"
 out="$(imgrun FAKE_CURL_FAIL=1)"
-contains "main does not answer: the version of the script" "$(runline)" " nsu-llm-node:0.2.0-cpu"
+contains "main does not answer: the version of the script" "$(runline)" " nsu-llm-node:0.2.1-cpu"
 printf 'name=evil:1\n' > "$TMP/upd.plan"
 out="$(imgrun)"
-contains "a name that is not ours is ignored: the version of the script" "$(runline)" " nsu-llm-node:0.2.0-cpu"
+contains "a name that is not ours is ignored: the version of the script" "$(runline)" " nsu-llm-node:0.2.1-cpu"
 printf 'name=nsu-llm-node:0.1.1-cpu\n' > "$TMP/upd.plan"
 out="$(env PATH="$TMP/updbin:$PATH" DOCKER_LOG="$TMP/upd.log" FAKE_PLAN="$TMP/upd.plan" bash "$UN/run-node.sh" --dry-run --main main.example --token T --mode standalone --accel cpu --node-ip 10.1.2.3 --name pc01 2>&1)"
-contains "--dry-run asks nobody and uses the version of the script" "$out" " nsu-llm-node:0.2.0-cpu"
+contains "--dry-run asks nobody and uses the version of the script" "$out" " nsu-llm-node:0.2.1-cpu"
 
 out="$(bash "$RN" --dry-run --main 192.168.3.21 --node-ip 1.2.3.4 2>&1)"; rc=$?
 [ $rc -ne 0 ] && pass "missing token fails" || fail "missing token fails"
@@ -1681,6 +1702,15 @@ if [ $rc -eq 0 ]; then pass "token-file: the node starts"; else fail "token-file
 contains "token-file: the token reaches docker through the environment" "$(grep '^docker run' "$TMP/upd.log")" "[CLUSTER_TOKEN=filetoken77]"
 lacks "token-file: no argv warning" "$out" "виден всем локальным пользователям"
 lacks "token-file: the token is not on the curl command line" "$(grep '^curl' "$TMP/upd.log")" "filetoken77"
+# task B2: before the container starts run-node says what main knows about the name; no answer or an older main: silence, it goes on
+KNOWN_MSG='Имя «pc01» уже есть на главном, а ключа этой ноды на ПК нет.'
+out="$(FAKE_KNOWN="{\"known\":true,\"message\":\"$KNOWN_MSG\"}" imgrun_tok bash "$UN/run-node.sh" --main main.example --token-file "$TMP/tokfile" --accel cpu --mode standalone --node-ip 10.1.2.3 --name pc01 --data-dir "$TMP/imgdata" --accept-ca --no-firewall)"; rc=$?
+contains "run-node prints what main says about the name" "$out" "$KNOWN_MSG"
+[ "$rc" = 0 ] && pass "run-node goes on after the name check" || fail "run-node goes on after the name check (rc=$rc)"
+contains "the name check asks main with the token in a header file" "$(cat "$TMP/upd.log.hdr")" "Authorization: Bearer filetoken77"
+out="$(FAKE_KNOWN='{"detail":"Not Found"}' FAKE_KNOWN_CODE=404 imgrun_tok bash "$UN/run-node.sh" --main main.example --token-file "$TMP/tokfile" --accel cpu --mode standalone --node-ip 10.1.2.3 --name pc01 --data-dir "$TMP/imgdata" --accept-ca --no-firewall)"; rc=$?
+[ "$rc" = 0 ] && pass "an older main: the node starts all the same" || fail "an older main: the node starts all the same (rc=$rc)"
+lacks "an older main: nothing is printed" "$out" "Not Found"
 out="$(printf 'stdintok88\n' | imgrun_tok bash "$UN/run-node.sh" --main main.example --token-stdin --accel cpu --mode standalone --node-ip 10.1.2.3 --name pc01 --data-dir "$TMP/imgdata" --accept-ca --no-firewall)"
 contains "token from stdin" "$(grep '^docker run' "$TMP/upd.log")" "[CLUSTER_TOKEN=stdintok88]"
 out="$(CLUSTER_TOKEN=envtok99 imgrun_tok bash "$UN/run-node.sh" --main main.example --accel cpu --mode standalone --node-ip 10.1.2.3 --name pc01 --data-dir "$TMP/imgdata" --accept-ca --no-firewall)"
@@ -1825,9 +1855,9 @@ contains "uninstall takes the RPC chain away" "$(ipt)" "iptables -w -X NSU-LLM-R
 contains "uninstall takes the inference chain away" "$(ipt)" "iptables -w -X NSU-LLM-INFER"
 contains "uninstall takes the owner rule away" "$(ipt)" "-D OUTPUT -p tcp --dport 18050 -m owner ! --uid-owner 0 -j REJECT"
 # the update pulls by the digest main named
-printf 'go=1\nimage=nsu-llm-node:0.2.0-cpu\ndigest=%s\nmode=requested\nwhen=now\nreason=\nrpc_peers=10.1.2.7\n' "$NEW_DIGEST" > "$TMP/upd.plan"
+printf 'go=1\nimage=nsu-llm-node:0.2.1-cpu\ndigest=%s\nmode=requested\nwhen=now\nreason=\nrpc_peers=10.1.2.7\n' "$NEW_DIGEST" > "$TMP/upd.plan"
 out="$(UPD_ARGS=--no-firewall fwupd)"
-contains "update pulls by the digest main named" "$(updlog)" "--image nsu-llm-node:0.2.0-cpu --digest $NEW_DIGEST"
+contains "update pulls by the digest main named" "$(updlog)" "--image nsu-llm-node:0.2.1-cpu --digest $NEW_DIGEST"
 
 # --- CA of main by the join token K10<sha256 of the CA of k3s>::... (fetch-main-ca.sh of main checks the signed /ca.crt) ----------------------
 if [ -n "${CA_FP:-}" ]; then
@@ -1938,7 +1968,7 @@ planp "10.1.2.9"
 out="$(UPD_ARGS=--sync-firewall fwupd)"; rc=$?
 contains "--sync-firewall puts the group of main into the rules" "$(ipt)" "restore: -A NSU-LLM-RPC -s 10.1.2.9 -j RETURN"
 lacks "--sync-firewall never pulls or replaces the container" "$(updlog)" "pull-image"
-printf 'go=1\nimage=nsu-llm-node:0.2.0-cpu\ndigest=%s\nmode=requested\nwhen=now\nreason=\nrpc_peers=10.1.2.9\n' "$NEW_DIGEST" > "$TMP/upd.plan"
+printf 'go=1\nimage=nsu-llm-node:0.2.1-cpu\ndigest=%s\nmode=requested\nwhen=now\nreason=\nrpc_peers=10.1.2.9\n' "$NEW_DIGEST" > "$TMP/upd.plan"
 out="$(UPD_ARGS=--sync-firewall fwupd)"
 lacks "--sync-firewall ignores 'go': no pull even when an update is due" "$(updlog)" "pull-image"
 # uninstall takes the units away
@@ -1948,7 +1978,7 @@ out="$(env PATH="$TMP/updbin:$PATH" NSU_LLM_SYSTEMD_DIR="$TMP/sysd" SYSTEMCTL_LO
 [ ! -e "$TMP/sysd/nsu-llm-node-firewall.service" ] && [ ! -e "$TMP/sysd/nsu-llm-node-sync.timer" ] && pass "uninstall removes the systemd units" || fail "uninstall removes the systemd units"
 # registry trust: no pinned root and the system roots reject the certificate: pull-image.sh must not be called (it would take /ca.crt with -k)
 rm -f "$TMP/upddata/state/ca.crt"
-printf 'go=1\nimage=nsu-llm-node:0.2.0-cpu\ndigest=%s\nmode=requested\nwhen=now\nreason=\n' "$NEW_DIGEST" > "$TMP/upd.plan"
+printf 'go=1\nimage=nsu-llm-node:0.2.1-cpu\ndigest=%s\nmode=requested\nwhen=now\nreason=\n' "$NEW_DIGEST" > "$TMP/upd.plan"
 out="$(UPD_ARGS=--no-firewall upd FAKE_V2_CODE=000)"; rc=$?
 [ $rc -ne 0 ] && pass "update without a pinned root, system roots reject main: refused" || fail "update without a pinned root, system roots reject main"
 lacks "...and pull-image.sh is never called (no silent TOFU)" "$(updlog)" "pull-image"
@@ -2111,8 +2141,8 @@ EOS2
   [ $rc -ne 0 ] && pass "ps1 -DockerUserSid with junk fails" || fail "ps1 -DockerUserSid with junk fails"
   # -SyncFirewall: main names the group, the rules follow it
   mkdir -p "$TMP/syncbin"
-  printf '@echo off\r\necho {"name":"nsu-llm-node:0.2.0-cpu","rpc_peers":["10.1.1.7","evil","10.1.1.8","10.1.1.7"]}\r\necho 200\r\n' > "$TMP/syncbin/curl-peers.bat"
-  printf '@echo off\r\necho {"name":"nsu-llm-node:0.2.0-cpu"}\r\necho 200\r\n' > "$TMP/syncbin/curl-nopeers.bat"
+  printf '@echo off\r\necho {"name":"nsu-llm-node:0.2.1-cpu","rpc_peers":["10.1.1.7","evil","10.1.1.8","10.1.1.7"]}\r\necho 200\r\n' > "$TMP/syncbin/curl-peers.bat"
+  printf '@echo off\r\necho {"name":"nsu-llm-node:0.2.1-cpu"}\r\necho 200\r\n' > "$TMP/syncbin/curl-nopeers.bat"
   printf '@echo off\r\nexit /b 7\r\n' > "$TMP/syncbin/curl-down.bat"
   syncps() { NSU_LLM_CURL="$(cygpath -w "$TMP/syncbin/$1")" "$PS" -NoProfile -ExecutionPolicy Bypass -File "$RNW" -SyncFirewall -DryRun -Main 10.9.0.5 -Name pc01 -Token T -Mode k3s 2>&1 < /dev/null; }
   out="$(syncps curl-peers.bat)"

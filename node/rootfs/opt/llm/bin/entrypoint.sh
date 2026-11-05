@@ -9,6 +9,29 @@ if [ $# -gt 0 ]; then
   exec "$@"
 fi
 
+# supervise CMD...: runs CMD again whenever it ends, with a backoff (SUPERVISE_DELAY_S, 5 s, doubling to 300 s; back to the
+# start after a run of 10 min or more), and says in the container log how it ended. The background helpers of the k3s mode
+# are never silently gone (task B1: a node whose registrar had ended never got its key). SUPERVISE_RESTARTS limits the
+# restarts (tests; unset: no limit).
+supervise() {
+  set +e  # runs in a subshell of its own: a failing CMD is the case it handles
+  local first="${SUPERVISE_DELAY_S:-5}" delay rc started n=0
+  delay="$first"
+  while :; do
+    started=$SECONDS
+    "$@"; rc=$?
+    if [ -n "${SUPERVISE_RESTARTS:-}" ] && [ "$n" -ge "$SUPERVISE_RESTARTS" ]; then
+      echo "$(date -u +%FT%TZ) entrypoint: $(basename "$1") ${*:2} ended (exit code $rc), not started again (SUPERVISE_RESTARTS=$SUPERVISE_RESTARTS)" >&2
+      return "$rc"
+    fi
+    n=$((n + 1))
+    [ $((SECONDS - started)) -lt 600 ] || delay="$first"
+    echo "$(date -u +%FT%TZ) entrypoint: $(basename "$1") ${*:2} ended (exit code $rc), starting it again in ${delay}s" >&2
+    sleep "$delay"
+    delay=$((delay * 2)); [ "$delay" -le 300 ] || delay=300
+  done
+}
+
 MODE="${MODE:-k3s}"
 NODE_NAME="${NODE_NAME:-$(hostname)}"
 NODE_NAME="${NODE_NAME,,}"
@@ -65,11 +88,12 @@ case "$MODE" in
     # What the portal learns from this container in the background, until it takes it: the image it runs (version, revision, digest;
     # «Версии» of the admin pages and the update from the panel) and the NIC run-node passed (WOL_MAC, WOL_IP, WOL_PREFIX) for
     # Wake-on-LAN. The token reaches the registrar through its environment, never argv.
-    CLUSTER_TOKEN="$K3S_TOKEN" registrar.sh --report &
+    # It enrols first (the node's own key, $STATE_DIR/node.key) and keeps the key valid; supervised: restarted if it ends.
+    ( export CLUSTER_TOKEN="$K3S_TOKEN"; supervise registrar.sh --report ) &
     # The size of the models volume goes to the portal every few minutes (the «Ноды» page, the cleanup of task 2-26);
     # MODELS_REPORT_S=0 switches it off.
     if [ "${MODELS_REPORT_S:-300}" != 0 ]; then
-      CLUSTER_TOKEN="$K3S_TOKEN" registrar.sh --models-report &
+      ( export CLUSTER_TOKEN="$K3S_TOKEN"; supervise registrar.sh --models-report ) &
     fi
     # Pod images come from the registry of main first (https://$MAIN_HOST/v2/, read-only, the campus LAN) and only then from
     # the internet: k3s appends the original registry to the endpoint list of a mirror. Pods ask for the bare name
@@ -103,8 +127,11 @@ REGISTRIES
     # monitoring: the load of the node (GPU, VRAM, RAM, CPU, model disk, llama/rpc up) goes to the portal every 20 s;
     # NODE_METRICS=0 switches it off. The token reaches the collector through its environment, never argv.
     if [ "${NODE_METRICS:-1}" != 0 ]; then
-      CLUSTER_TOKEN="$K3S_TOKEN" node-metrics.sh &
+      ( export CLUSTER_TOKEN="$K3S_TOKEN"; supervise node-metrics.sh ) &
     fi
+    # The images of older versions leave the containerd of this k3s a few minutes after the start (16 GB limit of a class PC);
+    # nothing a container of containerd uses is removed. PRUNE_IMAGES=0 switches it off.
+    [ "${PRUNE_IMAGES:-1}" = 0 ] || prune-node-images.sh &
     # k3s must stay PID 1: it evacuates the root cgroup (cgroup v2) only as PID 1.
     exec k3s "${args[@]}"
     ;;

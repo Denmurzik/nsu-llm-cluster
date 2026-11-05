@@ -366,6 +366,39 @@ async def test_a_gpu_node_fits_a_replica_by_what_its_vram_holds(client, app):
     assert {n["name"]: n["fits"] for n in r.json()["nodes"]} == {"g1": False, "c1": False}
 
 
+async def test_the_wizard_accepts_one_group_of_15_class_pcs_for_gpt_oss_120b_with_the_leader_on_main(client, app, settings, monkeypatch):
+    """The plan of the class: the estimate of the wizard fits every PC and shows no leader among them, the deployment is
+    accepted with group size 15."""
+    from app.catalog.gguf import GgufLayout
+
+    monkeypatch.setattr(settings, "split_leader_on_main", True)
+    h = await as_admin(client, app)
+    monkeypatch.setitem(app.state.hf.files, BIG_REPO, [HfFile(BIG_FILE, 63387346208)])
+    monkeypatch.setitem(app.state.hf.metas, (BIG_REPO, BIG_FILE), GgufMeta("gpt-oss", 36, 64, 8, 64, 2880, 131072, 64))
+    app.state.hf.layouts[(BIG_REPO, BIG_FILE)] = GgufLayout([1726212608] * 36, 615340800, 615329280, 615329280, 201088)
+    names = [f"pc{i:02d}" for i in range(1, 16)]
+    for n in names:
+        app.state.k8s.add_node(n, accel="nvidia", vram_mib=8188, mem_mib=8192, ram_mib=8192)
+    params = {"repo": BIG_REPO, "file": BIG_FILE, "ctx_per_request": 8192, "parallel": 1, "group_size": 15,
+              "nodes": ",".join(names), "mode": "split"}
+    r = await client.get("/api/admin/hf/estimate", params=params)
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert all(n["fits"] for n in data["nodes"]) and len(data["nodes"]) == 15
+    plan = data["placement"]
+    assert plan["fits"] is True and plan["speed_warning"] is False and plan["ram_bytes"] == 0
+    assert len(plan["nodes"]) == 15 and not any(n["leader"] for n in plan["nodes"])
+    assert sum(plan["tensor_split"]) == 37
+
+    r = await client.post(
+        "/api/admin/deployments",
+        json={"name": "gpt-oss-120b", "repo": BIG_REPO, "file": BIG_FILE, "mode": "split", "group_size": 15, "accel": "nvidia",
+              "ctx_per_request": 8192, "parallel": 1, "use_node_ram": True, "nodes": names},
+        headers=h,
+    )
+    assert r.status_code in (200, 201), r.text
+
+
 async def test_split_estimate_places_layers_over_vram_and_ram_of_the_first_group(client, app):
     from app.catalog.gguf import GgufLayout
 

@@ -64,6 +64,7 @@ export function DeleteNote({ nodes, held }: { nodes: NodeInfo[]; held: BusyDeplo
 export function deleteResultText(r: NodeDeleteResult): string {
   const parts = ["Удалена из кластера"];
   if (r.k8s === "unavailable") parts.push("объект Kubernetes не удалён: кластер не ответил, повторите позже");
+  if (r.k3s_password === "left") parts.push("пароль k3s не удалён: при подтверждении новой ноды с этим именем портал удалит его сам");
   if (r.online) parts.push("ПК в сети: удалите ноду и на нём (install-node.ps1 -Uninstall или run-node.sh --uninstall)");
   return parts.join("; ");
 }
@@ -208,6 +209,13 @@ export function NodeDeletedDialog({ result, onClose }: { result: NodeDeleteResul
       {result.k8s === "unavailable" && (
         <p className="error-text" role="alert">
           Объект ноды в Kubernetes не удалён: кластер не ответил. Повторите удаление, когда он вернётся.
+        </p>
+      )}
+      {result.k3s_password === "left" && (
+        <p className="error-text" role="alert">
+          Пароль ноды k3s не удалён: кластер не ответил. Пока он есть, k3s не примет ПК, переустановленный под этим именем. Портал
+          удалит его сам, когда вы подтвердите новую ноду с этим именем. Вручную, на главном:{" "}
+          <span className="mono">docker exec llm-main k3s kubectl -n kube-system delete secret {result.node}.node-password.k3s</span>
         </p>
       )}
       {result.unassigned.length > 0 && <p>Снята с развёртываний: {result.unassigned.join(", ")}.</p>}

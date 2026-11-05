@@ -23,6 +23,11 @@
 # Перед любой записью каталог раздачи на ПК закрывается (node\secure-dir.ps1: владелец Administrators, Users только чтение):
 # права C:\ProgramData по умолчанию позволяют любому пользователю заранее создать его и подменить скрипты.
 #
+# Место на системном диске ПК: install и update пропускают ПК, где свободно меньше -MinFreeGB (по умолчанию 14 ГБ; для установленной
+# ноды при update порог не применяется, считается только место под образ), таблица итогов показывает свободное место на C: каждого ПК и
+# отмечает ПК с местом меньше -WarnFreeGB (по умолчанию 18 ГБ); -MinFreeGB и -WarnFreeGB уходят на ПК в install-node.ps1.
+# Колонка «NSU-LLM» показывает, сколько места занимает сама нода (C:\ProgramData\NSU-LLM и раздача); больше 16 ГБ отмечается и перечисляется.
+#
 # Файлы рядом с инвентарём (в git не попадают): class-nodes.csv (name,address,mode,accel,docker), class-answers.json (главный, токен
 # агента под DPAPI, AllowFrom, образы), class-deploy-logs\<время>\<имя>.log. Подробности: docs\deploy-class.md, «Массовая установка».
 [CmdletBinding()]
@@ -41,6 +46,8 @@ param(
     [ValidateSet('auto', 'smb', 'winrm', 'none')][string]$CopyMode = 'auto',
     [int]$Throttle = 0,
     [double]$TimeoutMin = 90,
+    [int]$MinFreeGB = 14,
+    [int]$WarnFreeGB = 18,
     [string[]]$Only = @(),
     [string]$LogDir = '',
     [string]$ScriptsFrom = '',
@@ -57,6 +64,7 @@ param(
     [switch]$DryRun
 )
 $ErrorActionPreference = 'Stop'
+$FreeGBGiven = @{ Min = $PSBoundParameters.ContainsKey('MinFreeGB'); Warn = $PSBoundParameters.ContainsKey('WarnFreeGB') }   # $PSBoundParameters внутри функций — свои
 try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch { }
 # Windows PowerShell 5.1, запущенный из pwsh 7, наследует его PSModulePath, и модули 7.x (Microsoft.PowerShell.Security, WSMan,
 # CimCmdlets) в нём не грузятся. Пути pwsh 7 убираются, свой каталог модулей — на месте.
@@ -69,6 +77,7 @@ if ($PSVersionTable.PSEdition -ne 'Core') {
 $NodeDir = $(if ($ScriptsFrom) { $ScriptsFrom } else { $PSScriptRoot })   # откуда раздаются install-node.ps1 и соседи
 $NodeFiles = @('install-node.ps1', 'run-node.ps1', 'node-boot.ps1', 'wsl-setup.sh', 'pull-image.sh', 'IMAGE_VERSION')   # то, что install-node.ps1 берёт рядом с собой
 $HelperFiles = @('secure-dir.ps1', 'class-run.ps1')   # общие помощники: из -ScriptsFrom, иначе рядом с этим скриптом
+$FootprintLimitGB = 16                             # вся нода на ПК класса укладывается в 16 ГБ диска
 $Modes = @('k3s', 'standalone')
 $Accels = @('auto', 'cpu', 'nvidia')
 $Dockers = @('wsl', 'desktop')                     # wsl: Docker CE в WSL с автозапуском без входа (и при уже стоящем Docker Desktop)
@@ -436,9 +445,26 @@ $BlockProbe = {
     }
     catch { }
     $free = 0.0
-    try { $free = [math]::Round((Get-PSDrive -Name C -PSProvider FileSystem).Free / 1GB, 1) } catch { }
+    try { $sd = $(if ($env:SystemDrive) { $env:SystemDrive.TrimEnd(':') } else { 'C' }); $free = [math]::Round((Get-PSDrive -Name $sd -PSProvider FileSystem).Free / 1GB, 1) } catch { }
     $adm = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-    [pscustomobject]@{ Kind = 'probe'; ImageMark = $mark; Computer = $env:COMPUTERNAME; IsAdmin = $adm; HasGpu = $gpu; Driver = $drv; DriverMajor = $major; FreeGB = $free; StageFiles = $files
+    # Сколько места занимает сама нода: каталог установки (диск дистрибутива ext4.vhdx, скрипты) и раздача (архив образа).
+    $fp = 0.0
+    try {
+        foreach ($d in @((Join-Path $env:ProgramData 'NSU-LLM'), $p.StageDir)) {
+            if (Test-Path -LiteralPath $d) { foreach ($f in @(Get-ChildItem -LiteralPath $d -Recurse -File -Force -ErrorAction SilentlyContinue)) {
+                # место на диске, а не длина: длина разреженного ext4.vhdx не уменьшается после удаления модели
+                $sz = [double]$f.Length
+                try {
+                    if (-not ('NsuLlm.DiskSize' -as [type])) { Add-Type -Namespace NsuLlm -Name DiskSize -MemberDefinition '[DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] public static extern uint GetCompressedFileSizeW(string name, out uint high);' }
+                    $hi = [uint32]0; $lo = [NsuLlm.DiskSize]::GetCompressedFileSizeW($f.FullName, [ref]$hi)
+                    if ($lo -ne [uint32]::MaxValue) { $sz = [double]$hi * 4294967296 + $lo }
+                } catch { }
+                $fp += $sz
+            } }
+        }
+        $fp = [math]::Round($fp / 1GB, 1)
+    } catch { }
+    [pscustomobject]@{ Kind = 'probe'; ImageMark = $mark; Computer = $env:COMPUTERNAME; IsAdmin = $adm; HasGpu = $gpu; Driver = $drv; DriverMajor = $major; FreeGB = $free; FootprintGB = $fp; StageFiles = $files
         Installed = (Test-Path -LiteralPath (Join-Path $env:ProgramData 'NSU-LLM\install.json')); Build = [Environment]::OSVersion.Version.Build }
 }
 # Запуск install-node.ps1 на ПК. Вывод идёт в run.log раздачи и по строкам ({Kind=line}) обратно, чтобы ход был виден сразу.
@@ -593,6 +619,17 @@ $BlockRun = {
     if ($attach) { }   # шёл прошлый запуск, с какими образами — неизвестно: метка не меняется (нет образа — установщик попросит архив, и метка снимется)
     elseif ($code -eq 0 -and $p.ImageMark) { [IO.File]::WriteAllText($mark, [string]$p.ImageMark, $enc) }
     elseif ($code -ne 0 -and -not $a.ContainsKey('ImageTar') -and $out -match 'укажите -ImageTar') { Remove-Item -LiteralPath $mark -Force -ErrorAction SilentlyContinue }
+    # Раздача после ошибки: архив образа остаётся, чтобы повтор не копировал его заново, но на почти полном диске (меньше -MinFreeGB) он
+    # удаляется: копия в несколько ГБ в каталоге раздачи не должна добить системный диск.
+    if ($code -ne 0 -and $p.Cleanup -eq 'stage' -and $p.MinFreeGB -gt 0) {
+        $left = $null
+        try { $sd = $(if ($env:SystemDrive) { $env:SystemDrive.TrimEnd(':') } else { 'C' }); $left = (Get-PSDrive -Name $sd -PSProvider FileSystem).Free / 1GB } catch { }
+        if ($null -ne $left -and $left -lt $p.MinFreeGB) {
+            Get-ChildItem -LiteralPath $p.StageDir -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -like 'nsu-llm-node-*.tar*' } | Remove-Item -Force -ErrorAction SilentlyContinue
+            $extra2 = "На диске осталось $([math]::Round($left, 1)) ГБ: архив образа удалён из $($p.StageDir), чтобы не заполнять диск; повторный запуск скопирует его заново, когда место появится."
+            [IO.File]::AppendAllText($log, $extra2 + "`r`n", $enc); $out = $out + "`r`n" + $extra2
+        }
+    }
     # Раздача после успеха: uninstall — всё; install/update — всё, кроме run.log и метки образа (архив остаётся только с -KeepStage).
     if ($code -eq 0 -and $p.Cleanup -eq 'all') { Remove-Item -LiteralPath $p.StageDir -Recurse -Force -ErrorAction SilentlyContinue }
     elseif ($code -eq 0 -and $p.Cleanup -in @('stage', 'keep-image')) {
@@ -786,6 +823,9 @@ function Get-RunArgs([string]$act, $answers, $node, [pscredential]$cred) {
             if ($answers.ImageSource -eq 'main') { $a.ImageSource = 'main' }
             elseif (-not $tar -and $answers.ImageSource -ne 'tar') { $a.ImageSource = 'main' }   # без архива: образ с главного, не архив, найденный рядом с установщиком на ПК
             if ($answers.InsecureTls) { $a.InsecureTls = $true }
+            if ($a.Contains('ImageTar') -and -not $KeepStage) { $a.DeleteImageTar = $true }   # архив раздачи удаляется сразу после docker load, не в конце запуска
+            if ($FreeGBGiven.Min) { $a.MinFreeGB = $MinFreeGB }
+            if ($FreeGBGiven.Warn) { $a.WarnFreeGB = $WarnFreeGB }
         }
         'uninstall' {
             $a.Uninstall = $true; $a.NonInteractive = $true; $a.Yes = $true; $a.Name = $node.Name
@@ -835,20 +875,51 @@ function Set-RunResult($node, [string]$act, $res, [string]$err) {
         $node.Detail += " GPU не виден в WSL: поставьте accel=cpu для $($node.Name) в $Inventory и повторите: .\class-deploy.ps1 -Action $act -Only $($node.Name)"
     }
 }
+# Свободное место на C: в таблице итогов: '!! 12.3 ГБ' меньше -MinFreeGB, '! 40.1 ГБ' меньше -WarnFreeGB, пусто — ПК не опрашивался.
+function Format-FreeGB($node) {
+    $f = Get-Prop $node.Info 'FreeGB'
+    if ($null -eq $f) { return '' }
+    $mark = $(if ($MinFreeGB -gt 0 -and $f -lt $MinFreeGB) { '!! ' } elseif ($MinFreeGB -gt 0 -and $WarnFreeGB -gt 0 -and $f -lt $WarnFreeGB) { '! ' } else { '' })
+    return "$mark$f ГБ"
+}
+# Свободное место после установки меньше, чем до неё: итоговая таблица должна показывать то, что осталось.
+# Размер самой ноды на диске ПК: '!! 21.4 ГБ' больше лимита 16 ГБ, пусто — ноды ещё нет или ПК не опрашивался.
+function Format-FootprintGB($node) {
+    $f = Get-Prop $node.Info 'FootprintGB'
+    if ($null -eq $f -or $f -le 0) { return '' }
+    return "$(if ($f -gt $FootprintLimitGB) { '!! ' } else { '' })$f ГБ"
+}
+function Update-FreeGB($nodes) {
+    $live = @($nodes | Where-Object { $_.Session })
+    if ($live.Count -eq 0) { return }
+    Invoke-OnNodes $live $BlockProbe { param($n) @{ Op = 'probe'; StageDir = $StageDir } } $Throttle {
+        param($n, $res, $err)
+        if ($res -and $n.Info) {
+            $n.Info | Add-Member -NotePropertyName FreeGB -NotePropertyValue $res.FreeGB -Force
+            $n.Info | Add-Member -NotePropertyName FootprintGB -NotePropertyValue (Get-Prop $res 'FootprintGB') -Force
+        }
+    }
+}
 function Show-Table($nodes) {
     Say ''
     $rows = $nodes | ForEach-Object {
-        [pscustomobject]@{ 'Имя' = $_.Name; 'Адрес' = $_.Address; 'Режим' = $_.Mode; 'Ускоритель' = $_.Accel; 'Результат' = $_.Status
+        [pscustomobject]@{ 'Имя' = $_.Name; 'Адрес' = $_.Address; 'Режим' = $_.Mode; 'Ускоритель' = $_.Accel; 'Результат' = $_.Status; 'Диск C:' = (Format-FreeGB $_); 'NSU-LLM' = (Format-FootprintGB $_)
             'Время' = $(if ($_.Seconds) { '{0}:{1:D2}' -f [int][math]::Floor($_.Seconds / 60), [int]($_.Seconds % 60) } else { '' }); 'Подробности' = (Hide-Secrets $_.Detail) }
     }
     $text = ($rows | Format-Table -AutoSize -Wrap | Out-String -Width 200).TrimEnd()
     Say $text
     $groups = $nodes | Group-Object Status | ForEach-Object { "$($_.Name): $($_.Count)" }
+    $lowDisk = @($nodes | Where-Object { $f = Get-Prop $_.Info 'FreeGB'; $null -ne $f -and $MinFreeGB -gt 0 -and $WarnFreeGB -gt 0 -and $f -lt $WarnFreeGB } |
+            ForEach-Object { "$($_.Name) ($(Get-Prop $_.Info 'FreeGB') ГБ)" })
+    $bigFp = @($nodes | Where-Object { $f = Get-Prop $_.Info 'FootprintGB'; $null -ne $f -and $f -gt $FootprintLimitGB } | ForEach-Object { "$($_.Name) ($(Get-Prop $_.Info 'FootprintGB') ГБ)" })
+    $lowLine = $(if ($lowDisk.Count) { "Мало места на C: ($($lowDisk.Count) ПК, порог ошибки $MinFreeGB ГБ, рекомендуется $WarnFreeGB ГБ): $($lowDisk -join ', '). С заполненным диском WSL отвечает ошибками ввода-вывода и нода останавливается: освободите место (Параметры, Система, Память, «Временные файлы»)." } else { '' })
     Say ''
+    if ($bigFp.Count) { $lowLine = $(if ($lowLine) { "$lowLine`r`n" } else { '' }) + "Нода занимает больше $FootprintLimitGB ГБ диска ($($bigFp.Count) ПК): $($bigFp -join ', '). Лимит для ПК класса: освободите место (удалите ненужные модели кнопкой очистки на странице «Ноды», образы прежних версий, остатки установки)." }
+    if ($lowLine) { Warn $lowLine }
     Say ('Итого: ' + ($groups -join ', '))
     if (-not $DryRun -and $LogDir -and (Test-Path -LiteralPath $LogDir)) {
         Say "Журналы по ПК: $LogDir"
-        Set-Content -Encoding UTF8 -Path (Join-Path $LogDir 'summary.txt') -Value ($text + "`r`n`r`nИтого: " + ($groups -join ', '))
+        Set-Content -Encoding UTF8 -Path (Join-Path $LogDir 'summary.txt') -Value ($text + $(if ($lowLine) { "`r`n`r`n$lowLine" } else { '' }) + "`r`n`r`nИтого: " + ($groups -join ', '))
     }
 }
 
@@ -985,10 +1056,16 @@ function Invoke-Main {
             if ($tar) {
                 $len = (Get-Item -LiteralPath $tar).Length
                 $staged = $(if ((Get-MissingImageBytes $answers $n) -eq 0) { $len } else { 0 })   # уже лежит на ПК и занимает место
-                $need = $(if ($n.ImageLoaded) { 15 } else { [math]::Round(($len * 2 - $staged) / 1GB + 15, 1) })
+                # Архив удаляется сразу после docker load, Docker хранит только распакованные слои (классическое хранилище): пик = архив + слои + дистрибутив, около 8 ГБ сверх архива.
+                $need = $(if ($n.ImageLoaded) { 8 } else { [math]::Round(($len - $staged) / 1GB + 8, 1) })
             }
-            else { $need = 20 }   # образ скачивается с главного: до ~6 ГБ в Docker внутри WSL и запас
-            if ($n.Info.FreeGB -lt $need) { $n.Status = 'ПРОПУЩЕН'; $n.Detail = "на C: свободно $($n.Info.FreeGB) ГБ, нужно около $need ГБ (образ, его копия в WSL, дистрибутив)"; $n.Session = $null; continue }
+            else { $need = 12 }   # образ скачивается с главного: слои в Docker внутри WSL, дистрибутив и запас (пик установки 11-12 ГБ)
+            # Порог -MinFreeGB: диск не должен заполниться из-за ноды (WSL с полным диском даёт ошибки ввода-вывода). Нода уже стоит и обновляется:
+            # порог не применяется, хватит места под образ.
+            # Как Test-InstallDisk на ПК: нужен новый образ (архив надо загрузить или скачать) — это установка, порог действует; не применяется, только если нода
+            # стоит и образ уже загружен.
+            if (-not ($act -eq 'update' -and $n.Info.Installed -and $n.ImageLoaded) -and $MinFreeGB -gt $need) { $need = $MinFreeGB }
+            if ($n.Info.FreeGB -lt $need) { $n.Status = 'ПРОПУЩЕН'; $n.Detail = "на C: свободно $($n.Info.FreeGB) ГБ, нужно около $need ГБ (образ, его копия в WSL, дистрибутив, модели; порог -MinFreeGB $MinFreeGB). Освободите место на ПК (Параметры, Система, Память, «Временные файлы») и повторите"; $n.Session = $null; continue }
         }
     }
     $todo = @($live | Where-Object { $_.Session })
@@ -1047,7 +1124,7 @@ function Invoke-Main {
         param($n)
         $nc = Get-NodeCred $n $cred
         $ra = Get-RunArgs $act $answers $n $nc
-        @{ Op = 'run'; Action = $act; StageDir = $StageDir; Args = $ra; Cleanup = $cleanup; RunMode = $RunMode; Proxy = $Proxy
+        @{ Op = 'run'; Action = $act; StageDir = $StageDir; MinFreeGB = $MinFreeGB; Args = $ra; Cleanup = $cleanup; RunMode = $RunMode; Proxy = $Proxy
             TaskName = $DeployTask; TaskPath = $DeployTaskPath; TaskUser = $nc.UserName; TaskPassword = $nc.Password; TimeoutSec = [int]($TimeoutMin * 60)
             Runner = $script:RunnerText; SecureDir = $script:SecureDirText; ImageMark = $(if ($ra.Contains('ImageTar')) { Get-ImageMark $answers $n } else { '' }) }
     } $Throttle {
@@ -1070,6 +1147,7 @@ function Invoke-Main {
         if ($line -match '^\s*(\[\d+/\d+\]|ОШИБКА)') { Say "  $($n.Name): $(Hide-Secrets $line.Trim())" }
     } $localLimit
 
+    if ($act -in @('install', 'update')) { Update-FreeGB $nodes }
     Show-Table $nodes
     $reboot = @($nodes | Where-Object { $_.Status -eq 'ПЕРЕЗАГРУЗКА' })
     if ($reboot.Count) {

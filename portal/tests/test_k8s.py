@@ -143,6 +143,13 @@ async def test_list_endpoints_uses_external_ip_and_annotations(k8s, core):
     assert core.list_namespaced_pod.await_args.kwargs["label_selector"] == "llm.nsu/role=inference"
 
 
+async def test_an_endpoint_on_main_uses_the_address_of_the_container(k8s, core):
+    """The external address of llm-main is the host: only 443, 80 and 6443 are published there."""
+    _set_cluster(core, [_node("llm-main", internal="172.17.0.2", external="192.168.3.200")], [_pod("p1", node="llm-main")])
+    (ep,) = await k8s.list_endpoints("inference")
+    assert ep.ip == "172.17.0.2"
+
+
 async def test_list_endpoints_falls_back_to_internal_ip(k8s, core):
     _set_cluster(core, [_node("n1", internal="172.17.0.3")], [_pod("p1")])
     (ep,) = await k8s.list_endpoints("inference")
@@ -283,6 +290,16 @@ async def test_delete_node_404_returns_false(k8s, core):
     assert await k8s.delete_node("gone") is False
     core.delete_node.side_effect = None
     assert await k8s.delete_node("there") is True
+
+
+async def test_delete_node_password_is_the_k3s_secret_and_404_is_false(k8s, core):
+    assert await k8s.delete_node_password("pc01") is True
+    assert core.delete_namespaced_secret.call_args.args[:2] == ("pc01.node-password.k3s", "kube-system")
+    core.delete_namespaced_secret.side_effect = ApiException(status=404)
+    assert await k8s.delete_node_password("gone") is False
+    core.delete_namespaced_secret.side_effect = ApiException(status=500)
+    with pytest.raises(ApiException):
+        await k8s.delete_node_password("pc01")
 
 
 async def test_delete_node_other_error_propagates(k8s, core):

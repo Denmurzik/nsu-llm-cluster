@@ -20,6 +20,7 @@ log = logging.getLogger(__name__)
 
 __all__ = [
     "delete_k8s_node",
+    "delete_node_password",
     "forget_live",
     "heartbeat",
     "live_nodes",
@@ -158,16 +159,30 @@ async def remove(db: AsyncSession, name: str, commit: bool = True) -> bool:
     return found
 
 
-async def delete_k8s_node(k8s, name: str) -> str:
-    """Deletes the Kubernetes Node object (and with it the node password k3s keeps): `deleted`, `absent` (there was none)
-    or `unavailable` (the cluster does not answer; logged, never raised: the rest of the removal goes on)."""
+async def delete_k8s_node(k8s, name: str) -> tuple[str, bool]:
+    """Deletes the Kubernetes Node object and the node password k3s keeps for it. Returns (`deleted`, `absent` (there was no
+    Node) or `unavailable` (the cluster does not answer), whether the password is gone). Logged, never raised: the rest of
+    the removal goes on, and the caller tells the admin what stayed."""
     try:
         if not await k8s.available():
-            return "unavailable"
-        return "deleted" if await k8s.delete_node(name) else "absent"
+            log.warning("node %s: the cluster does not answer, its Node and its k3s node password stay", name)
+            return "unavailable", False
+        state = "deleted" if await k8s.delete_node(name) else "absent"
     except (K8sUnavailable, ApiException) as exc:
         log.warning("node %s: could not delete the Kubernetes node: %s", name, exc)
-        return "unavailable"
+        state = "unavailable"
+    return state, await delete_node_password(k8s, name)
+
+
+async def delete_node_password(k8s, name: str) -> bool:
+    """Drops `<name>.node-password.k3s`, so an agent reinstalled under this name is not refused. True: it is gone (or there
+    was none); False: the cluster did not answer, the caller tells the admin. Logged, never raised."""
+    try:
+        await k8s.delete_node_password(name)
+        return True
+    except (K8sUnavailable, ApiException) as exc:
+        log.warning("node %s: could not delete its k3s node password: %s", name, exc)
+        return False
 
 
 async def forget_live(redis, name: str) -> bool:

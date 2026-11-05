@@ -100,7 +100,8 @@ grep -qx 'ARG LLAMA_TAG=b12033' "$DF" && pass "llama.cpp ref stays b12033" || fa
 grep -qx 'ARG LLAMA_COMMIT=785322d17f2d51e5185cf996a1f4e46d87640841' "$DF" && [ "$(grep -c 'rev-parse HEAD)" = "${LLAMA_COMMIT}" \]' "$DF")" = 2 ] \
   && pass "llama.cpp clone verified against LLAMA_COMMIT in both build stages" || fail "llama.cpp clone verified against LLAMA_COMMIT"
 for f in "$DF" "$NODE/../main/Dockerfile"; do
-  unpinned="$(grep '^FROM ' "$f" | grep -v '@sha256:[0-9a-f]\{64\}' || true)"
+  # two FROMs name a stage of the same file and pull no image: FROM build-gpu AS gpu-libs, FROM gpu-base-${GPU_BASE} AS gpu
+  unpinned="$(grep '^FROM ' "$f" | grep -v '@sha256:[0-9a-f]\{64\}' | grep -v -E '^FROM (build-gpu|gpu-base-\$\{GPU_BASE\}) AS ' || true)"
   [ -z "$unpinned" ] && pass "every FROM of $(basename "$(dirname "$f")")/Dockerfile is pinned by digest" || fail "unpinned FROM in $f: $unpinned"
 done
 for stage in build-cpu build-gpu; do
@@ -142,6 +143,36 @@ has "$dp" 'CGO_ENABLED=1' && pass "device-plugin: cgo (go-nvml)" || fail "device
 has "$gpu" '^COPY --from=device-plugin /out/nvidia-device-plugin /opt/llm/bin/nvidia-device-plugin$' \
   && pass "gpu image carries nvidia-device-plugin" || fail "gpu image carries nvidia-device-plugin"
 has "$cpu" 'device-plugin' && fail "cpu image has no device plugin" || pass "cpu image has no device plugin"
+
+# --- slim GPU image (the 16 GB class-PC limit): ubuntu base + only the CUDA libraries the binaries link; GPU_BASE=fat is the fallback ---
+UBUNTU_PIN="$(awk '/^FROM ubuntu:24.04@/{print $2; exit}' "$DF")"
+slim="$(awk '/^FROM /{on = ($NF == "gpu-base-slim")} on' "$DF")"
+fat="$(awk '/^FROM /{on = ($NF == "gpu-base-fat")} on' "$DF")"
+libs="$(awk '/^FROM /{on = ($NF == "gpu-libs")} on' "$DF")"
+grep -qx 'ARG GPU_BASE=slim' "$DF" && pass "GPU_BASE defaults to slim" || fail "GPU_BASE defaults to slim"
+grep -qx 'FROM gpu-base-${GPU_BASE} AS gpu' "$DF" && pass "gpu stage is built on gpu-base-\${GPU_BASE}" || fail "gpu stage is built on gpu-base-\${GPU_BASE}"
+has "$fat" '^FROM nvidia/cuda:12.8.1-runtime-ubuntu24.04@sha256:[0-9a-f]\{64\} AS gpu-base-fat$' \
+  && pass "fat fallback keeps the nvidia/cuda runtime base" || fail "fat fallback keeps the nvidia/cuda runtime base"
+has "$slim" "^FROM $UBUNTU_PIN AS gpu-base-slim\$" && pass "slim base is the ubuntu:24.04 digest of the cpu and k3s stages" \
+  || fail "slim base is the ubuntu:24.04 digest of the cpu and k3s stages"
+has "$slim" '^COPY --from=gpu-libs /out/ /usr/local/cuda/lib64/$' && pass "slim: CUDA libraries come from gpu-libs" || fail "slim: CUDA libraries come from gpu-libs"
+for kv in 'NVIDIA_VISIBLE_DEVICES=all' 'NVIDIA_DRIVER_CAPABILITIES=compute,utility' 'LD_LIBRARY_PATH=/usr/local/cuda/lib64'; do
+  has "$slim" "$kv" && pass "slim: ENV $kv (the nvidia runtime and the device plugin rely on it)" || fail "slim: ENV $kv"
+done
+has "$slim" 'ldconfig' && pass "slim: ldconfig knows /usr/local/cuda/lib64" || fail "slim: ldconfig knows /usr/local/cuda/lib64"
+has "$libs" '^FROM build-gpu AS gpu-libs$' && has "$libs" 'ldd "/src/build/bin/\$b"' && pass "gpu-libs: libraries read from ldd of the built binaries" \
+  || fail "gpu-libs: libraries read from ldd of the built binaries"
+has "$libs" '\[ "\$name" = libcuda.so.1 \]' && pass "gpu-libs: only libcuda.so.1 may stay unresolved (it is the host driver)" \
+  || fail "gpu-libs: only libcuda.so.1 may stay unresolved"
+for l in libcudart.so.12 libcublas.so.12 libcublasLt.so.12; do
+  has "$libs" "$l" && pass "gpu-libs: build fails without $l" || fail "gpu-libs: build fails without $l"
+done
+grep -q -- '-DCMAKE_CUDA_ARCHITECTURES="86;89;120"' "$DF" && pass "CUDA architectures unchanged (86;89;120): build-gpu stays cached" \
+  || fail "CUDA architectures unchanged (86;89;120)"
+has "$gpu" 'nvidia-container-toolkit' && has "$gpu" '^COPY --from=k3s /k3s /opt/llm/bin/k3s$' \
+  && pass "gpu image keeps nvidia-container-toolkit and k3s on either base" || fail "gpu image keeps nvidia-container-toolkit and k3s"
+grep -q 'DOCKER_BUILD_GPU_BASE\|--build-arg GPU_BASE' "$NODE/../release/release.sh" \
+  && fail "release.sh does not set GPU_BASE (the default slim is the release)" || pass "release.sh does not set GPU_BASE (the default slim is the release)"
 
 # --- version and commit of the image (task 2-30): build arguments in the final stages, given last, label and environment ---
 MAIN_DF="$NODE/../main/Dockerfile"

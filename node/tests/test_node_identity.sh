@@ -145,6 +145,120 @@ FAKE_LOG="$TMP/curl.log" PATH="$TMP/old:$TMP/serve:$BIN:$PATH" CLUSTER_TOKEN=t N
 [ "$rc" = 0 ] && pass "an older main: the report process ends as before" || fail "an older main: the report process ends as before (rc=$rc)"
 contains "an older main still gets the image report" "$(cat "$TMP/curl.log")" "/api/nodes/lab-1/image"
 
+# --- task B1: a node never calls without its key, the keeper never ends while the container runs -----------------
+# A scripted portal: $SP/<kind> (enroll, register, heartbeat, wake, image) holds one answer per line, «code body»; each call
+# takes the first line while more than one is left (the last one repeats). $SP/calls logs «kind key=<X-Node-Key or ->».
+mkdir -p "$TMP/sp"
+cat > "$TMP/sp/curl" <<'EOS'
+#!/usr/bin/env bash
+prev="" hdr="" url=""
+for a in "$@"; do
+  [ "$prev" = -H ] && case "$a" in @*) hdr="$(cat "${a#@}")" ;; esac
+  prev="$a"
+  case "$a" in http*://*) url="$a" ;; esac
+done
+case "$url" in
+  */ca.crt) printf '404'; exit 0 ;;
+  */api/nodes/enroll) kind=enroll ;;
+  */api/nodes/register) kind=register ;;
+  */api/nodes/heartbeat) kind=heartbeat ;;
+  */api/nodes/wake) kind=wake ;;
+  */image) kind=image ;;
+  */stop) printf '\n204'; exit 0 ;;
+  *) printf '{"ok":true}\n200'; exit 0 ;;
+esac
+key="$(sed -n 's/^X-Node-Key: //p' <<<"$hdr")"
+echo "$kind key=${key:--}" >> "$SP/calls"
+f="$SP/$kind"
+line="$(head -n1 "$f")"
+[ "$(grep -c . "$f")" -gt 1 ] && sed -i 1d "$f"
+printf '%s\n%s' "${line#* }" "${line%% *}"
+EOS
+chmod +x "$TMP/sp/curl"
+sp_reset() { rm -rf "$TMP/spd" "$TMP/state"; mkdir -p "$TMP/spd"; : > "$TMP/spd/calls"; }
+sp_run() { # timeout [registrar args...]
+  local t="$1"; shift
+  SP="$TMP/spd" PATH="$TMP/sp:$TMP/serve:$BIN:$PATH" CLUSTER_TOKEN=t NODE_IP=10.0.0.9 NODE_NAME=lab-1 MAIN_HOST=main.example \
+    ACCEL=cpu STATE_DIR="$TMP/state" WAKE_RETRY_S=1 ENROLL_RETRY_S=1 WOL_MAC=00-1A-2B-3C-4D-5E WOL_IP=10.1.2.3 WOL_PREFIX=24 \
+    timeout "$t" bash "$BIN/registrar.sh" "$@" 2>&1
+}
+OK_KEY="200 {\"ok\":true,\"heartbeat_interval\":1,\"approved\":true,\"node_key\":\"$KEY\"}"
+OK_APPROVED='200 {"ok":true,"heartbeat_interval":1,"approved":true}'
+HB_OK='200 {"ok":true,"heartbeat_interval":1,"approved":true,"desired":null}'
+REQUIRED='403 {"detail":{"code":"node_key_required","message":"no key"}}'
+PENDING='403 {"detail":{"code":"node_pending","message":"waits"}}'
+
+# the live case (2026-11-05): the enrolment answered 200 but issued no key -> no report goes without a key, the keeper stays
+sp_reset
+echo "$OK_APPROVED" > "$TMP/spd/enroll"; echo "$REQUIRED" > "$TMP/spd/wake"; echo "$REQUIRED" > "$TMP/spd/image"
+out="$(sp_run 9 --report)"; rc=$?
+[ "$rc" = 124 ] && pass "k3s: an enrolment without a key does not end the keeper" || fail "k3s: an enrolment without a key does not end the keeper (rc=$rc)"
+contains "k3s: the log says the portal issued no key" "$out" "without issuing a key"
+[ "$(grep -c '^enroll' "$TMP/spd/calls")" -ge 2 ] && pass "k3s: the enrolment is repeated" || fail "k3s: the enrolment is repeated: $(cat "$TMP/spd/calls")"
+lacks "k3s: no NIC report without a key" "$(cat "$TMP/spd/calls")" "wake key=-"
+lacks "k3s: no image report without a key" "$(cat "$TMP/spd/calls")" "image key=-"
+
+# the portal does not answer at first: the reports wait for the key, then carry it
+sp_reset
+printf '%s\n%s\n%s\n%s\n' '503 {"detail":"down"}' '502 bad gateway' "$OK_KEY" "$OK_APPROVED" > "$TMP/spd/enroll"
+echo "$OK_APPROVED" > "$TMP/spd/wake"; echo "$OK_APPROVED" > "$TMP/spd/image"
+out="$(sp_run 25 --report)"
+[ "$(cat "$TMP/state/node.key" 2>/dev/null)" = "$KEY" ] && pass "k3s: the key is kept once the portal answers" || fail "k3s: the key is kept once the portal answers: $out"
+calls="$(cat "$TMP/spd/calls")"
+first_report="$(grep -n -m1 -E '^(wake|image)' <<<"$calls" | cut -d: -f1)"
+last_nokey_enroll="$(grep -n '^enroll key=-' <<<"$calls" | tail -1 | cut -d: -f1)"
+[ -n "$first_report" ] && [ "$first_report" -gt "${last_nokey_enroll:-0}" ] && pass "k3s: the reports go only after the key" \
+  || fail "k3s: the reports go only after the key: $calls"
+contains "k3s: the NIC report carries the key" "$calls" "wake key=$KEY"
+contains "k3s: the image report carries the key" "$calls" "image key=$KEY"
+contains "k3s: the keeper enrols again with the key (the portal confirms it)" "$calls" "enroll key=$KEY"
+[ "$(grep -c '^wake' <<<"$calls")" = 1 ] && pass "k3s: the NIC is reported once" || fail "k3s: the NIC is reported once: $calls"
+
+# a claim: the reports are refused (node_pending) until the admin approves it, then they go (with the same key)
+sp_reset
+printf '%s\n%s\n%s\n%s\n' "200 {\"ok\":true,\"approved\":false,\"node_key\":\"$KEY\"}" '200 {"ok":true,"approved":false}' \
+  '200 {"ok":true,"approved":false}' "$OK_APPROVED" > "$TMP/spd/enroll"
+printf '%s\n%s\n%s\n' "$PENDING" "$PENDING" "$OK_APPROVED" > "$TMP/spd/wake"
+printf '%s\n%s\n%s\n' "$PENDING" "$PENDING" "$OK_APPROVED" > "$TMP/spd/image"
+out="$(sp_run 8 --report)"
+contains "k3s: a waiting node says so" "$out" "waits for the admin's approval"
+contains "k3s: after the approval the NIC is reported" "$out" "NIC 00-1A-2B-3C-4D-5E (10.1.2.3/24) reported to the portal"
+contains "k3s: after the approval the image is reported" "$out" "(version dev, digest unknown) reported to the portal"
+[ "$(grep -c 'NIC report not taken yet' <<<"$out")" = 1 ] && pass "k3s: a refused report is logged once, not every round" \
+  || fail "k3s: a refused report is logged once: $out"
+
+# the admin deleted the node (or reset its key): the keeper's next enrolment gets 403 node_key_invalid, drops the key, gets a new one
+sp_reset
+printf '%s\n%s\n%s\n%s\n' "$OK_KEY" '403 {"detail":{"code":"node_key_invalid","message":"x"}}' \
+  "200 {\"ok\":true,\"approved\":false,\"node_key\":\"$KEY2\"}" '200 {"ok":true,"approved":false}' > "$TMP/spd/enroll"
+echo "$OK_APPROVED" > "$TMP/spd/wake"; echo "$OK_APPROVED" > "$TMP/spd/image"
+out="$(sp_run 6 --report)"
+[ "$(cat "$TMP/state/node.key" 2>/dev/null)" = "$KEY2" ] && pass "k3s: a key the portal refuses is replaced by the keeper" \
+  || fail "k3s: a key the portal refuses is replaced by the keeper: $(cat "$TMP/spd/calls")"
+# the deletion took the NIC and the image from the portal: the new registration sends them again, once
+calls="$(cat "$TMP/spd/calls")"
+contains "k3s: the NIC goes again with the new key" "$calls" "wake key=$KEY2"
+contains "k3s: the image goes again with the new key" "$calls" "image key=$KEY2"
+[ "$(grep -c "^wake key=$KEY2" <<<"$calls")" = 1 ] && pass "k3s: the new key reports the NIC once" || fail "k3s: the new key reports the NIC once: $calls"
+
+# standalone: a registration answered without a key is not «registered»; no heartbeat goes without a key
+sp_reset
+printf '%s\n%s\n' "$OK_APPROVED" "$OK_KEY" > "$TMP/spd/register"
+echo "$HB_OK" > "$TMP/spd/heartbeat"; echo "$OK_APPROVED" > "$TMP/spd/image"
+out="$(sp_run 12)"
+contains "standalone: a registration without a key is a failure" "$out" "without issuing a key"
+[ "$(grep -c 'registered as lab-1' <<<"$out")" = 1 ] && pass "standalone: «registered» only once, with the key" || fail "standalone: «registered» only with the key: $out"
+lacks "standalone: no heartbeat without a key" "$(cat "$TMP/spd/calls")" "heartbeat key=-"
+# an older portal (no identities: no `approved` in the reply, no key) is taken as before; a heartbeat that then wants a key
+# the node lacks (403 node_key_required) registers again
+sp_reset
+printf '%s\n%s\n' '200 {"ok":true,"heartbeat_interval":1}' "$OK_KEY" > "$TMP/spd/register"
+printf '%s\n%s\n' "$REQUIRED" "$HB_OK" > "$TMP/spd/heartbeat"
+echo "$OK_APPROVED" > "$TMP/spd/image"
+out="$(sp_run 12)"
+contains "standalone: 403 node_key_required without a key registers again" "$out" "registering again"
+[ "$(cat "$TMP/state/node.key" 2>/dev/null)" = "$KEY" ] && pass "standalone: the new registration keeps its key" || fail "standalone: the new registration keeps its key: $(cat "$TMP/spd/calls")"
+
 # --- node-metrics.sh ------------------------------------------------------------------------------------------------
 mkdir -p "$TMP/mstate"
 printf '%s\n' "$KEY" > "$TMP/mstate/node.key"
@@ -159,6 +273,25 @@ FAKE_METRICS_INVALID=1 FAKE_LOG="$TMP/curl.log" PATH="$TMP/bin:$PATH" STATE_DIR=
   CLUSTER_TOKEN=t NODE_NAME=lab-1 bash -c "source '$BIN/node-metrics.sh'; push '{}'" >/dev/null 2>&1
 [ ! -e "$TMP/mstate/node.key" ] && [ ! -e "$TMP/mstate/backend/key" ] && pass "node-metrics drops a key the portal refuses" \
   || fail "node-metrics drops a key the portal refuses"
+
+# the race that left the node without a key (task B1): the refusal of the OLD key arrives after the registrar kept a new one
+mkdir -p "$TMP/race"
+cat > "$TMP/race/curl" <<'EOS'
+#!/usr/bin/env bash
+printf '%s\n' "$NEW_KEY" > "$KEY_PATH"
+printf '{"detail":{"code":"node_key_invalid","message":"x"}}\n403'
+EOS
+chmod +x "$TMP/race/curl"
+printf '%s\n' "$KEY" > "$TMP/mstate/node.key"
+NEW_KEY="$KEY2" KEY_PATH="$TMP/mstate/node.key" PATH="$TMP/race:$PATH" STATE_DIR="$TMP/mstate" MAIN_URL=http://main.example \
+  CLUSTER_TOKEN=t NODE_NAME=lab-1 bash -c "source '$BIN/node-metrics.sh'; push '{}'" >/dev/null 2>&1
+[ "$(cat "$TMP/mstate/node.key" 2>/dev/null)" = "$KEY2" ] && pass "node-metrics keeps a key the registrar kept while the call was on its way" \
+  || fail "node-metrics keeps a key the registrar kept while the call was on its way"
+rm -rf "$TMP/state"; mkdir -p "$TMP/state"; printf '%s\n' "$KEY" > "$TMP/state/node.key"
+out="$(NEW_KEY="$KEY2" KEY_PATH="$TMP/state/node.key" PATH="$TMP/race:$TMP/serve:$BIN:$PATH" CLUSTER_TOKEN=t MAIN_URL=http://main.example \
+  NODE_NAME=lab-1 STATE_DIR="$TMP/state" MODELS_REPORT_S=300 WAKE_RETRY_S=1 timeout 3 bash "$BIN/registrar.sh" --models-report 2>&1)"
+[ "$(cat "$TMP/state/node.key" 2>/dev/null)" = "$KEY2" ] && pass "the models report keeps a key kept while the call was on its way" \
+  || { fail "the models report keeps a key kept while the call was on its way"; echo "$out"; }
 
 # --- serve-llama.sh: the backend key file of the k3s pods ----------------------------------------------------------
 mkdir -p "$TMP/llama"
@@ -193,7 +326,7 @@ EOS
 chmod +x "$TMP/fca/fetch-main-ca.sh"
 rm -rf "$TMP/state"; : > "$TMP/fca.log"; : > "$TMP/curl.log"
 FAKE_FCA_LOG="$TMP/fca.log" FAKE_LOG="$TMP/curl.log" FAKE_ISSUE="$KEY" PATH="$TMP/fca:$TMP/bin:$TMP/serve:$BIN:$PATH"   CLUSTER_TOKEN=t NODE_IP=10.0.0.9 NODE_NAME=lab-1 MAIN_HOST=main.example ACCEL=cpu STATE_DIR="$TMP/state" timeout 3   bash "$BIN/registrar.sh" >/dev/null 2>&1
-contains "registrar asks fetch-main-ca.sh for main's CA" "$(cat "$TMP/fca.log")" "--main https://main.example --out $TMP/state/ca.crt token=set"
+contains "registrar asks fetch-main-ca.sh for main's CA" "$(cat "$TMP/fca.log")" "--main main.example --out $TMP/state/ca.crt token=set"
 lacks "registrar never asks for trust on first use" "$(cat "$TMP/fca.log")" "-yes"
 lacks "registrar never asks for trust on first use (flag)" "$(cat "$TMP/fca.log")" "trust-first-use"
 lacks "registrar does not fetch the CA with curl -k then" "$(cat "$TMP/curl.log")" "https://main.example/ca.crt"

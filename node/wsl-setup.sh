@@ -7,6 +7,7 @@
 # install-node.ps1 передаёт их через WSLENV, а не в командной строке; пароль прокси в вывод не попадает.
 # Файлы с прокси (apt.conf.d, drop-in Docker) доступны на чтение только root.
 # Последняя строка вывода: NSU_LLM_RESTART=1, если дистрибутив нужно перезапустить (включён systemd).
+# HOST_MOUNT=/mnt/c (диск Windows, на котором лежит диск дистрибутива): раз в минуту его свободное место пишется в state ноды (шаг 4).
 # ROOT — префикс путей для тестов.
 set -euo pipefail
 ROOT="${ROOT:-}"
@@ -54,6 +55,48 @@ fi
 [ "$(cat "$ROOT/proc/1/comm" 2>/dev/null)" = systemd ] || restart=1
 
 # 2. Docker CE.
+# Хранилище образов: Docker CE 29+ на новой установке берёт containerd image store, а он держит ещё и сжатые слои (blobs) рядом с распакованными,
+# образ ноды (несколько ГБ) занимает диск дважды. features.containerd-snapshotter=false в daemon.json возвращает классическое хранилище overlay2
+# (только распакованные слои). Пишется до того, как Docker впервые скачает образ. Если Docker уже стоит и в хранилище есть образы, настройка не
+# меняется: смена хранилища спрятала бы их (образы: docker image ls; тогда переустановите дистрибутив или загрузите образ заново).
+DAEMON_JSON="$ROOT/etc/docker/daemon.json"
+classic_store() {
+  grep -Eq '"containerd-snapshotter"[[:space:]]*:[[:space:]]*false' "$DAEMON_JSON" 2>/dev/null && return 0
+  if [ -x "$ROOT/usr/bin/docker" ]; then
+    # Docker уже стоит: переключать хранилище можно, только убедившись, что в нём нет образов. Демон не отвечает (только что запущен, systemd поднимается) —
+    # узнать это нельзя, настройка откладывается до следующего запуска установщика.
+    if ! docker info >/dev/null 2>&1; then
+      say "ВНИМАНИЕ: демон Docker не отвечает, наличие образов неизвестно: containerd-snapshotter=false не записан. Запустите установку ещё раз, когда Docker заработает."
+      return 0
+    fi
+    if [ -n "$(docker image ls -q 2>/dev/null || true)" ]; then
+      say "ВНИМАНИЕ: в Docker уже есть образы в хранилище containerd: настройка containerd-snapshotter=false не применена (образы станут невидимы). Удалите образы (docker image prune -a) и запустите установку снова."
+      return 0
+    fi
+  fi
+  mkdir -p "$(dirname "$DAEMON_JSON")"
+  if [ ! -s "$DAEMON_JSON" ]; then
+    printf '{
+  "features": {
+    "containerd-snapshotter": false
+  }
+}
+' > "$DAEMON_JSON"
+  elif command -v python3 >/dev/null 2>&1; then
+    if python3 -c 'import json, sys; d = json.load(sys.stdin); d.setdefault("features", {})["containerd-snapshotter"] = False; json.dump(d, sys.stdout, indent=2); print()' < "$DAEMON_JSON" > "$DAEMON_JSON.new" 2>/dev/null; then
+      mv -f "$DAEMON_JSON.new" "$DAEMON_JSON"
+    else
+      rm -f "$DAEMON_JSON.new"; say "ВНИМАНИЕ: $DAEMON_JSON не разобран, containerd-snapshotter=false не записан"; return 0
+    fi
+  else
+    say "ВНИМАНИЕ: в $DAEMON_JSON уже есть настройки, а python3 для слияния нет: добавьте \"features\": {\"containerd-snapshotter\": false} вручную"
+    return 0
+  fi
+  say "Docker: классическое хранилище образов (containerd-snapshotter=false), слои не хранятся дважды"
+  [ -x "$ROOT/usr/bin/docker" ] && docker_restart=1   # демон уже работает: перечитает daemon.json после перезапуска
+  return 0
+}
+classic_store
 if [ ! -x "$ROOT/usr/bin/docker" ]; then
   say "установка Docker CE из download.docker.com"
   apt_fail() { die "не удалось установить Docker CE: нет доступа к download.docker.com или к зеркалу Ubuntu. Проверьте интернет и прокси, затем запустите install-node.ps1 снова."; }
@@ -87,8 +130,69 @@ if [ "$ACCEL" = nvidia ]; then
     apt-get install -y --allow-downgrades nvidia-container-toolkit="$CTK" nvidia-container-toolkit-base="$CTK" \
       libnvidia-container-tools="$CTK" libnvidia-container1="$CTK" || ctk_fail
   fi
+  daemon_was="$(cksum < "$DAEMON_JSON" 2>/dev/null || true)"
   nvidia-ctk runtime configure --runtime=docker >/dev/null || die "nvidia-ctk runtime configure --runtime=docker завершился ошибкой"
-  [ "$restart" = 1 ] || systemctl restart docker || die "Docker не перезапустился после настройки runtime nvidia: journalctl -u docker -n 50"
+  # nvidia-ctk переписывает daemon.json: ключ классического хранилища образов должен остаться (иначе образ снова хранится дважды)
+  if ! grep -Eq '"containerd-snapshotter"[[:space:]]*:[[:space:]]*false' "$DAEMON_JSON" 2>/dev/null; then
+    say "ВНИМАНИЕ: после nvidia-ctk в $DAEMON_JSON пропал ключ features.containerd-snapshotter=false, записываю его снова"
+    classic_store
+  fi
+  # Перезапуск только при новых настройках: повторный запуск установщика на работающей ноде иначе ронял бы её контейнер с моделью.
+  if [ "$restart" = 0 ] && { [ "$daemon_was" != "$(cksum < "$DAEMON_JSON" 2>/dev/null || true)" ] || ! docker info --format '{{json .Runtimes}}' 2>/dev/null | grep -q '"nvidia"'; }; then
+    systemctl restart docker || die "Docker не перезапустился после настройки runtime nvidia: journalctl -u docker -n 50"
+  fi
+fi
+
+# 4. Свободное место диска Windows. Контейнер ноды его не видит: df внутри WSL показывает виртуальный диск (до 1 ТБ), а не диск Windows, который
+# заполняет ext4.vhdx. Служба раз в минуту пишет df /mnt/<диск> в <state ноды>/host-disk (JSON: mount, free_bytes, total_bytes, at), node-metrics.sh
+# отправляет free_bytes порталу как disk_free_bytes (панель «Ноды» предупреждает о малом месте). Каталога state ещё нет (ноду не запускали) — запись пропускается.
+HOST_MOUNT="${HOST_MOUNT:-/mnt/c}"
+case "$HOST_MOUNT" in /mnt/[a-z]) ;; *) HOST_MOUNT=/mnt/c ;; esac
+HOST_DISK_STATE="${HOST_DISK_STATE:-/var/lib/nsu-llm-node/state/host-disk}"
+hd_bin="$ROOT/usr/local/sbin/nsu-llm-host-disk"
+hd_dir="$ROOT/etc/systemd/system"
+hd_script="$(cat <<EOS
+#!/bin/sh
+# NSU LLM: свободное место диска Windows ($HOST_MOUNT) для отчёта ноды; запускает nsu-llm-host-disk.timer (wsl-setup.sh)
+out='$HOST_DISK_STATE'
+[ -d "\$(dirname "\$out")" ] || exit 0
+set -- \$(df -Pk '$HOST_MOUNT' 2>/dev/null | awk 'NR == 2 { print \$4 * 1024, \$2 * 1024 }')
+[ "\$#" = 2 ] || exit 0
+printf '{"mount":"%s","free_bytes":%s,"total_bytes":%s,"at":%s}\\n' '$HOST_MOUNT' "\$1" "\$2" "\$(date +%s)" > "\$out.tmp" && mv -f "\$out.tmp" "\$out"
+EOS
+)"
+hd_service='[Unit]
+Description=NSU LLM: free space of the Windows disk for the node report
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/nsu-llm-host-disk'
+hd_timer='[Unit]
+Description=NSU LLM: free space of the Windows disk, every minute
+
+[Timer]
+OnBootSec=30
+OnUnitActiveSec=60
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target'
+hd_changed=0
+mkdir -p "$(dirname "$hd_bin")" "$hd_dir"
+if [ "$(cat "$hd_bin" 2>/dev/null)" != "$hd_script" ]; then printf '%s\n' "$hd_script" > "$hd_bin"; chmod 0755 "$hd_bin"; hd_changed=1; fi
+if [ "$(cat "$hd_dir/nsu-llm-host-disk.service" 2>/dev/null)" != "$hd_service" ]; then printf '%s\n' "$hd_service" > "$hd_dir/nsu-llm-host-disk.service"; hd_changed=1; fi
+if [ "$(cat "$hd_dir/nsu-llm-host-disk.timer" 2>/dev/null)" != "$hd_timer" ]; then printf '%s\n' "$hd_timer" > "$hd_dir/nsu-llm-host-disk.timer"; hd_changed=1; fi
+systemctl enable nsu-llm-host-disk.timer >/dev/null 2>&1 || true
+if [ "$hd_changed" = 1 ] && [ "$(cat "$ROOT/proc/1/comm" 2>/dev/null)" = systemd ]; then
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  systemctl restart nsu-llm-host-disk.timer >/dev/null 2>&1 || true
+  say "служба nsu-llm-host-disk: свободное место $HOST_MOUNT раз в минуту в $HOST_DISK_STATE"
+fi
+
+# Проверка: хранилище, которое выбрал Docker, классическое (Driver overlay2). С containerd store `docker info` показывает overlayfs.
+if [ -z "$ROOT" ] && command -v docker >/dev/null 2>&1; then
+  sd="$(docker info --format '{{.Driver}}' 2>/dev/null || true)"
+  if [ -n "$sd" ] && [ "$sd" != overlay2 ]; then say "ВНИМАНИЕ: хранилище образов Docker «$sd», а не overlay2: образы хранятся дважды (см. /etc/docker/daemon.json, features.containerd-snapshotter)"; fi
 fi
 
 echo "NSU_LLM_RESTART=$restart"

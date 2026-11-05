@@ -35,7 +35,7 @@ from kubernetes_asyncio.client import ApiException
 
 from app.deployments import schedule, service
 from app.deps import REDIS_ERRORS
-from app.k8s import K8sUnavailable
+from app.k8s import MAIN_NODE, K8sUnavailable
 from app import key_access
 from app.config import key_fingerprint
 from app.litellm_client import LiteLLMError, LiteLLMUnavailable, access_groups
@@ -184,9 +184,13 @@ class BackendController:
             if c is None:
                 continue
             # a pod reads its node's own key from the node container (builders.BACKEND_KEY_FILE): a node without one, or not
-            # approved (its pods should not be there at all), gets no entry
-            key = keys.get(c.node.lower())
-            if key and c.node.lower() in approved:
+            # approved (its pods should not be there at all), gets no entry. A split leader on main has main's own key:
+            # main is no node, nobody approves it
+            if c.node.lower() == MAIN_NODE:
+                key = self.app_state.settings.main_backend_key.get_secret_value()
+            else:
+                key = keys.get(c.node.lower()) if c.node.lower() in approved else None
+            if key:
                 candidates.append(replace(c, api_key=key))
         return candidates
 

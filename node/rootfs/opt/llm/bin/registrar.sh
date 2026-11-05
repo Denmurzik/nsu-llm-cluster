@@ -10,8 +10,8 @@
 # mode the size travels with the heartbeat, and the heartbeat reply may carry cleanup orders (`purge`, models-cleanup.sh).
 #
 # Identity (task SEC-1, portal/app/nodes/identity.py): the agent token only joins. The first registration of the name
-# (standalone: POST /api/nodes/register, k3s: POST /api/nodes/enroll, which --report does first and then keeps doing
-# whenever the key is gone) returns the node's own key once; it is kept root-only in $STATE_DIR/node.key and sent as
+# (standalone: POST /api/nodes/register, k3s: POST /api/nodes/enroll, which --report does first, before any report, and
+# then again every ENROLL_RETRY_S seconds with the key, so a refused or lost key is replaced) returns the node's own key once; it is kept root-only in $STATE_DIR/node.key and sent as
 # X-Node-Key with every call, besides the token. From it the node derives its backend key (llama-server --api-key):
 # sha256("nsu-llm-backend:" + key) in $STATE_DIR/backend/key, which the k3s pods mount. A 403 node_key_invalid (the
 # admin reset the key or deleted the node) drops both files and registers again; the node then waits for the admin's
@@ -71,6 +71,7 @@ D_ENV=()             # the llama.cpp settings of the deployment as NAME=value (d
 LLM_ENV_NAMES='^(THINKING|KV_CACHE_TYPE|SAMPLING_ARGS|DRAFT_REPO|DRAFT_FILE|DRAFT_REVISION|MMPROJ_FILE|EXTRA_ARGS)$'
 HTTP_CODE=000
 BODY=""
+SENT_KEY=""          # the key the last call carried
 TLS=()
 
 log() { echo "$(date -u +%FT%TZ) registrar: $*"; }
@@ -183,7 +184,16 @@ ensure_backend_key() {
     printf '%s' "nsu-llm-backend:$k" | sha256sum | cut -d' ' -f1 > "$BACKEND_KEY_FILE.tmp" && mv "$BACKEND_KEY_FILE.tmp" "$BACKEND_KEY_FILE" )
 }
 
+# Three processes share the key file (this one, --models-report, node-metrics.sh). A refusal drops the key that was sent, never
+# one that another process kept meanwhile: the portal has only its hash, a lost new key costs the node a trip to the admin
+# (task B1: node-metrics.sh dropped the fresh key on a refusal of the old one, and the node was left without any).
 drop_key() {
+  local now
+  now="$(node_key)"
+  if [ -n "$now" ] && [ "$now" != "$SENT_KEY" ]; then
+    log "the portal refused the key sent, a newer one is kept already: it stays"
+    return 0
+  fi
   log "the portal refused this node's key (reset by the admin or the node was deleted): registering again"
   rm -f "$KEY_FILE" "$BACKEND_KEY_FILE"
 }
@@ -196,12 +206,19 @@ refusal_text() {
   jq -r '.detail.message // .detail // empty' <<<"$BODY" 2>/dev/null | head -c 300
 }
 
-# Takes what a registration answered: the key it issued, whether the node is approved
+# Takes what a registration answered: the key it issued, whether the node is approved. A registration sent without a key
+# to a portal with identities (its reply says `approved`) must come back with one: a 200 without it is a failure, never
+# "registered" (the node would then call without a key and get 403 node_key_required forever, task B1).
 take_identity() {
   local k a
   k="$(jq -r '.node_key // empty' <<<"$BODY" 2>/dev/null)"
   if [ -n "$k" ] && ! save_key "$k"; then
     return 1  # not kept: the next registration repeats the nonce and gets a new key
+  fi
+  if [ -z "$(node_key)" ] && [ "$(jq -r 'has("approved")' <<<"$BODY" 2>/dev/null)" = true ]; then
+    log "the portal answered the registration of $NODE_NAME without issuing a key: trying again (no call goes without a key)"
+    HTTP_CODE=200-nokey
+    return 1
   fi
   a="$(jq -r 'if .approved == false then "false" else "true" end' <<<"$BODY" 2>/dev/null)"
   note_approval "${a:-true}"
@@ -224,6 +241,7 @@ call() {
   [ "${#TLS[@]}" -gt 0 ] && args+=("${TLS[@]}")
   [ -n "$data" ] && args+=(-H 'Content-Type: application/json' -d "$data")
   key="$(node_key)" nonce=""
+  SENT_KEY="$key"
   case "$path" in /api/nodes/register|/api/nodes/enroll) [ -n "$key" ] || nonce="$(enroll_nonce)" ;; esac
   # The token and the node's key reach curl as a header file, never through argv (/proc/<pid>/cmdline is world-readable).
   if ! out="$(curl "${args[@]}" -H @<(printf 'Authorization: Bearer %s\n' "$CLUSTER_TOKEN"; [ -n "$key" ] && printf 'X-Node-Key: %s\n' "$key"; [ -n "$nonce" ] && printf 'X-Node-Enroll-Nonce: %s\n' "$nonce") "$MAIN_URL$path" 2>&1)"; then
@@ -518,6 +536,12 @@ heartbeat() {
     drop_key
     register_until_ok
     NEXT_HB=0
+  elif [ "$HTTP_CODE" = 403 ] && [ -z "$(node_key)" ] && [[ "$(refusal_code)" =~ ^(node_key_required|node_unknown)$ ]]; then
+    # the key is gone (a state directory lost or restored without it): register again; a known name becomes a claim the
+    # admin approves on the «Ноды» page
+    log "the portal wants this node's key and there is none ($(refusal_code)): registering again"
+    register_until_ok
+    NEXT_HB=0
   else
     log "heartbeat failed (HTTP $HTTP_CODE): ${BODY:0:200}"
     NEXT_HB=$((SECONDS + 5))
@@ -536,34 +560,57 @@ shutdown() {
   exit 0
 }
 
-# k3s mode: the NIC once per container start; a refusal (422: data the portal does not accept) is not retried
-report_wake() {
-  local payload
-  payload="$(jq -nc --arg name "$NODE_NAME" --argjson wake "$WAKE" '{name: $name} + $wake')"
-  until call POST /api/nodes/wake "$payload" && [ "$HTTP_CODE" = 200 ]; do
-    [ "$STOPPING" = 1 ] && return 0
-    if [ "$HTTP_CODE" = 422 ] || [ "$HTTP_CODE" = 403 ]; then
-      log "wake-on-lan: the portal refused the NIC $WOL_MAC ($WOL_IP/$WOL_PREFIX): ${BODY:0:200}"
-      return 1
-    fi
-    log "wake-on-lan: NIC report failed (HTTP $HTTP_CODE): ${BODY:0:200}; retrying in $WAKE_RETRY_S s"
-    nap "$WAKE_RETRY_S"
-  done
-  log "wake-on-lan: NIC $WOL_MAC ($WOL_IP/$WOL_PREFIX) reported to the portal"
+# k3s mode: the NIC and the image, once per container start each, sent only while the node holds a key (they need it:
+# a name the portal knows refuses a call without one). One attempt per round of the keeper; a refusal that will not change
+# (422: data the portal does not take; 404 for the image: an older portal) is not retried, anything else is retried next
+# round (403 node_pending: a claim waits for the admin; its key becomes the node's key on approval). Logged when the
+# outcome changes, not every round.
+WAKE_DONE=0
+IMAGE_DONE=0
+WAKE_LAST=""
+IMAGE_LAST=""
+REPORTED_KEY=""
+# A new key is a new registration: the node was deleted or reset, and the portal forgot its NIC and its image with it
+reports_follow_the_key() {
+  local k
+  k="$(node_key)"
+  [ "$k" != "$REPORTED_KEY" ] || return 0
+  if [ -n "$REPORTED_KEY" ]; then
+    [ "$WAKE" = null ] || WAKE_DONE=0
+    IMAGE_DONE=0 WAKE_LAST="" IMAGE_LAST=""
+  fi
+  REPORTED_KEY="$k"
 }
-
-# k3s mode: the image once per container start; a portal without the endpoint (404) or that refuses it (422) is not retried
-report_image_until_ok() {
-  until report_image; do
-    [ "$STOPPING" = 1 ] && return 0
-    case "$HTTP_CODE" in
-      404|422) log "image report not taken by the portal (HTTP $HTTP_CODE): the portal shows no version for this node"; return 1 ;;
-      403) log "image report refused: $(refusal_text)"; return 1 ;;
-    esac
-    log "image report failed (HTTP $HTTP_CODE): ${BODY:0:200}; retrying in $WAKE_RETRY_S s"
-    nap "$WAKE_RETRY_S"
-  done
-  log "image ${NODE_IMAGE:-?} (version $NODE_VERSION, digest ${NODE_IMAGE_DIGEST:-unknown}) reported to the portal"
+try_reports() {
+  local payload
+  if [ "$WAKE_DONE" = 0 ]; then
+    payload="$(jq -nc --arg name "$NODE_NAME" --argjson wake "$WAKE" '{name: $name} + $wake')"
+    if call POST /api/nodes/wake "$payload" && [ "$HTTP_CODE" = 200 ]; then
+      WAKE_DONE=1
+      log "wake-on-lan: NIC $WOL_MAC ($WOL_IP/$WOL_PREFIX) reported to the portal"
+    elif [ "$HTTP_CODE" = 422 ]; then
+      WAKE_DONE=1
+      log "wake-on-lan: the portal refused the NIC $WOL_MAC ($WOL_IP/$WOL_PREFIX): ${BODY:0:200}"
+    else
+      [ "$HTTP_CODE" = 403 ] && [ "$(refusal_code)" = node_key_invalid ] && drop_key
+      [ "$WAKE_LAST" = "$HTTP_CODE" ] || log "wake-on-lan: NIC report not taken yet (HTTP $HTTP_CODE): $(refusal_text || true); retrying every ${ENROLL_RETRY_S}s"
+      WAKE_LAST="$HTTP_CODE"
+    fi
+  fi
+  if [ "$IMAGE_DONE" = 0 ]; then
+    if report_image; then
+      IMAGE_DONE=1
+      log "image ${NODE_IMAGE:-?} (version $NODE_VERSION, digest ${NODE_IMAGE_DIGEST:-unknown}) reported to the portal"
+    elif [ "$HTTP_CODE" = 404 ] || [ "$HTTP_CODE" = 422 ]; then
+      IMAGE_DONE=1
+      log "image report not taken by the portal (HTTP $HTTP_CODE): the portal shows no version for this node"
+    else
+      [ "$HTTP_CODE" = 403 ] && [ "$(refusal_code)" = node_key_invalid ] && drop_key
+      [ "$IMAGE_LAST" = "$HTTP_CODE" ] || log "image report not taken yet (HTTP $HTTP_CODE): $(refusal_text || true); retrying every ${ENROLL_RETRY_S}s"
+      IMAGE_LAST="$HTTP_CODE"
+    fi
+  fi
+  return 0
 }
 
 # k3s mode: the size of the models volume every MODELS_REPORT_S seconds; a refusal (422) or an old portal (404) is not retried
@@ -599,27 +646,31 @@ fi
 
 if [ "$WAKE_REPORT" = 1 ]; then
   setup_tls || exit 0
-  # the identity first (its key goes with the reports); a portal that does not answer yet does not hold the reports up
-  enroll_once
-  rc=0
-  if [ "$WAKE" != null ]; then report_wake || rc=$?; else log "wake-on-lan: no NIC given (WOL_MAC, WOL_IP, WOL_PREFIX), nothing to report"; fi
-  report_image_until_ok || true
-  # The identity keeper of the container: while the node has a key (or could not register yet) it stays, and a key the
-  # portal refused (node-metrics.sh or the models report drop it) is replaced by a new registration, which then waits for
-  # the admin's approval. A new registration reports the NIC and the image again (refused while the name was unknown).
-  if [ -n "$(node_key)" ] || [ "$ENROLL_STATE" = retry ]; then
-    while [ "$STOPPING" = 0 ]; do
+  [ "$WAKE" != null ] || { log "wake-on-lan: no NIC given (WOL_MAC, WOL_IP, WOL_PREFIX), nothing to report"; WAKE_DONE=1; }
+  # The identity keeper of the container (task B1): the key first, then the reports that need it. Every round
+  # (ENROLL_RETRY_S) the enrolment goes again, with the key when the node has one: the portal confirms the key (or refuses it:
+  # 403 node_key_invalid drops it and the node registers again, a claim for the admin), says whether the node is approved,
+  # and a key lost meanwhile (node-metrics.sh or the models report dropped it) is replaced. It never ends while the
+  # container runs, except for an older main without the enroll endpoint (404: the reports go without a key as before);
+  # entrypoint.sh restarts it whenever it ends.
+  first_wait=5; [ "$ENROLL_RETRY_S" -ge 5 ] || first_wait="$ENROLL_RETRY_S"
+  wait_s="$first_wait"
+  while [ "$STOPPING" = 0 ]; do
+    if enroll_once; then
+      wait_s="$first_wait"
+      reports_follow_the_key
+      try_reports
       nap "$ENROLL_RETRY_S"
-      [ "$STOPPING" = 1 ] && break
-      [ -z "$(node_key)" ] || continue
-      if enroll_once && [ -n "$(node_key)" ]; then
-        [ "$WAKE" = null ] || report_wake || true
-        report_image_until_ok || true
-      fi
-    done
-    exit 0
-  fi
-  exit $rc
+      continue
+    fi
+    if [ "$ENROLL_STATE" = none ]; then
+      try_reports
+      exit 0
+    fi
+    nap "$wait_s"
+    wait_s=$((wait_s * 2)); [ "$wait_s" -le "$ENROLL_RETRY_S" ] || wait_s="$ENROLL_RETRY_S"
+  done
+  exit 0
 fi
 
 setup_tls || shutdown

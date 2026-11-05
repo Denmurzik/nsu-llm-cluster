@@ -68,7 +68,7 @@ def test_overrides_parse_and_the_most_specific_wins():
     overrides = wake.parse_overrides(" 10.1.0.0/16=10.1.255.255 , 10.1.2.0/24=10.1.2.7,192.168.0.0/24=192.168.0.255")
     assert wake.broadcast_for("10.1.2.3", 24, overrides) == "10.1.2.7"
     assert wake.broadcast_for("10.1.9.3", 24, overrides) == "10.1.255.255"
-    assert wake.broadcast_for("10.2.0.3", 24, overrides) == "10.2.0.255"  # no override: the directed broadcast
+    assert wake.broadcast_for("10.2.1.3", 24, overrides) == "10.2.1.255"  # no override: the directed broadcast
     assert wake.parse_overrides("") == []
 
 
@@ -218,7 +218,7 @@ def test_wake_job_runs_the_sender_on_the_relay_node():
     assert "runtimeClassName" not in pod and "serviceAccountName" not in pod
     assert pod["automountServiceAccountToken"] is False
     (c,) = pod["containers"]
-    assert c["image"] == "nsu-llm-node:0.2.0-gpu" and c["imagePullPolicy"] == "Never"
+    assert c["image"] == "nsu-llm-node:0.2.1-gpu" and c["imagePullPolicy"] == "Never"
     assert c["command"] == ["wol-send.sh", "00:1a:2b:3c:4d:5e", "10.1.2.255"]
     assert c["securityContext"] == {"allowPrivilegeEscalation": False, "privileged": False}
     assert "env" not in c and "envFrom" not in c  # no secrets in the relay pod

@@ -707,6 +707,20 @@ if [ "$MODE" = k3s ]; then
   fi
 fi
 
+# What main knows about this name and what the admin has to click, before the container starts (task B2). A normal restart
+# says nothing; an older main (404) or no answer neither: the node goes on anyway.
+name_state() {
+  [ "$DRY" = 0 ] && [ -n "$TOKEN" ] || return 0
+  local body code msg=""
+  body="$(mktemp)"
+  # shellcheck disable=SC2046
+  code="$(curl -sS -o "$body" -w '%{http_code}' -m 10 $(tls_args) -H @<(auth_headers) "$MAIN_URL/api/nodes/$NAME/known" 2>/dev/null)" || code=000
+  [ "$code" != 200 ] || msg="$(api_message "$body")"
+  rm -f "$body"
+  [ -z "$msg" ] || echo "$msg"
+}
+name_state
+
 # Re-running replaces the container; volumes (k3s identity, models) stay.
 if [ "$DRY" = 0 ] && docker inspect "$CONTAINER" >/dev/null 2>&1; then
   docker rm -f "$CONTAINER" >/dev/null
@@ -774,4 +788,6 @@ install_firewall_units
 run "${args[@]}"
 if [ "$DRY" = 0 ]; then
   echo "Нода $NAME запущена: контейнер $CONTAINER, образ $IMAGE, режим $MODE, адрес $NODE_IP."
+  # Older node images are dead weight after an update (pull-image.sh only adds the new one; 16 GB limit of a class PC): a failure costs disk only.
+  [ ! -f "$HERE/prune-old-images.sh" ] || bash "$HERE/prune-old-images.sh" --keep "$IMAGE" || true
 fi

@@ -110,14 +110,14 @@ DIG_OLD="sha256:$(printf '11%.0s' $(seq 32))"
 DIG_NEW="sha256:$(printf 'cd%.0s' $(seq 32))"
 inspect_json() { # NODE_IMAGE_DIGEST network mount-source -> docker inspect output of the node container
   cat > "$TMP/inspect.json" <<EOS
-[{"Config":{"Image":"nsu-llm-node:0.2.0-cpu","Env":["MODE=k3s","MAIN_HOST=10.9.0.5","CLUSTER_TOKEN=clustersecret42","NODE_NAME=pc01","NODE_IP=10.1.2.3","ACCEL=cpu","WOL_MAC=00-1A-2B-3C-4D-5E","WOL_IP=10.1.2.3","WOL_PREFIX=24","NODE_IMAGE_DIGEST=${1:-$DIG_OLD}","PATH=/usr/bin"]},
+[{"Config":{"Image":"nsu-llm-node:0.2.1-cpu","Env":["MODE=k3s","MAIN_HOST=10.9.0.5","CLUSTER_TOKEN=clustersecret42","NODE_NAME=pc01","NODE_IP=10.1.2.3","ACCEL=cpu","WOL_MAC=00-1A-2B-3C-4D-5E","WOL_IP=10.1.2.3","WOL_PREFIX=24","NODE_IMAGE_DIGEST=${1:-$DIG_OLD}","PATH=/usr/bin"]},
   "HostConfig":{"NetworkMode":"${2:-default}"},
   "Mounts":[{"Destination":"/var/lib/llm-node","Source":"${3:-/run/desktop/mnt/host/c/ProgramData/nsu-llm-node/state}"}]}]
 EOS
   export FAKE_INSPECT_JSON="$(cygpath -w "$TMP/inspect.json")"
 }
 plan() { # go [digest] [reason]
-  printf '{"image":{"name":"nsu-llm-node:0.2.0-cpu","digest":"%s","version":"0.2.0","revision":"abc"},"update":{"go":%s,"mode":"requested","when":"now","waiting":false,"reason":"%s"}}' \
+  printf '{"image":{"name":"nsu-llm-node:0.2.1-cpu","digest":"%s","version":"0.2.1","revision":"abc"},"update":{"go":%s,"mode":"requested","when":"now","waiting":false,"reason":"%s"}}' \
     "${2:-$DIG_NEW}" "$1" "${3:-}" > "$TMP/plan.json"
   export FAKE_PLAN="$(cygpath -w "$TMP/plan.json")"
 }
@@ -160,14 +160,14 @@ out="$(upd)"; rc=$?
 [ $rc -eq 0 ] && pass "update: main says go, the container is replaced" || { fail "update: main says go, the container is replaced (rc=$rc)"; echo "$out"; }
 log="$(flog)"
 contains "update pulls the image from main by the digest main named, not by a tag that can be overwritten" "$log" "docker pull 10.9.0.5/nsu-llm-node@$DIG_NEW"
-lacks "update does not pull by tag" "$log" "docker pull 10.9.0.5/nsu-llm-node:0.2.0-cpu"
-contains "update gives the pulled image its local name" "$log" "docker tag 10.9.0.5/nsu-llm-node@$DIG_NEW nsu-llm-node:0.2.0-cpu"
+lacks "update does not pull by tag" "$log" "docker pull 10.9.0.5/nsu-llm-node:0.2.1-cpu"
+contains "update gives the pulled image its local name" "$log" "docker tag 10.9.0.5/nsu-llm-node@$DIG_NEW nsu-llm-node:0.2.1-cpu"
 contains "update drops the remote name" "$log" "docker rmi 10.9.0.5/nsu-llm-node@$DIG_NEW"
 [ "$(before "$log" "docker pull")" -lt "$(before "$log" "docker rm -f llm-node")" ] && [ "$(before "$log" "docker rm -f llm-node")" -lt "$(before "$log" "docker run")" ] \
   && pass "update: pull, then remove, then run" || fail "update: pull, then remove, then run"
 run="$(grep '^docker run' "$TMP/fake.log")"
 for want in "--name llm-node" "--hostname pc01" "--restart unless-stopped" "-e MODE=k3s" "-e MAIN_HOST=10.9.0.5" "-e NODE_NAME=pc01" "-e NODE_IP=10.1.2.3" "-e ACCEL=cpu" \
-    "-e WOL_MAC=00-1A-2B-3C-4D-5E -e WOL_IP=10.1.2.3 -e WOL_PREFIX=24" "-e NODE_IMAGE=nsu-llm-node:0.2.0-cpu" "-e CLUSTER_TOKEN "; do
+    "-e WOL_MAC=00-1A-2B-3C-4D-5E -e WOL_IP=10.1.2.3 -e WOL_PREFIX=24" "-e NODE_IMAGE=nsu-llm-node:0.2.1-cpu" "-e CLUSTER_TOKEN "; do
   contains "update re-creates the container with the same parameter: $want" "$run" "$want"
 done
 lacks "update: the token is not on the docker command line" "$run" "clustersecret42"
@@ -214,7 +214,7 @@ out="$(upd)"; rc=$?
 [ $rc -ne 0 ] && pass "update refuses an image name that is not ours" || fail "update refuses an image name that is not ours"
 contains "update names the bad image" "$out" "недопустимый образ"
 lacks "update: a foreign image is not pulled" "$(flog)" "docker pull"
-printf '{"image":{"name":"nsu-llm-node:0.2.0-cpu","digest":"sha256:short"},"update":{"go":true}}' > "$TMP/plan.json"
+printf '{"image":{"name":"nsu-llm-node:0.2.1-cpu","digest":"sha256:short"},"update":{"go":true}}' > "$TMP/plan.json"
 out="$(upd)"; rc=$?
 [ $rc -ne 0 ] && pass "update refuses a malformed digest" || fail "update refuses a malformed digest"
 
@@ -245,7 +245,7 @@ contains "wsl update asks main from the distro with the pinned CA" "$log" "--cac
 contains "wsl update asks about this node" "$log" "https://10.9.0.5/api/nodes/pc01/desired?accel=cpu"
 contains "wsl update: the token goes in a header file in the distro" "$log" "header-file: Authorization: Bearer clustersecret42"
 contains "wsl update pulls with pull-image.sh in the distro" "$log" "wsl -d NSU-LLM -u root -e bash /mnt/"
-contains "wsl update gives pull-image.sh the registry address and the record file" "$log" "pull-image.sh --main 10.9.0.5 --image nsu-llm-node:0.2.0-cpu --digest $DIG_NEW --no-tofu --record $WDATA/state/image.digest --ca $WDATA/state/ca.crt"
+contains "wsl update gives pull-image.sh the registry address and the record file" "$log" "pull-image.sh --main 10.9.0.5 --image nsu-llm-node:0.2.1-cpu --digest $DIG_NEW --no-tofu --record $WDATA/state/image.digest --ca $WDATA/state/ca.crt"
 contains "wsl update re-creates the container in the distro" "$log" "wsl -d NSU-LLM -u root -e docker run -d --name llm-node"
 contains "wsl update keeps the host network the container had" "$(grep 'docker run' "$TMP/fake.log")" "--network host"
 lacks "wsl update: the token is not on the wsl command line" "$(flog | grep '^wsl ')" "clustersecret42"
@@ -255,7 +255,7 @@ contains "wsl update: a failed pull is reported with the body in a file (no quot
 lacks "wsl update: the wsl command lines carry no double quotes" "$(flog | grep '^wsl ' | grep -v 'bash -c')" '"'
 
 # ---- a fresh run takes the image from main (its NODE_IMAGE_TAG), not from a constant of the script (found on the 122b bed: main ran
-# 0.1.1, the script checked the GPU with the image nsu-llm-node:0.2.0-gpu and failed at the last step)
+# 0.1.1, the script checked the GPU with the image nsu-llm-node:0.2.1-gpu and failed at the last step)
 unset FAKE_INSPECT_JSON
 FRESH="$TMP/fresh-data"; mkdir -p "$FRESH"
 fresh() { # accel -> output of a real (not dry) first run on Docker Desktop
@@ -271,17 +271,17 @@ log="$(flog)"
 contains "fresh run: main is asked for the name of the gpu image" "$log" "/api/nodes/pc01/desired?accel=nvidia"
 contains "fresh run: the GPU is checked with the image main names" "$log" "docker run --rm --pull never --gpus all --entrypoint nvidia-smi nsu-llm-node:0.1.1-gpu"
 contains "fresh run: that very image is started" "$log" "-e NODE_IMAGE=nsu-llm-node:0.1.1-gpu"
-lacks "fresh run: the constant of the script is not used" "$log" "nsu-llm-node:0.2.0"
+lacks "fresh run: the constant of the script is not used" "$log" "nsu-llm-node:0.2.1"
 lacks "fresh run: the token is not on a command line" "$(printf '%s\n' "$log" | grep '^curl')" "clustersecret42"
 printf '{"name":"nsu-llm-node:0.1.1-cpu","image":null,"update":{"go":false}}' > "$TMP/plan.json"
 out="$(fresh cpu)"
 contains "fresh cpu run: the cpu image of main's tag" "$(flog)" "-e NODE_IMAGE=nsu-llm-node:0.1.1-cpu"
 printf '{"name":"evil:1"}' > "$TMP/plan.json"
 out="$(fresh cpu)"
-contains "a name that is not ours is ignored: IMAGE_VERSION of the scripts" "$(flog)" "-e NODE_IMAGE=nsu-llm-node:0.2.0-cpu"
+contains "a name that is not ours is ignored: IMAGE_VERSION of the scripts" "$(flog)" "-e NODE_IMAGE=nsu-llm-node:0.2.1-cpu"
 export FAKE_CURL_DOWN=1
 out="$(fresh cpu)"
-contains "main does not answer: IMAGE_VERSION of the scripts" "$(flog)" "-e NODE_IMAGE=nsu-llm-node:0.2.0-cpu"
+contains "main does not answer: IMAGE_VERSION of the scripts" "$(flog)" "-e NODE_IMAGE=nsu-llm-node:0.2.1-cpu"
 unset FAKE_CURL_DOWN
 
 # ---- node-boot.ps1: the loop asks for updates while the distro runs

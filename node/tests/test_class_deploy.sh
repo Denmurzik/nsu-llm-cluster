@@ -390,7 +390,7 @@ contains "hang: tail in the host log" "$(cat "$TMP/work/class-deploy-logs"/*/pc0
 reset
 scenario '{"trusted":"*","hosts":{"192.168.3.101":{},
  "192.168.3.102":{"probe":{"HasGpu":true,"Driver":"566.36"}},
- "192.168.3.103":{"probe":{"HasGpu":true},"run":{"install":{"Code":1,"Output":"Внимание: GPU не виден в WSL — нода будет cpu.\nОШИБКА: После загрузки образа nsu-llm-node:0.2.0-cpu нет\n"}}}}}'
+ "192.168.3.103":{"probe":{"HasGpu":true},"run":{"install":{"Code":1,"Output":"Внимание: GPU не виден в WSL — нода будет cpu.\nОШИБКА: После загрузки образа nsu-llm-node:0.2.1-cpu нет\n"}}}}}'
 run "-Action install $COMMON -Only pc02,pc03"
 contains "old driver: plan says the PC goes cpu" "$OUT" "драйвер старее 570: cpu"
 contains "old driver: auto host gets the cpu image" "$(echo "$LOG" | grep '^RUN 192.168.3.102')" "nsu-llm-node-0.1.0-cpu.tar.gz"
@@ -402,16 +402,71 @@ contains "GPU not in WSL: and a rerun for that PC" "$OUT" "-Only pc03"
 reset
 mkdir -p "$TMP/big" "$TMP/remote/192.168.3.101/ProgramData/NSU-LLM-stage"
 sparse() { : > "$1"; fsutil sparse setflag "$(cygpath -w "$1")" > /dev/null 2>&1; truncate -s "$2" "$1"; }
-sparse "$TMP/big/nsu-llm-node-0.1.0-cpu.tar.gz" 1536M
+sparse "$TMP/big/nsu-llm-node-0.1.0-cpu.tar.gz" 8192M
 BIG="$(W "$TMP/big/nsu-llm-node-0.1.0-cpu.tar.gz")"
-scenario '{"trusted":"*","hosts":{"192.168.3.101":{"probe":{"FreeGB":17}}}}'
-run "-Action install -ScriptsFrom '$(W "$TMP/scripts")' -Inventory '$INV' -ImageTarCpu '$BIG' -Main 10.0.0.5 -Token $TOKEN -AllowFrom 10.0.0.5 -NonInteractive -Only pc01 -DryRun"
-contains "free space: 1.5 GB image, 17 GB free, nothing staged -> skipped" "$OUT" "нужно около 18"
-sparse "$TMP/remote/192.168.3.101/ProgramData/NSU-LLM-stage/nsu-llm-node-0.1.0-cpu.tar.gz" 1536M
-run "-Action install -ScriptsFrom '$(W "$TMP/scripts")' -Inventory '$INV' -ImageTarCpu '$BIG' -Main 10.0.0.5 -Token $TOKEN -AllowFrom 10.0.0.5 -NonInteractive -Only pc01 -DryRun"
+scenario '{"trusted":"*","hosts":{"192.168.3.101":{"probe":{"FreeGB":12}}}}'
+run "-Action install -ScriptsFrom '$(W "$TMP/scripts")' -Inventory '$INV' -ImageTarCpu '$BIG' -Main 10.0.0.5 -Token $TOKEN -AllowFrom 10.0.0.5 -NonInteractive -Only pc01 -DryRun -MinFreeGB 10"
+contains "free space: 8 GB image, 12 GB free, nothing staged -> skipped" "$OUT" "нужно около 16"
+sparse "$TMP/remote/192.168.3.101/ProgramData/NSU-LLM-stage/nsu-llm-node-0.1.0-cpu.tar.gz" 8192M
+run "-Action install -ScriptsFrom '$(W "$TMP/scripts")' -Inventory '$INV' -ImageTarCpu '$BIG' -Main 10.0.0.5 -Token $TOKEN -AllowFrom 10.0.0.5 -NonInteractive -Only pc01 -DryRun -MinFreeGB 10"
 lacks "free space: the same image already staged is subtracted" "$OUT" "ПРОПУЩЕН"
 contains "free space: planned" "$OUT" "ПЛАН"
 rm -rf "$TMP/big"
+
+# B3: the floor -MinFreeGB (30 GB by default) for a PC that needs an install, a warning column in the table
+reset
+scenario '{"trusted":"*","hosts":{"192.168.3.101":{"probe":{"FreeGB":12}}}}'
+run "-Action install $COMMON -Only pc01 -DryRun"
+contains "disk floor: 12 GB free is below the default 14 GB -> skipped" "$OUT" "нужно около 14"
+contains "disk floor: the skip names the option" "$OUT" "порог -MinFreeGB 14"
+contains "disk floor: the table has a disk column" "$OUT" "Диск C:"
+contains "disk floor: below the floor is marked with !!" "$OUT" "!! 12 ГБ"
+contains "disk floor: the low-disk PCs are listed" "$OUT" "Мало места на C: (1 ПК, порог ошибки 14 ГБ, рекомендуется 18 ГБ): pc01 (12 ГБ)"
+scenario '{"trusted":"*","hosts":{"192.168.3.101":{"probe":{"FreeGB":16}}}}'
+run "-Action install $COMMON -Only pc01 -DryRun"
+lacks "disk floor: 16 GB free is above the floor: planned" "$OUT" "ПРОПУЩЕН"
+contains "disk floor: between the floor and the warning is marked with !" "$OUT" "! 16 ГБ"
+contains "disk floor: and listed as low" "$OUT" "pc01 (16 ГБ)"
+scenario '{"trusted":"*","hosts":{"192.168.3.101":{"probe":{"FreeGB":200}}}}'
+run "-Action install $COMMON -Only pc01 -DryRun"
+lacks "disk floor: plenty of space: no warning" "$OUT" "Мало места на C:"
+contains "disk floor: plenty of space: shown in the column" "$OUT" "200 ГБ"
+scenario '{"trusted":"*","hosts":{"192.168.3.101":{"probe":{"FreeGB":12}}}}'
+run "-Action install $COMMON -Only pc01 -DryRun -MinFreeGB 10 -WarnFreeGB 20"
+lacks "disk floor: -MinFreeGB 10 lets 12 GB through (the default floor of 14 would not)" "$OUT" "ПРОПУЩЕН"
+contains "disk floor: the thresholds go to the installer on the PC" "$OUT" "-MinFreeGB 10 -WarnFreeGB 20"
+scenario '{"trusted":"*","hosts":{"192.168.3.101":{"probe":{"FreeGB":200}}}}'
+run "-Action install $COMMON -Only pc01 -DryRun"
+lacks "disk floor: the thresholds are passed only when given" "$OUT" "-MinFreeGB"
+# update of a node that is installed and whose image is already loaded: no floor, only the room for the scripts
+reset; mkdir -p "$MS"; mark 0 > "$MS/image-loaded.json"
+scenario '{"trusted":"*","hosts":{"192.168.3.101":{"probe":{"FreeGB":13,"Installed":true}}}}'
+run "-Action update $COMMON -Only pc01 -DryRun"
+lacks "disk floor: update of an installed node with its image loaded is not blocked by the floor" "$OUT" "ПРОПУЩЕН"
+contains "disk floor: the update is planned" "$OUT" "ПЛАН"
+contains "disk floor: and the column still shows the space" "$OUT" "!! 13 ГБ"
+# the same node, but a new image has to be loaded: that is an install for the installer on the PC, so the same refusal here (not a silent failure on the PC)
+reset
+run "-Action update $COMMON -Only pc01 -DryRun"
+contains "disk floor: update that needs a new image is refused like an install" "$OUT" "нужно около 14"
+contains "disk floor: and marked as skipped" "$OUT" "ПРОПУЩЕН"
+
+# the footprint of the node (its own dir and the stage) against the 16 GB limit
+scenario '{"trusted":"*","hosts":{"192.168.3.101":{"probe":{"FootprintGB":21.4}}}}'
+run "-Action status $COMMON -Only pc01"
+contains "footprint: the table has a node column" "$OUT" "NSU-LLM"
+contains "footprint: above 16 GB is marked" "$OUT" "!! 21.4 ГБ"
+contains "footprint: and listed" "$OUT" "Нода занимает больше 16 ГБ диска (1 ПК): pc01 (21.4 ГБ)"
+scenario '{"trusted":"*","hosts":{"192.168.3.101":{"probe":{"FootprintGB":9}}}}'
+run "-Action status $COMMON -Only pc01"
+contains "footprint: below the limit is shown plain" "$OUT" "9 ГБ"
+lacks "footprint: below the limit: no warning" "$OUT" "Нода занимает больше"
+# the staged archive is deleted by the installer right after docker load
+scenario '{"trusted":"*","hosts":{"192.168.3.101":{}}}'
+run "-Action install $COMMON -Only pc01"
+contains "image tar: the installer is asked to delete the archive right after docker load" "$(echo "$LOG" | grep '^RUN 192.168.3.101')" "DeleteImageTar=True"
+run "-Action install $COMMON -Only pc01 -KeepStage"
+lacks "image tar: -KeepStage keeps it" "$(echo "$LOG" | grep '^RUN 192.168.3.101' | tail -1)" "DeleteImageTar"
 
 # image discovery picks the version of install-node.ps1, not just the newest tar
 reset
@@ -541,19 +596,19 @@ mkfake() {
   rm -rf "$FAKE" "$TMP/remote"; mkdir -p "$FAKE"
   { printf '\xEF\xBB\xBF'; cat <<'EOF'; } > "$FAKE/install-node.ps1"
 param([string]$Main, [string]$Token, [string]$Mode, [string]$Accel, [string]$Name, [string]$AllowFrom, [string]$ImageTar, [string]$ImageSource, [string]$TaskPassword, [string]$Proxy, [string]$Docker,
-      [switch]$NonInteractive, [switch]$Yes, [switch]$InsecureTls, [switch]$Status, [switch]$Uninstall)
+      [int]$MinFreeGB, [int]$WarnFreeGB, [switch]$DeleteImageTar, [switch]$NonInteractive, [switch]$Yes, [switch]$InsecureTls, [switch]$Status, [switch]$Uninstall)
 Write-Host '[1/2] шаг один'
 Write-Host "installer got Main=$Main Name=$Name Mode=$Mode Accel=$Accel NI=$NonInteractive Tar=$ImageTar Proxy=$($PSBoundParameters['Proxy']) HTTPS_PROXY=$env:HTTPS_PROXY policy=$(Get-ExecutionPolicy -Scope Process)"
 if ($Token -ne 'agent-token-SECRET-123' -or $TaskPassword -ne 'Pw-Secret-9x') { Write-Host 'ОШИБКА: secrets lost'; exit 1 }
 if ($Name -eq 'pc02') { Write-Host 'ОШИБКА: boom'; exit 1 }
-if ($env:FAKE_NOIMAGE -and -not $ImageTar) { Write-Host 'ОШИБКА: Образ nsu-llm-node:0.2.0-cpu не найден ни в WSL, ни рядом со скриптом'; Write-Host 'Как исправить: Положите nsu-llm-node-0.1.0-cpu.tar.gz рядом с install-node.ps1 или укажите -ImageTar <путь>'; exit 1 }
+if ($env:FAKE_NOIMAGE -and -not $ImageTar) { Write-Host 'ОШИБКА: Образ nsu-llm-node:0.2.1-cpu не найден ни в WSL, ни рядом со скриптом'; Write-Host 'Как исправить: Положите nsu-llm-node-0.1.0-cpu.tar.gz рядом с install-node.ps1 или укажите -ImageTar <путь>'; exit 1 }
 if ($Name -eq 'pc03' -and $env:FAKE_SLOW) { Start-Sleep -Seconds 8 }
 Write-Host '[2/2] шаг два'
 exit 0
 EOF
   echo cpu-image > "$FAKE/nsu-llm-node-0.1.0-cpu.tar.gz"
 }
-LOCALRUN="$COMMON -CopyMode none -StageDir '$(W "$FAKE")' -Proxy http://proxy.nsu.ru:3128"
+LOCALRUN="$COMMON -CopyMode none -StageDir '$(W "$FAKE")' -Proxy http://proxy.nsu.ru:3128 -MinFreeGB 1"
 R="$TMP/remote"
 
 # task mode (default)
@@ -592,6 +647,14 @@ contains "task: run.log has the installer output" "$(cat "$R/192.168.3.101-stage
 [ -f "$R/192.168.3.102-stage/nsu-llm-node-0.1.0-cpu.tar.gz" ] && pass "cleanup: kept after a failure (rerun needs it)" || fail "cleanup: kept after a failure"
 leak="$(grep -rl --exclude=install-node.ps1 "$TOKEN" "$R" 2>/dev/null)"   # the fake installer itself compares against the token
 [ -z "$leak" ] && pass "task: token not left in plain text on the PC" || fail "task: token left in plain text on the PC: $leak"
+
+# a failed install on a PC that is left with less than -MinFreeGB: the image archive does not stay in the stage dir
+reset; mkfake
+scenario '{"trusted":"*","exec":"local","hosts":{"192.168.3.102":{"probe":{"FreeGB":999999999999}}}}'
+run "-Action install ${LOCALRUN/-MinFreeGB 1/-MinFreeGB 99999999} -Only pc02"
+[ ! -f "$R/192.168.3.102-stage/nsu-llm-node-0.1.0-cpu.tar.gz" ] && pass "cleanup: after a failure on a nearly full disk the image archive is removed" || fail "cleanup: after a failure on a nearly full disk the image archive is removed"
+contains "cleanup: the removal is explained in the log of the PC" "$(cat "$R/192.168.3.102-stage/run.log" 2>/dev/null)" "архив образа удалён"
+[ -f "$R/192.168.3.102-stage/run.log" ] && pass "cleanup: the log stays" || fail "cleanup: the log stays"
 
 # -KeepStage keeps the image
 reset; mkfake

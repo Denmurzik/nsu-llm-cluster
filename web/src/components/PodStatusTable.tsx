@@ -49,7 +49,7 @@ export function PodStatusTable({ status }: { status: DeploymentStatus }) {
                   </div>
                 </td>
                 <td className="mono nowrap">{pod.name}</td>
-                <td>{roleLabel(pod.role)}</td>
+                <td>{pod.on_main ? `${roleLabel(pod.role)} (на главном)` : roleLabel(pod.role)}</td>
                 <td>{phaseLabel(pod.phase)}</td>
                 <td>
                   <Readiness pod={pod} />

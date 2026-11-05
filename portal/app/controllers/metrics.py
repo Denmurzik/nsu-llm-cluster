@@ -16,6 +16,7 @@ from typing import Any
 
 from app import settings_store
 from app.deployments import service
+from app.k8s import MAIN_NODE
 from app.metrics import gateway_models, history, live
 from app.metrics.scrape import ModelScraper
 from app.nodes import identity
@@ -75,6 +76,8 @@ class MetricsController:
         backends = (getattr(state, "backend_status", None) or {}).get("backends", [])
         async with state.sessionmaker() as db:
             keys = await identity.backend_keys(db)  # every backend answers its node's own key only
+        if main_key := state.settings.main_backend_key.get_secret_value():  # a split leader on main
+            keys[MAIN_NODE] = main_key
         scrapes = await self._scraper.scrape(backends, keys)
         traffic = await gateway_models.read_minute(state.redis, minute - 1)
 

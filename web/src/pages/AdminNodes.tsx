@@ -4,6 +4,7 @@ import "../styles/tools.css";
 import { APPROVE_NOTE, BulkNodeActions, SPLIT_WARNING } from "../components/BulkNodeActions";
 import { CopyButton } from "../components/CopyButton";
 import { Confirm } from "../components/Modal";
+import { NodeDiskWarning } from "../components/NodeDiskWarning";
 import { NodeWake } from "../components/NodeWake";
 import { BulkUpdateNodes, NodeUpdateButton, NodeVersionTag, useNodeVersions } from "../components/NodeVersions";
 import { NodeDeletedDialog, NodeDeleteMenu } from "../components/NodeDelete";
@@ -25,7 +26,9 @@ const JOIN_ROWS: { key: keyof JoinInfo & ("linux" | "linux_standalone" | "window
 const UNKNOWN = "?";
 
 export function AdminNodes() {
-  const nodes = useResource(() => api.nodes(), [], { interval: 10000 });
+  const nodes = useResource(() => api.nodes(true), [], { interval: 10000 });
+  /** the last samples of the nodes: the free space of the PC's disk */
+  const live = useResource(() => api.metricsLive(), [], { interval: 10000 });
   const deployments = useResource(() => api.deployments(), [], { interval: 10000 });
   const join = useResource(() => api.join(), []);
   /** the image each node runs and whether it is outdated (portal task 2-30); the table does not wait for it */
@@ -181,7 +184,7 @@ export function AdminNodes() {
                       <div className="stackcell">
                         <span className="mono nowrap">{n.name}</span>
                         <span className="muted small nowrap">
-                          <span>{n.is_main ? "главная" : n.source}</span>
+                          <span>{n.is_main ? "главная" : n.source === "enrolled" ? "ещё не в кластере" : n.source}</span>
                           {n.ip ? ` · ${n.ip}` : ""}
                         </span>
                       </div>
@@ -195,7 +198,9 @@ export function AdminNodes() {
                       {hasClaims(n) && (
                         <div className="stackcell">
                           <span className="tag warn small">
-                            {n.approved === false ? "Ждёт выбора заявки" : "Попытка перерегистрации известного имени"}
+                            {n.approved === false && !waitsForApproval(n)
+                              ? "Ждёт выбора заявки"
+                              : "Попытка перерегистрации известного имени"}
                           </span>
                           <button type="button" className="btn sm" onClick={() => setClaimsOf(n)}>
                             Заявки: {n.claims!.length}
@@ -218,7 +223,17 @@ export function AdminNodes() {
                             Подтвердить
                           </button>
                         </div>
-                      ) : n.approved === false ? null : (
+                      ) : n.approved === false ? (
+                        hasClaims(n) ? null : (
+                          <span
+                            className="status"
+                            title="Контейнер ноды регистрируется сам при старте. Если этого не происходит, перезапустите ноду на ПК и посмотрите журнал контейнера"
+                          >
+                            <i className="dot starting" aria-hidden="true" />
+                            <span>Ждёт регистрации ноды</span>
+                          </span>
+                        )
+                      ) : (
                         <span className="status">
                           <i
                             className={`dot ${n.maintenance ? "starting" : n.ready ? "ready" : "down"}`}
@@ -233,6 +248,9 @@ export function AdminNodes() {
                         </span>
                       )}
                       <NodeWake node={n} />
+                      {!n.is_main && (
+                        <NodeDiskWarning freeBytes={live.data?.nodes.find((l) => l.name === n.name)?.disk_free_bytes} />
+                      )}
                     </td>
                     <td className="num">{n.backends}</td>
                     <td>

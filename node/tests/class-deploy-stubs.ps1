@@ -94,7 +94,7 @@ function Invoke-Command { [CmdletBinding()] param($Session, [scriptblock]$Script
         $mk = Join-Path $stage 'image-loaded.json'
         $mark = $(if (Test-Path -LiteralPath $mk) { [IO.File]::ReadAllText($mk) } else { [string](Cfg $pr 'ImageMark' '') })
         $items = @([pscustomobject]@{ Kind = 'probe'; ImageMark = $mark; Computer = $addr; IsAdmin = [bool](Cfg $pr 'IsAdmin' $true); HasGpu = $gpu; Driver = $drv; DriverMajor = $major
-            FreeGB = [double](Cfg $pr 'FreeGB' 200); Build = [int](Cfg $pr 'Build' 26100); Installed = [bool](Cfg $pr 'Installed' $false); StageFiles = $files })
+            FreeGB = [double](Cfg $pr 'FreeGB' 200); FootprintGB = [double](Cfg $pr 'FootprintGB' 0); Build = [int](Cfg $pr 'Build' 26100); Installed = [bool](Cfg $pr 'Installed' $false); StageFiles = $files })
     }
     elseif ($p.Op -eq 'tail') {
         Log "TAIL $addr $($p.Path)"

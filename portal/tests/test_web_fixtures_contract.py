@@ -57,7 +57,7 @@ def _registry_of_main():
     from tests.test_node_versions import D1, D2, FakeRegistry
 
     fake = FakeRegistry()
-    fake.tags = {"0.2.0-cpu": D1, "0.2.0-gpu": D2}
+    fake.tags = {"0.2.1-cpu": D1, "0.2.1-gpu": D2}
     versions.REGISTRY.reset()
     versions.REGISTRY.transport = httpx.MockTransport(fake)
     yield

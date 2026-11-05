@@ -364,6 +364,30 @@ async def test_split_leader_endpoint_is_added(controller, litellm, k8s):
         assert (model.source, model.node, model.max_input_tokens) == ("k8s", "worker-1", 8192)
 
 
+async def test_a_leader_on_main_gets_mains_own_key_and_needs_no_approval(app, controller, litellm, k8s, settings, monkeypatch):
+    monkeypatch.setattr(settings, "main_backend_key", SecretStr("main-key"))
+    k8s.add_node("llm-main", internal_ip="127.0.0.1", external_ip="192.168.1.5", is_main=True)
+    async with backend() as b:
+        k8s.add_pod(
+            "llm-sp-g0-x", "llm-main", "split-leader", "sp", port=b.port, model_name="sp", max_input_tokens=8192,
+            spec_hash="h1", workload="llm-sp-g0",
+        )
+        await controller.reconcile_once()
+        (model,) = litellm.models.values()
+        assert model.node == "llm-main"
+        assert model.api_base == f"http://127.0.0.1:{b.port}/v1"  # the container's address: the port is not published
+        assert model.key_fingerprint == key_fingerprint("main-key")
+
+
+async def test_a_leader_on_main_without_a_key_gets_no_entry(app, controller, litellm, k8s, settings, monkeypatch):
+    monkeypatch.setattr(settings, "main_backend_key", SecretStr(""))
+    k8s.add_node("llm-main", internal_ip="127.0.0.1", is_main=True)
+    async with backend() as b:
+        k8s.add_pod("llm-sp-g0-x", "llm-main", "split-leader", "sp", port=b.port, model_name="sp", max_input_tokens=8192)
+        await controller.reconcile_once()
+    assert litellm.models == {}
+
+
 async def test_the_leader_of_a_held_split_group_leaves_litellm(app, controller, litellm, k8s):
     """A group waiting for a lost member: its leader still answers /health, but a request hangs in a recv on the dead
     rpc connection. The workload controller names such leaders (`held_split_leaders`); they are not offered."""

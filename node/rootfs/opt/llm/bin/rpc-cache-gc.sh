@@ -4,7 +4,7 @@
 #   rpc-cache-gc.sh          one pass
 #   rpc-cache-gc.sh --loop   a pass now and then every RPC_CACHE_GC_INTERVAL_S seconds (default 600)
 # Settings:
-#   RPC_CACHE_MAX_GIB       cache size limit in GiB (default 64, 0 = no limit)
+#   RPC_CACHE_MAX_GIB       cache size limit in GiB (default 5, 0 = no limit)
 #   RPC_CACHE_MIN_FREE_PCT  keep at least this share of the file system free (default 10)
 #   RPC_CACHE_DIR           the cache directory (default $LLAMA_CACHE/rpc)
 #   RPC_CACHE_MAX_BYTES     the limit in bytes instead of GiB (tests)
@@ -16,7 +16,7 @@ set -uo pipefail
 
 DIR="${RPC_CACHE_DIR:-${LLAMA_CACHE:-/var/lib/llm-models}/rpc}"
 INTERVAL="${RPC_CACHE_GC_INTERVAL_S:-600}"
-MAX_GIB="${RPC_CACHE_MAX_GIB:-64}"
+MAX_GIB="${RPC_CACHE_MAX_GIB:-5}"
 MIN_FREE_PCT="${RPC_CACHE_MIN_FREE_PCT:-10}"
 for v in MAX_GIB MIN_FREE_PCT INTERVAL; do
   [[ "${!v}" =~ ^[0-9]+$ ]] || { echo "rpc-cache-gc: $v must be a whole number (got '${!v}')" >&2; exit 2; }

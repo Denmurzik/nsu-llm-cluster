@@ -24,7 +24,7 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 
-$Version = '0.2.0'
+$Version = '0.2.1'
 $Container = 'llm-main'
 if (-not $Image) { $Image = "nsu-llm-main:$Version" }
 if (-not $AirgapDir) { $AirgapDir = Join-Path $env:ProgramData 'nsu-llm-main\images' }

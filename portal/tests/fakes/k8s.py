@@ -40,6 +40,7 @@ class FakeK8s:
         self.applied: list[dict] = []  # every apply() call, in order
         self.deleted: list[tuple[str, str]] = []  # every delete() call, in order
         self.deleted_nodes: list[str] = []
+        self.deleted_node_passwords: list[str] = []
         self.tainted_nodes: list[str] = []  # every add_class_taint() call that changed a node
         self.deleted_pods: list[str] = []
         self.jobs: list[dict] = []  # every create_job() call (Wake-on-LAN relays, models cleanups)
@@ -104,7 +105,7 @@ class FakeK8s:
         started_at: float | None = None,
     ) -> FakePod:
         pod = FakePod(
-            PodInfo(name, node_name, role, deployment, phase, ready, restarts, message, workload, started_at),
+            PodInfo(name, node_name, role, deployment, phase, ready, restarts, message, workload, started_at, port),
             port,
             model_name,
             max_input_tokens,
@@ -155,6 +156,11 @@ class FakeK8s:
         self.deleted_nodes.append(name)
         return self.nodes.pop(name, None) is not None
 
+    async def delete_node_password(self, name: str) -> bool:
+        self._check()
+        self.deleted_node_passwords.append(name)
+        return True
+
     async def list_endpoints(self, role: str, deployment: str | None = None) -> list[Endpoint]:
         self._check()
         endpoints = []
@@ -168,7 +174,7 @@ class FakeK8s:
                 or node is None
             ):
                 continue
-            ip = node.external_ip or node.internal_ip
+            ip = node.internal_ip if node.is_main else node.external_ip or node.internal_ip
             spec_hash = pod.spec_hash
             if spec_hash is None and role == "rpc":
                 spec_hash = self.rpc_templates.get((info.deployment, node.accel))
